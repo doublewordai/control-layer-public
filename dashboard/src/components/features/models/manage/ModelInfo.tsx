@@ -1,0 +1,2664 @@
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  ArrowLeft,
+  Code,
+  Users,
+  BarChart3,
+  Play,
+  Activity,
+  X,
+  Info,
+  Edit,
+  Check,
+  Copy,
+  GitMerge,
+  Trash2,
+} from "lucide-react";
+import {
+  useModel,
+  useEndpoint,
+  useUpdateModel,
+  useProbes,
+  useModelComponents,
+  useDaemons,
+  useConfig,
+} from "../../../../api/control-layer";
+import type {
+  ApiKeyPurpose,
+  ModelMetadata,
+  ModelDisplayCategory,
+  TrafficRoutingRule,
+  ReasoningTranslationOverrides,
+} from "../../../../api/control-layer";
+import {
+  useAuthorization,
+  isPlaygroundDenied,
+  copyToClipboard,
+} from "../../../../utils";
+import {
+  ApiExamples,
+  AccessManagementModal,
+  UpdateModelPricingModal,
+  CachePricingModal,
+  DeleteVirtualModelModal,
+} from "../../../modals";
+import UserUsageTable from "./UserUsageTable";
+import ModelProbes from "./ModelProbes";
+import { ModelPricing } from "./ModelPricing";
+import ProvidersTab from "./ProvidersTab";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "../../../ui/card";
+import { Badge } from "../../../ui/badge";
+import { Button } from "../../../ui/button";
+import { Input } from "../../../ui/input";
+import { Textarea } from "../../../ui/textarea";
+import { InfoTip } from "../../../ui/info-tip";
+import { Checkbox } from "../../../ui/checkbox";
+import { Switch } from "../../../ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../../ui/select";
+import { Form, FormControl, FormField, FormItem } from "../../../ui/form";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import * as z from "zod";
+import { Sparkline } from "../../../ui/sparkline";
+import { Markdown } from "../../../ui/markdown";
+import { ModelCombobox } from "../../../ui/model-combobox";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
+import {
+  ReasoningTranslationOverridesEditor,
+  normalizeReasoningTranslationOverrides,
+} from "../../reasoning";
+
+const aliasFormSchema = z.object({
+  alias: z
+    .string()
+    .min(1, "Alias is required")
+    .max(100, "Alias must be 100 characters or less"),
+});
+
+const TRAFFIC_PURPOSE_OPTIONS: ApiKeyPurpose[] = [
+  "realtime",
+  "batch",
+  "playground",
+];
+
+const DISPLAY_CATEGORY_OPTIONS: {
+  value: ModelDisplayCategory;
+  label: string;
+}[] = [
+  { value: "generation", label: "Generation" },
+  { value: "embedding", label: "Embedding" },
+  { value: "ocr", label: "OCR" },
+];
+
+const ModelInfo: React.FC = () => {
+  const { modelId } = useParams<{ modelId: string }>();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { hasPermission } = useAuthorization();
+  const canManageGroups = hasPermission("manage-groups");
+  const canManageModels = hasPermission("manage-models");
+  const canViewAnalytics = hasPermission("analytics");
+  const canViewEndpoints = hasPermission("endpoints");
+
+  const fromUrl = searchParams.get("from");
+
+  const tabFromUrl = searchParams.get("tab");
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    if (tabFromUrl === "usage" && canManageGroups) return "usage";
+    if (tabFromUrl === "probes" && canManageGroups) return "probes";
+    if (tabFromUrl === "providers" && canManageGroups) return "providers";
+    return "overview";
+  });
+
+  useEffect(() => {
+    const tabFromUrl = searchParams.get("tab");
+    if (
+      tabFromUrl === "overview" ||
+      (tabFromUrl === "usage" && canManageGroups) ||
+      (tabFromUrl === "probes" && canManageGroups) ||
+      (tabFromUrl === "providers" && canManageGroups)
+    ) {
+      setActiveTab(tabFromUrl);
+    }
+  }, [searchParams, canManageGroups]);
+
+  const handleTabChange = (value: string) => {
+    setActiveTab(value);
+    const newParams = new URLSearchParams(searchParams);
+    newParams.set("tab", value);
+    navigate(`/models/manage/${modelId}?${newParams.toString()}`, { replace: true });
+  };
+
+  const [updateData, setUpdateData] = useState({
+    alias: "",
+    display_name: "",
+    description: "",
+    model_type: "" as "CHAT" | "EMBEDDINGS" | "",
+    capabilities: [] as string[],
+    sanitize_responses: false,
+    trusted: false,
+    reasoning_translation_overrides: null as ReasoningTranslationOverrides | null,
+    realtime_inflight_limit: null as number | null,
+    batch_capacity: null as number | null,
+    throughput: null as number | null,
+    allowed_batch_completion_windows: null as string[] | null,
+    traffic_routing_rules: [] as TrafficRoutingRule[],
+    metadata: null as ModelMetadata | null,
+    backoff_enabled: false,
+    backoff_initial_ms: 100,
+    backoff_max_ms: 5000,
+    backoff_factor: 2.0,
+    backoff_jitter: "full" as "full" | "none",
+    backoff_max_total_ms: null as number | null,
+    backoff_max_attempts: 3 as number | null,
+  });
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [reasoningTranslationValid, setReasoningTranslationValid] =
+    useState(true);
+  const [showApiExamples, setShowApiExamples] = useState(false);
+  const [isEditingAlias, setIsEditingAlias] = useState(false);
+  const [aliasTruncated, setAliasTruncated] = useState(false);
+  const [aliasPopoverOpen, setAliasPopoverOpen] = useState(false);
+  const aliasRef = useCallback((el: HTMLHeadingElement | null) => {
+    if (el) setAliasTruncated(el.scrollWidth > el.clientWidth);
+  }, []);
+  const [showAccessModal, setShowAccessModal] = useState(false);
+  const [isEditingModelDetails, setIsEditingModelDetails] = useState(false);
+  const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showCachePricingModal, setShowCachePricingModal] = useState(false);
+  const [showDeleteVirtualModal, setShowDeleteVirtualModal] = useState(false);
+  const [aliasCopied, setAliasCopied] = useState(false);
+
+  const aliasForm = useForm<z.infer<typeof aliasFormSchema>>({
+    resolver: zodResolver(aliasFormSchema),
+    defaultValues: {
+      alias: "",
+    },
+  });
+
+  const updateModelMutation = useUpdateModel();
+  const { data: config } = useConfig();
+  const availableCompletionWindows = useMemo(
+    () => config?.batches?.allowed_completion_windows ?? ["24h"],
+    [config?.batches?.allowed_completion_windows],
+  );
+
+  const strictModeEnabled = config?.onwards?.strict_mode ?? false;
+
+  const includeParam = useMemo(() => {
+    const parts: string[] = ["status", "pricing"];
+    if (canManageGroups) parts.push("groups");
+    if (canViewAnalytics) parts.push("metrics");
+    return parts.join(",");
+  }, [canManageGroups, canViewAnalytics]);
+
+  const {
+    data: model,
+    isLoading: modelLoading,
+    error: modelError,
+  } = useModel(modelId!, { include: includeParam });
+
+  const {
+    data: endpoint,
+    isLoading: endpointLoading,
+    error: endpointError,
+  } = useEndpoint(model?.hosted_on || "", {
+    enabled: !!model?.hosted_on && canViewEndpoints,
+  });
+
+  const { data: probes } = useProbes();
+  const modelProbe = probes?.find((p) => p.deployment_id === model?.id);
+
+  const { data: components } = useModelComponents(modelId!, {
+    enabled: !!model?.is_composite,
+  });
+
+  const { data: daemonsData } = useDaemons(
+    { status: "running" },
+    { enabled: canManageGroups },
+  );
+  const runningDaemonCount =
+    daemonsData?.daemons.filter((d) => {
+      if (d.status !== "running" || !d.last_heartbeat) return false;
+      const timeSinceHeartbeat = Date.now() - d.last_heartbeat * 1000;
+      return timeSinceHeartbeat <= d.config.heartbeat_interval_ms * 2;
+    }).length ?? 0;
+
+  const loading = modelLoading || endpointLoading;
+  const error = modelError
+    ? (modelError as Error).message
+    : endpointError
+      ? (endpointError as Error).message
+      : null;
+
+  useEffect(() => {
+    if (model) {
+      const effectiveType = model.model_type || "CHAT";
+
+      setUpdateData({
+        alias: model.alias,
+        display_name: model.display_name || "",
+        description: model.description || "",
+        model_type: effectiveType as "CHAT" | "EMBEDDINGS",
+        capabilities: model.capabilities || [],
+        sanitize_responses: model.sanitize_responses ?? false,
+        trusted: model.trusted ?? false,
+        reasoning_translation_overrides:
+          normalizeReasoningTranslationOverrides(
+            model.reasoning_translation_overrides ?? null,
+          ),
+        realtime_inflight_limit: model.realtime_inflight_limit ?? null,
+        batch_capacity: model.batch_capacity || null,
+        throughput: model.throughput || null,
+        allowed_batch_completion_windows:
+          model.allowed_batch_completion_windows ?? null,
+        traffic_routing_rules: model.traffic_routing_rules || [],
+        metadata: model.metadata ?? null,
+        backoff_enabled: model.fallback?.backoff != null,
+        backoff_initial_ms: model.fallback?.backoff?.initial_ms ?? 100,
+        backoff_max_ms: model.fallback?.backoff?.max_ms ?? 5000,
+        backoff_factor: model.fallback?.backoff?.factor ?? 2.0,
+        backoff_jitter: model.fallback?.backoff?.jitter ?? "full",
+        backoff_max_total_ms: model.fallback?.max_total_backoff_ms ?? null,
+        backoff_max_attempts: model.fallback?.max_attempts ?? 3,
+      });
+      aliasForm.reset({
+        alias: model.alias,
+      });
+      setIsEditingAlias(false);
+      setIsEditingModelDetails(false);
+      setSettingsError(null);
+      setReasoningTranslationValid(true);
+    }
+  }, [model, aliasForm]);
+
+  const handleSave = async () => {
+    if (!model) return;
+    setSettingsError(null);
+
+    if (!reasoningTranslationValid) {
+      setSettingsError("Finish the reasoning translation override before saving.");
+      return;
+    }
+
+    const normalizedTrafficRules = updateData.traffic_routing_rules.map((rule) => {
+      if (rule.action.type === "redirect") {
+        return {
+          ...rule,
+          action: {
+            type: "redirect" as const,
+            target: rule.action.target.trim(),
+          },
+        };
+      }
+      return rule;
+    });
+
+    if (
+      normalizedTrafficRules.some(
+        (rule) =>
+          rule.action.type === "redirect" && rule.action.target.length === 0,
+      )
+    ) {
+      setSettingsError("Redirect rules must include a target model alias");
+      return;
+    }
+
+    const inflightLimit = updateData.realtime_inflight_limit;
+    if (
+      model.is_composite &&
+      ((inflightLimit === null && model.realtime_inflight_limit != null) ||
+        (inflightLimit !== null && inflightLimit < 1))
+    ) {
+      setSettingsError("Enter a realtime in-flight limit of 1 or more.");
+      return;
+    }
+
+    try {
+      const isStandard = !model.is_composite;
+      const standardFallbackOverrides = isStandard
+        ? {
+            fallback_enabled: updateData.backoff_enabled,
+            fallback_with_replacement: updateData.backoff_enabled,
+            fallback_max_attempts: updateData.backoff_enabled
+              ? (updateData.backoff_max_attempts ?? 3)
+              : null,
+          }
+        : {};
+
+      await updateModelMutation.mutateAsync({
+        id: model.id,
+        data: {
+          alias: updateData.alias,
+          display_name: updateData.display_name || null,
+          description: updateData.description,
+          model_type:
+            updateData.model_type === ""
+              ? null
+              : (updateData.model_type as "CHAT" | "EMBEDDINGS"),
+          capabilities: updateData.capabilities,
+          sanitize_responses: updateData.sanitize_responses,
+          trusted: updateData.trusted,
+          ...(isStandard
+            ? {
+                reasoning_translation_overrides:
+                  normalizeReasoningTranslationOverrides(
+                    updateData.reasoning_translation_overrides,
+                  ),
+              }
+            : {}),
+          ...(isStandard || updateData.realtime_inflight_limit === null
+            ? {}
+            : { realtime_inflight_limit: updateData.realtime_inflight_limit }),
+          batch_capacity: updateData.batch_capacity,
+          throughput: updateData.throughput,
+          allowed_batch_completion_windows:
+            updateData.allowed_batch_completion_windows,
+          traffic_routing_rules: normalizedTrafficRules,
+          metadata: updateData.metadata,
+          backoff_enabled: updateData.backoff_enabled,
+          backoff_initial_ms: updateData.backoff_initial_ms,
+          backoff_max_ms: updateData.backoff_max_ms,
+          backoff_factor: updateData.backoff_factor,
+          backoff_jitter: updateData.backoff_jitter,
+          backoff_max_total_ms: updateData.backoff_enabled
+            ? updateData.backoff_max_total_ms
+            : null,
+          ...standardFallbackOverrides,
+        },
+      });
+      setIsEditingModelDetails(false);
+    } catch (error) {
+      setSettingsError(
+        error instanceof Error
+          ? error.message
+          : "Failed to update model settings",
+      );
+    }
+  };
+
+  const handleModelDetailsCancel = () => {
+    if (model) {
+      const effectiveType = model.model_type || "CHAT";
+      setUpdateData({
+        alias: model.alias,
+        display_name: model.display_name || "",
+        description: model.description || "",
+        model_type: effectiveType as "CHAT" | "EMBEDDINGS",
+        capabilities: model.capabilities || [],
+        sanitize_responses: model.sanitize_responses ?? false,
+        trusted: model.trusted ?? false,
+        reasoning_translation_overrides:
+          normalizeReasoningTranslationOverrides(
+            model.reasoning_translation_overrides ?? null,
+          ),
+        realtime_inflight_limit: model.realtime_inflight_limit ?? null,
+        batch_capacity: model.batch_capacity || null,
+        throughput: model.throughput || null,
+        allowed_batch_completion_windows:
+          model.allowed_batch_completion_windows ?? null,
+        traffic_routing_rules: model.traffic_routing_rules || [],
+        metadata: model.metadata ?? null,
+        backoff_enabled: model.fallback?.backoff != null,
+        backoff_initial_ms: model.fallback?.backoff?.initial_ms ?? 100,
+        backoff_max_ms: model.fallback?.backoff?.max_ms ?? 5000,
+        backoff_factor: model.fallback?.backoff?.factor ?? 2.0,
+        backoff_jitter: model.fallback?.backoff?.jitter ?? "full",
+        backoff_max_total_ms: model.fallback?.max_total_backoff_ms ?? null,
+        backoff_max_attempts: model.fallback?.max_attempts ?? 3,
+      });
+    }
+    setIsEditingModelDetails(false);
+    setSettingsError(null);
+    setReasoningTranslationValid(true);
+  };
+
+  const onAliasSubmit = async (values: z.infer<typeof aliasFormSchema>) => {
+    if (!model) return;
+    setSettingsError(null);
+
+    try {
+      await updateModelMutation.mutateAsync({
+        id: model.id,
+        data: { alias: values.alias },
+      });
+      setIsEditingAlias(false);
+    } catch (error) {
+      setSettingsError(
+        error instanceof Error ? error.message : "Failed to update alias",
+      );
+    }
+  };
+
+  const handleAliasCancel = () => {
+    aliasForm.reset({
+      alias: model?.alias || "",
+    });
+    setIsEditingAlias(false);
+    setSettingsError(null);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <div
+            className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"
+            aria-label="Loading"
+          ></div>
+          <p className="text-doubleword-neutral-600">
+            Loading model details...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <div className="text-red-500 mb-4">
+            <ArrowLeft className="h-12 w-12 mx-auto" />
+          </div>
+          <p className="text-red-600 font-semibold">Error: {error}</p>
+          <Button
+            variant="outline"
+            onClick={() => navigate(fromUrl || "/models/manage")}
+            className="mt-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {fromUrl ? "Go Back" : "Back to Models"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!model) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <p className="text-gray-600 font-semibold">Model not found</p>
+          <Button
+            variant="outline"
+            onClick={() => navigate(fromUrl || "/models/manage")}
+            className="mt-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {fromUrl ? "Go Back" : "Back to Models"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6">
+      <Tabs
+        value={activeTab}
+        onValueChange={handleTabChange}
+        className="space-y-4"
+      >
+        { }
+        <div className="mb-6">
+          <div className="flex items-center gap-4 mb-4">
+            <button
+              onClick={() => navigate(fromUrl || "/models/manage")}
+              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+              aria-label={fromUrl ? "Go back" : "Back to Models"}
+              title={fromUrl ? "Go back" : "Back to Models"}
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+            <div className="flex-1 min-w-0">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div className="min-w-0">
+                  {isEditingAlias ? (
+                    <div className="space-y-2">
+                      <Form {...aliasForm}>
+                        <form
+                          onSubmit={aliasForm.handleSubmit(onAliasSubmit)}
+                          className="flex items-center gap-2"
+                        >
+                          <FormField
+                            control={aliasForm.control}
+                            name="alias"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormControl>
+                                  <Input
+                                    className="text-3xl font-bold h-12 text-doubleword-neutral-900"
+                                    placeholder="Model alias"
+                                    {...field}
+                                  />
+                                </FormControl>
+                              </FormItem>
+                            )}
+                          />
+                          <Button
+                            type="submit"
+                            size="sm"
+                            disabled={updateModelMutation.isPending}
+                          >
+                            {updateModelMutation.isPending ? (
+                              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                            ) : (
+                              <Check className="h-4 w-4" />
+                            )}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={handleAliasCancel}
+                            disabled={updateModelMutation.isPending}
+                          >
+                            <X className="h-4 w-4" />
+                          </Button>
+                        </form>
+                      </Form>
+                      {aliasForm.formState.errors.alias && (
+                        <p className="text-sm text-red-600">
+                          {aliasForm.formState.errors.alias.message}
+                        </p>
+                      )}
+                      {settingsError && (
+                        <p className="text-sm text-red-600">{settingsError}</p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3 min-w-0">
+                      {aliasTruncated ? (
+                        <Popover open={aliasPopoverOpen} onOpenChange={setAliasPopoverOpen}>
+                          <PopoverTrigger asChild>
+                            <h1
+                              ref={aliasRef}
+                              className="text-3xl font-bold text-doubleword-neutral-900 truncate min-w-0 cursor-default"
+                              onMouseEnter={() => setAliasPopoverOpen(true)}
+                              onMouseLeave={() => setAliasPopoverOpen(false)}
+                            >
+                              {model.alias}
+                            </h1>
+                          </PopoverTrigger>
+                          <PopoverContent
+                            side="bottom"
+                            align="start"
+                            className="w-auto max-w-sm px-3 py-2 pointer-events-none"
+                            onOpenAutoFocus={(e) => e.preventDefault()}
+                          >
+                            <p className="text-sm break-all font-medium">{model.alias}</p>
+                          </PopoverContent>
+                        </Popover>
+                      ) : (
+                        <h1
+                          ref={aliasRef}
+                          className="text-3xl font-bold text-doubleword-neutral-900 truncate min-w-0"
+                        >
+                          {model.alias}
+                        </h1>
+                      )}
+                      <button
+                        type="button"
+                        className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+                        aria-label="Copy model alias"
+                        onClick={async () => {
+                          if (await copyToClipboard(model.alias)) {
+                            setAliasCopied(true);
+                            setTimeout(() => setAliasCopied(false), 1500);
+                          }
+                        }}
+                      >
+                        {aliasCopied ? (
+                          <Check className="h-4 w-4 text-green-600" />
+                        ) : (
+                          <Copy className="h-4 w-4" />
+                        )}
+                      </button>
+                      { }
+                      {modelProbe && (
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`h-3 w-3 rounded-full ${
+                              model.status?.last_success === true
+                                ? "bg-green-500"
+                                : model.status?.last_success === false
+                                  ? "bg-red-500"
+                                  : "bg-gray-400"
+                            }`}
+                          />
+                          {model.status?.uptime_percentage !== undefined &&
+                            model.status?.uptime_percentage !== null && (
+                              <span className="text-sm text-doubleword-neutral-600">
+                                {model.status.uptime_percentage.toFixed(2)}%
+                                uptime (24h)
+                              </span>
+                            )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {canManageGroups && (
+                    <p className="text-doubleword-neutral-600 mt-1">
+                      {model.model_name}
+                      {model.is_composite ? (
+                        <>
+                          {" "}
+                          •{" "}
+                          <span className="inline-flex items-center gap-1">
+                            <GitMerge className="h-3 w-3" />
+                            Virtual ({components?.length || 0} hosted models)
+                          </span>
+                        </>
+                      ) : (
+                        canViewEndpoints && (
+                          <> • {endpoint?.name || "Unknown endpoint"}</>
+                        )
+                      )}
+                    </p>
+                  )}
+                  {!canManageGroups &&
+                    !model.is_composite &&
+                    canViewEndpoints && (
+                      <p className="text-doubleword-neutral-600 mt-1">
+                        {endpoint?.name || "Unknown endpoint"}
+                      </p>
+                    )}
+                </div>
+                {canManageGroups && (
+                  <div className="flex items-center justify-center sm:justify-start gap-3">
+                    <TabsList className="w-full sm:w-auto">
+                      <TabsTrigger
+                        value="overview"
+                        className="flex items-center gap-2"
+                      >
+                        <Info className="h-4 w-4" />
+                        Overview
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value="usage"
+                        className="flex items-center gap-2"
+                      >
+                        <Users className="h-4 w-4" />
+                        Usage
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value="probes"
+                        className="flex items-center gap-2"
+                      >
+                        <Activity className="h-4 w-4" />
+                        Uptime
+                      </TabsTrigger>
+                      {model.is_composite && (
+                        <TabsTrigger
+                          value="providers"
+                          className="flex items-center gap-2"
+                        >
+                          <GitMerge className="h-4 w-4" />
+                          Hosted Models
+                        </TabsTrigger>
+                      )}
+                    </TabsList>
+                    {model.is_composite && canManageModels && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setShowDeleteVirtualModal(true)}
+                        className="h-8 w-8 p-0"
+                        aria-label="Delete virtual model"
+                        title="Delete virtual model"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+          {model.provisioning_source && (
+            <div
+              role="status"
+              className="flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+            >
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>
+                This model is provisioned from {model.provisioning_source}.
+                Changes made here, other than enabling or disabling a hosted
+                model, will be overwritten when the server restarts.
+              </p>
+            </div>
+          )}
+        </div>
+        <TabsContent value="overview">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            { }
+            <div className="lg:col-span-2 space-y-6">
+              { }
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <div className="flex items-center justify-between">
+                    <CardTitle>Model Details</CardTitle>
+                    {canManageGroups && !isEditingModelDetails && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setIsEditingModelDetails(true)}
+                        className="h-8 w-8 p-0"
+                      >
+                        <Edit className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  {isEditingModelDetails ? (
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Full Name
+                          </label>
+                          <p className="font-medium p-2 bg-gray-50 rounded text-gray-500">
+                            {model.model_name}
+                          </p>
+                          <p className="text-xs text-gray-400 mt-1">
+                            Read-only
+                          </p>
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Alias
+                          </label>
+                          <Input
+                            value={updateData.alias}
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                alias: e.target.value,
+                              }))
+                            }
+                            className="font-medium"
+                            placeholder="Model alias"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Display Name
+                          </label>
+                          <Input
+                            value={updateData.display_name}
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                display_name: e.target.value,
+                              }))
+                            }
+                            placeholder="Human-readable name for catalog"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">
+                            Shown in the model catalog instead of alias
+                          </p>
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Type
+                          </label>
+                          <Select
+                            value={updateData.model_type}
+                            onValueChange={(value) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                model_type: value as "CHAT" | "EMBEDDINGS",
+                              }))
+                            }
+                          >
+                            <SelectTrigger>
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="CHAT">Chat</SelectItem>
+                              <SelectItem value="EMBEDDINGS">
+                                Embeddings
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-1 mb-2">
+                          <label className="text-sm text-gray-600">
+                            Description
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              User provided description for the model.
+                              Displayed to all users when viewing the model on
+                              the overview page.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <Textarea
+                          value={updateData.description}
+                          onChange={(e) =>
+                            setUpdateData((prev) => ({
+                              ...prev,
+                              description: e.target.value,
+                            }))
+                          }
+                          placeholder="Enter model description..."
+                          rows={3}
+                          className="resize-y min-h-[72px]"
+                        />
+                      </div>
+
+                      { }
+                      {updateData.model_type === "CHAT" && (
+                        <div className="border-t pt-4">
+                          <div className="flex items-center gap-1 mb-3">
+                            <label className="text-sm text-gray-600 font-medium">
+                              Capabilities
+                            </label>
+                          </div>
+                          <div className="space-y-2">
+                            {[
+                              { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
+                              { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                              { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
+                            ].map((cap) => (
+                              <label key={cap.id} className="flex items-center gap-2 text-sm">
+                                <Checkbox
+                                  id={`${cap.id}-capability`}
+                                  checked={
+                                    updateData.capabilities?.includes(cap.id) ??
+                                    false
+                                  }
+                                  onCheckedChange={(checked) => {
+                                    const newCapabilities = checked
+                                      ? [
+                                          ...(updateData.capabilities || []),
+                                          cap.id,
+                                        ]
+                                      : (updateData.capabilities || []).filter(
+                                          (c) => c !== cap.id,
+                                        );
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      capabilities: newCapabilities,
+                                    }));
+                                  }}
+                                />
+                                <span className="text-sm font-medium leading-none flex items-center gap-1">
+                                  {cap.label}
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      {cap.tip}
+                                    </p>
+                                  </InfoTip>
+                                </span>
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      { }
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Display Metadata
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Display metadata shown on the public models page.
+                              These fields are informational and do not affect
+                              model behavior.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Provider Key
+                            </label>
+                            <Input
+                              value={updateData.metadata?.provider ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    provider:
+                                      e.target.value.trim().toLowerCase() ||
+                                      undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. openai, anthropic, alibaba"
+                            />
+                            <p className="text-xs text-gray-400 mt-1">
+                              Matches the global provider config by key.
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Context Window
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              value={updateData.metadata?.context_window ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    context_window: e.target.value
+                                      ? parseInt(e.target.value)
+                                      : undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. 131072"
+                            />
+                            <p className="text-xs text-gray-400 mt-1">
+                              Max tokens
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Released
+                            </label>
+                            <Input
+                              type="date"
+                              value={updateData.metadata?.released_at ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    released_at: e.target.value || undefined,
+                                  },
+                                }))
+                              }
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Display Category
+                            </label>
+                            <Select
+                              value={updateData.metadata?.display_category ?? "__unset__"}
+                              onValueChange={(value) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    display_category:
+                                      value === "__unset__"
+                                        ? undefined
+                                        : (value as ModelDisplayCategory),
+                                  },
+                                }))
+                              }
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Use model type defaults" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="__unset__">Use model type defaults</SelectItem>
+                                {DISPLAY_CATEGORY_OPTIONS.map((option) => (
+                                  <SelectItem key={option.value} value={option.value}>
+                                    {option.label}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                            <p className="text-xs text-gray-400 mt-1">
+                              Controls which catalog tab this model appears in.
+                            </p>
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Intelligence Index
+                            </label>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="0.1"
+                              value={updateData.metadata?.intelligence_index ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    intelligence_index: e.target.value
+                                      ? parseFloat(e.target.value)
+                                      : undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. 45.0"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Attribution
+                            </label>
+                            <Input
+                              value={updateData.metadata?.attribution ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    attribution: e.target.value || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. artificial_analysis"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Quantization
+                            </label>
+                            <Input
+                              value={updateData.metadata?.quantization ?? ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    quantization: e.target.value.toUpperCase() || undefined,
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. FP8, FP16, INT4"
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Deployment Providers
+                            </label>
+                            <Input
+                              value={
+                                ((updateData.metadata?.extra as Record<string, unknown>)?.deployment_providers as string[] | undefined)?.join(", ") ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      deployment_providers: e.target.value
+                                        ? e.target.value.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="e.g. snowflake, onwards"
+                            />
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-1 gap-4 mt-4">
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 block">
+                              Model Order
+                            </label>
+                            <Input
+                              type="number"
+                              step="1"
+                              value={
+                                (updateData.metadata?.extra as Record<string, unknown>)?.model_order as number ?? ""
+                              }
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  metadata: {
+                                    ...prev.metadata,
+                                    extra: {
+                                      ...(prev.metadata?.extra ?? {}),
+                                      model_order: e.target.value
+                                        ? parseInt(e.target.value, 10)
+                                        : undefined,
+                                    },
+                                  },
+                                }))
+                              }
+                              placeholder="Lower numbers appear first"
+                            />
+                          </div>
+                        </div>
+                        <div className="mt-4">
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Summary
+                          </label>
+                          <Input
+                            value={
+                              (updateData.metadata?.extra as Record<string, unknown>)?.summary as string ?? ""
+                            }
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                metadata: {
+                                  ...prev.metadata,
+                                  extra: {
+                                    ...(prev.metadata?.extra ?? {}),
+                                    summary: e.target.value || undefined,
+                                  },
+                                },
+                              }))
+                            }
+                            placeholder="Short one-line description for the catalog"
+                          />
+                        </div>
+                        <div className="mt-4">
+                          <label className="text-sm text-gray-600 mb-2 block">
+                            Use Cases
+                          </label>
+                          <Input
+                            value={
+                              ((updateData.metadata?.extra as Record<string, unknown>)?.use_cases as string[] ?? []).join(", ")
+                            }
+                            onChange={(e) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                metadata: {
+                                  ...prev.metadata,
+                                  extra: {
+                                    ...(prev.metadata?.extra ?? {}),
+                                    use_cases: e.target.value
+                                      ? e.target.value.split(",").map((s) => s.trim()).filter(Boolean)
+                                      : undefined,
+                                  },
+                                },
+                              }))
+                            }
+                            placeholder="Comma-separated, e.g. Research, Coding, Analysis"
+                          />
+                          <p className="text-xs text-gray-400 mt-1">
+                            Comma-separated list
+                          </p>
+                        </div>
+                      </div>
+
+                      { }
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Response Configuration
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Configure how responses from this model are
+                              processed before being returned to clients.
+                            </p>
+                          </InfoTip>
+                        </div>
+
+                        <div className="space-y-2">
+                          { }
+                          {!strictModeEnabled && (
+                            <div className="flex items-center space-x-2">
+                              <input
+                                type="checkbox"
+                                id="sanitize-responses"
+                                checked={updateData.sanitize_responses ?? false}
+                                onChange={(e) => {
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    sanitize_responses: e.target.checked,
+                                  }));
+                                }}
+                                className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                              />
+                              <label
+                                htmlFor="sanitize-responses"
+                                className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                              >
+                                Sanitize Responses
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Filter out third-party provider fields from
+                                    OpenAI compatible responses to ensure clean,
+                                    standardized API responses.
+                                  </p>
+                                </InfoTip>
+                              </label>
+                            </div>
+                          )}
+
+                          { }
+                          {!model.is_composite && strictModeEnabled && (
+                            <>
+                              <div className="flex items-center space-x-2">
+                                <input
+                                  type="checkbox"
+                                  id="trusted-provider"
+                                  checked={updateData.trusted ?? false}
+                                  onChange={(e) => {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      trusted: e.target.checked,
+                                    }));
+                                  }}
+                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                                <label
+                                  htmlFor="trusted-provider"
+                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
+                                >
+                                  Trusted Provider
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Mark this provider as trusted in strict
+                                      mode. Trusted providers bypass error
+                                      sanitization, allowing full error details
+                                      to be returned. Non-trusted providers have
+                                      sensitive error information removed.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {!model.is_composite && (
+                        <div className="border-t pt-4">
+                          <ReasoningTranslationOverridesEditor
+                            value={updateData.reasoning_translation_overrides}
+                            endpointDefault={endpoint?.reasoning_translation}
+                            onValidityChange={setReasoningTranslationValid}
+                            onChange={(reasoning_translation_overrides) =>
+                              setUpdateData((previous) => ({
+                                ...previous,
+                                reasoning_translation_overrides,
+                              }))
+                            }
+                          />
+                        </div>
+                      )}
+
+                      { }
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Batch Completion Windows
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              All globally configured windows are allowed by
+                              default. Uncheck to restrict specific windows for
+                              this model.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="space-y-2">
+                          {availableCompletionWindows.map((window) => {
+                            const current =
+                              updateData.allowed_batch_completion_windows;
+                            const isChecked =
+                              current === null || current.includes(window);
+                            return (
+                              <label
+                                key={window}
+                                className="flex items-center gap-2 text-sm"
+                              >
+                                <Checkbox
+                                  checked={isChecked}
+                                  onCheckedChange={(checked) =>
+                                    setUpdateData((prev) => {
+                                      const current =
+                                        prev.allowed_batch_completion_windows;
+                                      let next: string[];
+                                      if (checked) {
+                                        if (current === null) return prev;
+                                        next = current.includes(window)
+                                          ? current
+                                          : [...current, window];
+                                      } else if (current === null) {
+                                        next =
+                                          availableCompletionWindows.filter(
+                                            (w) => w !== window,
+                                          );
+                                      } else {
+                                        next = current.filter(
+                                          (w) => w !== window,
+                                        );
+                                      }
+                                      const allChecked =
+                                        availableCompletionWindows.every((w) =>
+                                          next.includes(w),
+                                        );
+                                      return {
+                                        ...prev,
+                                        allowed_batch_completion_windows:
+                                          allChecked ? null : next,
+                                      };
+                                    })
+                                  }
+                                />
+                                <span className="font-mono text-xs">
+                                  {window}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                        {updateData.allowed_batch_completion_windows !==
+                          null &&
+                          updateData.allowed_batch_completion_windows.length >=
+                            0 && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="mt-3 text-xs"
+                            onClick={() =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                allowed_batch_completion_windows: null,
+                              }))
+                            }
+                          >
+                            Allow All
+                          </Button>
+                        )}
+                      </div>
+
+                      { }
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Traffic Routing Rules
+                          </label>
+                          <InfoTip>
+                            <p className="text-sm text-muted-foreground">
+                              Match API key purpose and either deny traffic or
+                              transparently redirect to another model alias.
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <div className="space-y-2">
+                          {updateData.traffic_routing_rules.length > 0 && (
+                            <div className="hidden md:grid md:grid-cols-12 gap-2 text-xs text-muted-foreground">
+                              <span className="md:col-span-3">Purpose</span>
+                              <span className="md:col-span-3">Action</span>
+                              <span className="md:col-span-5">Target</span>
+                            </div>
+                          )}
+                          {updateData.traffic_routing_rules.map((rule, index) => (
+                            <div
+                              key={index}
+                              className="grid grid-cols-1 md:grid-cols-12 gap-2 items-start"
+                            >
+                              <div className="md:col-span-3">
+                                <Select
+                                  value={rule.api_key_purpose}
+                                  onValueChange={(value) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.map((r, i) =>
+                                          i === index
+                                            ? {
+                                                ...r,
+                                                api_key_purpose:
+                                                  value as ApiKeyPurpose,
+                                              }
+                                            : r,
+                                        ),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    {TRAFFIC_PURPOSE_OPTIONS.filter(
+                                      (purpose) =>
+                                        purpose === rule.api_key_purpose ||
+                                        !updateData.traffic_routing_rules.some(
+                                          (r) =>
+                                            r.api_key_purpose === purpose,
+                                        ),
+                                    ).map((purpose) => (
+                                      <SelectItem key={purpose} value={purpose}>
+                                        {purpose}
+                                      </SelectItem>
+                                    ))}
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div className="md:col-span-3">
+                                <Select
+                                  value={rule.action.type}
+                                  onValueChange={(value) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.map((r, i) => {
+                                          if (i !== index) return r;
+                                          if (value === "redirect") {
+                                            return {
+                                              ...r,
+                                              action: {
+                                                type: "redirect",
+                                                target:
+                                                  r.action.type === "redirect"
+                                                    ? r.action.target
+                                                    : "",
+                                              },
+                                            };
+                                          }
+                                          return {
+                                            ...r,
+                                            action: { type: "deny" },
+                                          };
+                                        }),
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="deny">Deny</SelectItem>
+                                    <SelectItem value="redirect">
+                                      Redirect
+                                    </SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                              <div className="md:col-span-5">
+                                {rule.action.type === "redirect" ? (
+                                  <ModelCombobox
+                                    value={
+                                      rule.action.target
+                                        ? ({ id: "", alias: rule.action.target } as any)
+                                        : null
+                                    }
+                                    onValueChange={(model) =>
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        traffic_routing_rules:
+                                          prev.traffic_routing_rules.map((r, i) =>
+                                            i === index
+                                              ? {
+                                                  ...r,
+                                                  action: {
+                                                    type: "redirect",
+                                                    target: model.alias,
+                                                  },
+                                                }
+                                              : r,
+                                          ),
+                                      }))
+                                    }
+                                    placeholder="Select target model..."
+                                    className="w-full font-mono text-xs"
+                                    filterFn={(model) =>
+                                      model.id !== modelId
+                                    }
+                                  />
+                                ) : (
+                                  <p className="text-xs text-muted-foreground h-10 flex items-center">
+                                    Return 403 Forbidden
+                                  </p>
+                                )}
+                              </div>
+                              <div className="md:col-span-1 flex justify-end">
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-9 w-9 p-0"
+                                  onClick={() =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      traffic_routing_rules:
+                                        prev.traffic_routing_rules.filter(
+                                          (_, i) => i !== index,
+                                        ),
+                                    }))
+                                  }
+                                >
+                                  <X className="h-4 w-4" />
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        {(() => {
+                          const usedPurposes = new Set(
+                            updateData.traffic_routing_rules.map(
+                              (r) => r.api_key_purpose,
+                            ),
+                          );
+                          const nextPurpose =
+                            TRAFFIC_PURPOSE_OPTIONS.find(
+                              (p) => !usedPurposes.has(p),
+                            );
+                          return (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="mt-3"
+                              disabled={!nextPurpose}
+                              onClick={() => {
+                                if (!nextPurpose) return;
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  traffic_routing_rules: [
+                                    ...prev.traffic_routing_rules,
+                                    {
+                                      api_key_purpose: nextPurpose,
+                                      action: { type: "deny" },
+                                    },
+                                  ],
+                                }));
+                              }}
+                            >
+                              Add Rule
+                            </Button>
+                          );
+                        })()}
+                      </div>
+
+                      { }
+                      <div className="border-t pt-4">
+                        <div className="flex items-center gap-1 mb-3">
+                          <label className="text-sm text-gray-600 font-medium">
+                            Limits and Capacity
+                          </label>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          {model.is_composite && (
+                            <div>
+                              <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                                Realtime In-Flight Limit
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Default number of realtime requests one
+                                    account can have in flight on this model.
+                                    Requests over the limit get a 429. Batch
+                                    and async requests are not counted.
+                                    Accounts can have their own limits in
+                                    account limit files.
+                                  </p>
+                                </InfoTip>
+                              </label>
+                              <Input
+                                type="number"
+                                min="1"
+                                step="1"
+                                aria-label="Realtime In-Flight Limit"
+                                value={updateData.realtime_inflight_limit ?? ""}
+                                onChange={(e) =>
+                                  setUpdateData((prev) => ({
+                                    ...prev,
+                                    realtime_inflight_limit:
+                                      e.target.value === ""
+                                        ? null
+                                        : Number(e.target.value),
+                                  }))
+                                }
+                              />
+                            </div>
+                          )}
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                              Per-Daemon Batch Concurrency
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Maximum concurrent batch requests each
+                                  daemon can send to this model. Total
+                                  capacity scales with the number of running
+                                  daemons.
+                                </p>
+                              </InfoTip>
+                              {runningDaemonCount > 0 && (
+                                <span className="text-xs text-gray-500">
+                                  ({runningDaemonCount}{" "}
+                                  {runningDaemonCount === 1
+                                    ? "daemon"
+                                    : "daemons"}{" "}
+                                  running
+                                  {updateData.batch_capacity
+                                    ? ` · ${(updateData.batch_capacity * runningDaemonCount).toLocaleString()} total capacity`
+                                    : ""}
+                                  )
+                                </span>
+                              )}
+                            </label>
+                            <Input
+                              type="number"
+                              min="1"
+                              max="10000"
+                              step="1"
+                              value={updateData.batch_capacity || ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  batch_capacity:
+                                    e.target.value === ""
+                                      ? null
+                                      : Number(e.target.value),
+                                }))
+                              }
+                              placeholder={
+                                updateData.batch_capacity !== null
+                                  ? updateData.batch_capacity?.toString() ||
+                                    "None"
+                                  : "None"
+                              }
+                            />
+                          </div>
+                          <div>
+                            <label className="text-sm text-gray-600 mb-2 flex items-center gap-1">
+                              Throughput
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Model throughput in requests per second,
+                                  used for batch SLA capacity calculations.
+                                  Defaults to 100 req/s if not set.
+                                </p>
+                              </InfoTip>
+                            </label>
+                            <Input
+                              type="number"
+                              min="0.01"
+                              max="1000"
+                              step="any"
+                              value={updateData.throughput || ""}
+                              onChange={(e) =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  throughput:
+                                    e.target.value === ""
+                                      ? null
+                                      : Number(e.target.value),
+                                }))
+                              }
+                              placeholder={
+                                updateData.throughput !== null
+                                  ? updateData.throughput?.toString() || "None"
+                                  : "None"
+                              }
+                            />
+                          </div>
+                        </div>
+                        {(updateData.batch_capacity ||
+                          updateData.throughput) && (
+                          <div className="mt-3">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() =>
+                                setUpdateData((prev) => ({
+                                  ...prev,
+                                  batch_capacity: null,
+                                  throughput: null,
+                                }))
+                              }
+                              className="text-xs"
+                            >
+                              Clear Batch Capacity
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+
+                      { }
+                      <div className="space-y-4 pt-6 border-t">
+                        <div>
+                          <h4 className="text-base font-semibold text-gray-900 flex items-center gap-2">
+                            Retry Backoff
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                Insert an exponential delay between retry
+                                attempts on transient upstream failures
+                                (rate-limit / 5xx / network errors). For
+                                single-provider models, this also opts into
+                                same-provider retries. For composite models,
+                                this gates the wait between fallback hops
+                                configured in Routing Configuration.
+                              </p>
+                            </InfoTip>
+                          </h4>
+                          <p className="text-sm text-gray-500 mt-1">
+                            Off (default) preserves the legacy zero-delay
+                            retry behavior.
+                          </p>
+                        </div>
+
+                        <div className="flex items-center justify-between">
+                          <label className="text-sm text-gray-700">
+                            Enable backoff
+                          </label>
+                          <Switch
+                            checked={updateData.backoff_enabled}
+                            onCheckedChange={(checked) =>
+                              setUpdateData((prev) => ({
+                                ...prev,
+                                backoff_enabled: checked,
+                              }))
+                            }
+                          />
+                        </div>
+
+                        {updateData.backoff_enabled && (
+                          <div className="space-y-3 pl-4 border-l-2 border-gray-200">
+                            { }
+                            {!model.is_composite && (
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Max attempts
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Total tries including the first. Must be
+                                      &gt; 1 for retries to happen — a
+                                      single-provider model otherwise makes one
+                                      attempt and stops, so backoff never fires.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="2"
+                                  value={updateData.backoff_max_attempts ?? ""}
+                                  onChange={(e) => {
+                                    const val = e.target.value;
+                                    if (val === "") {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_attempts: null,
+                                      }));
+                                    } else {
+                                      const num = Number(val);
+                                      if (Number.isFinite(num) && num >= 2) {
+                                        setUpdateData((prev) => ({
+                                          ...prev,
+                                          backoff_max_attempts: Math.floor(num),
+                                        }));
+                                      }
+                                    }
+                                  }}
+                                  placeholder="3"
+                                  className="w-32"
+                                />
+                              </div>
+                            )}
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 block">
+                                  Initial delay (ms)
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="1"
+                                  value={updateData.backoff_initial_ms}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_initial_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 block">
+                                  Max delay (ms)
+                                </label>
+                                <Input
+                                  type="number"
+                                  min="1"
+                                  value={updateData.backoff_max_ms}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Growth factor
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Each retry's base delay = initial ×
+                                      factor^(retry − 1), capped at max delay.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Input
+                                  type="number"
+                                  step="0.1"
+                                  min="1"
+                                  value={updateData.backoff_factor}
+                                  onChange={(e) => {
+                                    const num = Number(e.target.value);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_factor: num,
+                                      }));
+                                    }
+                                  }}
+                                />
+                              </div>
+                              <div>
+                                <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                  Jitter
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      <b>Full</b> samples uniformly from
+                                      [0, delay] to avoid synchronized retries.
+                                      <br />
+                                      <b>None</b> uses the exact computed delay.
+                                    </p>
+                                  </InfoTip>
+                                </label>
+                                <Select
+                                  value={updateData.backoff_jitter}
+                                  onValueChange={(v) =>
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      backoff_jitter: v as "full" | "none",
+                                    }))
+                                  }
+                                >
+                                  <SelectTrigger>
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="full">Full</SelectItem>
+                                    <SelectItem value="none">None</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
+                            </div>
+
+                            <div>
+                              <label className="text-sm text-gray-600 mb-1 flex items-center gap-1">
+                                Total backoff budget (ms)
+                                <InfoTip>
+                                  <p className="text-sm text-muted-foreground">
+                                    Cumulative cap across all inter-attempt
+                                    sleeps. Blank = no budget cap (max_attempts
+                                    still bounds the loop).
+                                  </p>
+                                </InfoTip>
+                              </label>
+                              <Input
+                                type="number"
+                                min="1"
+                                value={updateData.backoff_max_total_ms ?? ""}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  if (val === "") {
+                                    setUpdateData((prev) => ({
+                                      ...prev,
+                                      backoff_max_total_ms: null,
+                                    }));
+                                  } else {
+                                    const num = Number(val);
+                                    if (Number.isFinite(num) && num >= 1) {
+                                      setUpdateData((prev) => ({
+                                        ...prev,
+                                        backoff_max_total_ms: Math.floor(num),
+                                      }));
+                                    }
+                                  }
+                                }}
+                                placeholder="No cap"
+                                className="w-40"
+                              />
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-3 pt-4 border-t justify-end">
+                        <Button
+                          onClick={handleSave}
+                          disabled={
+                            updateModelMutation.isPending ||
+                            !reasoningTranslationValid
+                          }
+                          size="sm"
+                        >
+                          {updateModelMutation.isPending ? (
+                            <>
+                              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
+                              Saving...
+                            </>
+                          ) : (
+                            <>
+                              <Check className="mr-2 h-4 w-4" />
+                              Save Changes
+                            </>
+                          )}
+                        </Button>
+                        <Button
+                          variant="outline"
+                          onClick={handleModelDetailsCancel}
+                          disabled={updateModelMutation.isPending}
+                          size="sm"
+                        >
+                          Cancel
+                        </Button>
+                        {settingsError && (
+                          <p className="text-sm text-red-600 ml-3">
+                            {settingsError}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      {canManageGroups && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Full Name</p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The name under which the model is available
+                                  at the upstream endpoint.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            <p className="font-medium">{model.model_name}</p>
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Alias</p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The name under which the model will be made
+                                  available in the control layer API.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            <p className="font-medium">{model.alias}</p>
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">Type</p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  The type of the model. Determines which
+                                  playground is used.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            <Badge variant="outline">
+                              {model.model_type || "UNKNOWN"}
+                            </Badge>
+                          </div>
+                      </div>
+                      )}
+                      <div>
+                        <div className="flex items-center gap-1 mb-1">
+                          <p className="text-sm text-gray-600">Description</p>
+                          {canManageGroups && (
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                User provided description for the model.
+                                Displayed to all users when viewing the model on
+                                the overview page.
+                              </p>
+                            </InfoTip>
+                          )}
+                        </div>
+                        {model.description ? (
+                          <Markdown className="text-sm text-gray-700">
+                            {model.description}
+                          </Markdown>
+                        ) : (
+                          <p className="text-gray-700">
+                            No description provided
+                          </p>
+                        )}
+                      </div>
+
+                      { }
+                      {(model.model_type === "CHAT" || !model.model_type) &&
+                        canManageGroups && (
+                          <div className="border-t pt-6">
+                            <div className="flex items-center gap-1 mb-3">
+                              <p className="text-sm text-gray-600 font-medium">
+                                Capabilities
+                              </p>
+                            </div>
+                            <div className="space-y-3">
+                              {[
+                                { id: "vision", label: "Vision", tip: "Enables image upload in the playground." },
+                                { id: "reasoning", label: "Reasoning", tip: "Model supports extended reasoning / chain-of-thought." },
+                                { id: "enhanced_structured_generation", label: "Enhanced Structured Generation", tip: "Model supports enhanced generation for complex schema generation." },
+                              ].map((cap) => (
+                                <div key={cap.id} className="flex items-center justify-between">
+                                  <label className="flex items-center gap-2 text-sm">
+                                    <Checkbox
+                                      id={`${cap.id}-capability-readonly`}
+                                      checked={
+                                        model.capabilities?.includes(cap.id) ??
+                                        false
+                                      }
+                                      onCheckedChange={async (checked) => {
+                                        const newCapabilities = checked
+                                          ? [
+                                              ...(model.capabilities || []),
+                                              cap.id,
+                                            ]
+                                          : (model.capabilities || []).filter(
+                                              (c) => c !== cap.id,
+                                            );
+
+                                        try {
+                                          await updateModelMutation.mutateAsync({
+                                            id: model.id,
+                                            data: {
+                                              capabilities: newCapabilities,
+                                            },
+                                          });
+                                        } catch (error) {
+                                          console.error(
+                                            "Failed to update capabilities:",
+                                            error,
+                                          );
+                                        }
+                                      }}
+                                      disabled={updateModelMutation.isPending}
+                                    />
+                                    <span className="text-sm font-medium leading-none flex items-center gap-1">
+                                      {cap.label}
+                                      <InfoTip>
+                                        <p className="text-sm text-muted-foreground">
+                                          {cap.tip}
+                                        </p>
+                                      </InfoTip>
+                                    </span>
+                                  </label>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                      { }
+                      {model.metadata && (
+                        <div className="border-t pt-6">
+                          <div className="flex items-center gap-1 mb-3">
+                            <p className="text-sm text-gray-600 font-medium">
+                              Display Metadata
+                            </p>
+                          </div>
+                          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                          {model.metadata.provider && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Provider Key</p>
+                                <p className="text-sm font-medium">{model.metadata.provider}</p>
+                            </div>
+                          )}
+                          {model.metadata.display_category && (
+                            <div>
+                                <p className="text-xs text-gray-400 mb-1">Display Category</p>
+                                <p className="text-sm font-medium capitalize">
+                                  {model.metadata.display_category}
+                                </p>
+                            </div>
+                          )}
+                            {model.metadata.context_window != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Context Window</p>
+                                <p className="text-sm font-medium tabular-nums">
+                                  {model.metadata.context_window >= 1024
+                                    ? `${Math.round(model.metadata.context_window / 1024)}k tokens`
+                                    : `${model.metadata.context_window} tokens`}
+                                </p>
+                              </div>
+                            )}
+                            {model.metadata.intelligence_index != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Intelligence Index</p>
+                                <p className="text-sm font-medium tabular-nums">{model.metadata.intelligence_index}</p>
+                              </div>
+                            )}
+                            {model.metadata.released_at && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Released</p>
+                                <p className="text-sm font-medium">
+                                  {new Date(model.metadata.released_at + "T00:00:00").toLocaleDateString("en-US", {
+                                    month: "short",
+                                    day: "numeric",
+                                    year: "numeric",
+                                  })}
+                                </p>
+                              </div>
+                            )}
+                            {model.metadata.attribution && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Attribution</p>
+                                <p className="text-sm font-medium">{model.metadata.attribution}</p>
+                              </div>
+                            )}
+                            {model.metadata.quantization && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Quantization</p>
+                                <p className="text-sm font-medium">{model.metadata.quantization}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.deployment_providers && model.metadata.extra.deployment_providers.length > 0 && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Deployment Providers</p>
+                                <p className="text-sm font-medium">{model.metadata.extra.deployment_providers.join(", ")}</p>
+                              </div>
+                            )}
+                            {model.metadata.extra?.model_order != null && (
+                              <div>
+                                <p className="text-xs text-gray-400 mb-1">Model Order</p>
+                                <p className="text-sm font-medium tabular-nums">
+                                  {model.metadata.extra.model_order}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                          {model.metadata.extra?.summary && (
+                            <div className="mt-3">
+                              <p className="text-xs text-gray-400 mb-1">Summary</p>
+                              <p className="text-sm text-gray-700">{model.metadata.extra.summary}</p>
+                            </div>
+                          )}
+                          {model.metadata.extra?.use_cases && model.metadata.extra.use_cases.length > 0 && (
+                            <div className="mt-3">
+                              <p className="text-xs text-gray-400 mb-1">Use Cases</p>
+                              <div className="flex flex-wrap gap-1.5">
+                                {model.metadata.extra.use_cases.map((uc) => (
+                                  <Badge key={uc} variant="secondary" className="text-xs font-normal">
+                                    {uc}
+                                  </Badge>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      { }
+                      {canManageGroups && (
+                        <div className="border-t pt-6 space-y-4">
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">
+                                Batch Completion Windows
+                              </p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Allowed batch completion windows for this model.
+                                  Empty means global defaults from config.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            {model.allowed_batch_completion_windows &&
+                            model.allowed_batch_completion_windows.length > 0 ? (
+                              <div className="flex flex-wrap gap-2">
+                                {model.allowed_batch_completion_windows.map((window) => (
+                                  <Badge key={window} variant="outline" className="font-mono">
+                                    {window}
+                                  </Badge>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-sm text-muted-foreground">
+                                Global defaults ({availableCompletionWindows.join(", ")})
+                              </p>
+                            )}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">
+                                Traffic Routing Rules
+                              </p>
+                              <InfoTip>
+                                <p className="text-sm text-muted-foreground">
+                                  Purpose-specific deny or redirect behavior.
+                                </p>
+                              </InfoTip>
+                            </div>
+                            {model.traffic_routing_rules &&
+                            model.traffic_routing_rules.length > 0 ? (
+                              <div className="space-y-2">
+                                {model.traffic_routing_rules.map((rule, index) => (
+                                  <div
+                                    key={index}
+                                    className="flex items-center justify-between rounded-md border bg-muted px-3 py-2"
+                                  >
+                                    <div className="flex items-center gap-2 text-sm">
+                                      <Badge variant="outline">{rule.api_key_purpose}</Badge>
+                                      <span className="text-muted-foreground">→</span>
+                                      {rule.action.type === "deny" ? (
+                                        <span className="font-medium">deny</span>
+                                      ) : (
+                                        <span className="font-medium">
+                                          redirect to
+                                          <span className="ml-1 font-mono text-xs">
+                                            {rule.action.target}
+                                          </span>
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-sm text-muted-foreground">
+                                No routing rules configured.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <ModelPricing
+                        key={`${model.id}:${searchParams.get("pricing_org") ?? "general"}`}
+                        model={model}
+                        manager={canManageModels}
+                        initialOrganization={searchParams.get("pricing_org") ?? undefined}
+                        onEditPrices={() => setShowPricingModal(true)}
+                        onEditCache={() => setShowCachePricingModal(true)}
+                      />
+
+                      { }
+                      {canManageGroups &&
+                        (model.realtime_inflight_limit !== undefined ||
+                          model.batch_capacity !== undefined ||
+                          model.throughput !== undefined) && (
+                          <div className="border-t pt-6">
+                            <div className="flex items-center gap-1 mb-1">
+                              <p className="text-sm text-gray-600">
+                                Limits & Capacity
+                              </p>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                              {model.is_composite && (
+                                <div>
+                                  <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                    Realtime In-Flight Limit
+                                    <InfoTip>
+                                      <p className="text-sm text-muted-foreground">
+                                        Default number of realtime requests one
+                                        account can have in flight on this
+                                        model. Batch and async requests are not
+                                        counted.
+                                      </p>
+                                    </InfoTip>
+                                  </p>
+                                  <p className="font-medium">
+                                    {model.realtime_inflight_limit != null
+                                      ? `${model.realtime_inflight_limit.toLocaleString()} per account`
+                                      : "Not visible"}
+                                  </p>
+                                </div>
+                              )}
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                  Per-Daemon Batch Concurrency
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Maximum concurrent batch requests each
+                                      daemon can send to this model. Total
+                                      capacity scales with the number of
+                                      running daemons.
+                                    </p>
+                                  </InfoTip>
+                                  {runningDaemonCount > 0 && (
+                                    <span className="text-xs text-gray-500">
+                                      ({runningDaemonCount}{" "}
+                                      {runningDaemonCount === 1
+                                        ? "daemon"
+                                        : "daemons"}{" "}
+                                      running)
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="font-medium">
+                                  {model.batch_capacity
+                                    ? `${model.batch_capacity.toLocaleString()} per daemon`
+                                    : "No limit"}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-xs text-gray-500 mb-1 flex items-center gap-1">
+                                  Throughput
+                                  <InfoTip>
+                                    <p className="text-sm text-muted-foreground">
+                                      Model throughput in requests per second,
+                                      used for batch SLA capacity
+                                      calculations. Defaults to 100 req/s if
+                                      not set.
+                                    </p>
+                                  </InfoTip>
+                                </p>
+                                <p className="font-medium">
+                                  {model.throughput
+                                    ? `${model.throughput} req/s`
+                                    : "100 req/s (default)"}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              { }
+              {canViewAnalytics && model.metrics && (
+                <Card className="p-0 gap-0 rounded-lg">
+                  <CardHeader className="px-6 pt-5 pb-4">
+                    <CardTitle>Usage Metrics</CardTitle>
+                    <CardDescription>
+                      Request statistics and performance data
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="px-6 pb-6 pt-0">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
+                      <div>
+                        <div className="flex items-center gap-1 mb-1">
+                          <p className="text-sm text-gray-600">
+                            Total Requests
+                          </p>
+                          <InfoTip className="w-40">
+                            <p className="text-xs text-muted-foreground">
+                              Total requests made to this model
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <p className="text-xl font-bold text-gray-900">
+                          {model.metrics.total_requests.toLocaleString()}
+                        </p>
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-1 mb-1">
+                          <p className="text-sm text-gray-600">Avg Latency</p>
+                          <InfoTip className="w-40">
+                            <p className="text-xs text-muted-foreground">
+                              Average response time across all requests
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <p className="text-xl font-bold text-gray-900">
+                          {model.metrics.avg_latency_ms
+                            ? model.metrics.avg_latency_ms >= 1000
+                              ? `${(model.metrics.avg_latency_ms / 1000).toFixed(1)}s`
+                              : `${Math.round(model.metrics.avg_latency_ms)}ms`
+                            : "N/A"}
+                        </p>
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-1 mb-1">
+                          <p className="text-sm text-gray-600">Total Tokens</p>
+                          <InfoTip className="w-48">
+                            <div className="text-xs text-muted-foreground">
+                              <p>
+                                Input:{" "}
+                                {model.metrics.total_input_tokens.toLocaleString()}
+                              </p>
+                              <p>
+                                Output:{" "}
+                                {model.metrics.total_output_tokens.toLocaleString()}
+                              </p>
+                              <p className="mt-1 font-medium">
+                                Total tokens processed
+                              </p>
+                            </div>
+                          </InfoTip>
+                        </div>
+                        <p className="text-xl font-bold text-gray-900">
+                          {(
+                            model.metrics.total_input_tokens +
+                            model.metrics.total_output_tokens
+                          ).toLocaleString()}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          {model.metrics.total_input_tokens.toLocaleString()} in
+                          + {model.metrics.total_output_tokens.toLocaleString()}{" "}
+                          out
+                        </p>
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-1 mb-1">
+                          <p className="text-sm text-gray-600">Last Active</p>
+                          <InfoTip className="w-36">
+                            <p className="text-xs text-muted-foreground">
+                              Last request received
+                            </p>
+                          </InfoTip>
+                        </div>
+                        <p className="text-xl font-bold text-gray-900">
+                          {model.metrics.last_active_at
+                            ? (() => {
+                                const date = new Date(
+                                  model.metrics.last_active_at,
+                                );
+                                const now = new Date();
+                                const diffMs = now.getTime() - date.getTime();
+                                const diffMinutes = Math.floor(
+                                  diffMs / (1000 * 60),
+                                );
+                                const diffHours = Math.floor(
+                                  diffMs / (1000 * 60 * 60),
+                                );
+                                const diffDays = Math.floor(
+                                  diffMs / (1000 * 60 * 60 * 24),
+                                );
+
+                                if (diffMinutes < 1) return "Now";
+                                if (diffMinutes < 60) return `${diffMinutes}m`;
+                                if (diffHours < 24) return `${diffHours}h`;
+                                if (diffDays < 7) return `${diffDays}d`;
+                                return date.toLocaleDateString();
+                              })()
+                            : "Never"}
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+
+            { }
+            <div className="space-y-6">
+              { }
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Quick Actions</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0 space-y-3">
+                  {!isPlaygroundDenied(model) && (
+                    <Button
+                      className="w-full justify-start"
+                      onClick={() => {
+                        const currentUrl = `/models/manage/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                        navigate(
+                          `/playground?model=${encodeURIComponent(model.id)}&from=${encodeURIComponent(currentUrl)}`,
+                        );
+                      }}
+                    >
+                      <Play className="mr-2 h-4 w-4" />
+                      Try in Playground
+                    </Button>
+                  )}
+                  {canViewAnalytics && (
+                    <>
+                      <Button
+                        variant="outline"
+                        className="w-full justify-start"
+                        onClick={() => {
+                          const currentUrl = `/models/manage/${model.id}${fromUrl ? `?from=${encodeURIComponent(fromUrl)}` : ""}`;
+                          navigate(
+                            `/analytics?model=${encodeURIComponent(model.alias)}&from=${encodeURIComponent(currentUrl)}`,
+                          );
+                        }}
+                      >
+                        <BarChart3 className="mr-2 h-4 w-4" />
+                        View Analytics
+                      </Button>
+                    </>
+                  )}
+                  <Button
+                    variant="outline"
+                    className="w-full justify-start"
+                    onClick={() => setShowApiExamples(true)}
+                  >
+                    <Code className="mr-2 h-4 w-4" />
+                    API Examples
+                  </Button>
+                  {canManageGroups && (
+                    <Button
+                      variant="outline"
+                      className="w-full justify-start"
+                      onClick={() => setShowAccessModal(true)}
+                    >
+                      <Users className="mr-2 h-4 w-4" />
+                      Manage Access
+                    </Button>
+                  )}
+                </CardContent>
+              </Card>
+
+              { }
+              {canViewAnalytics &&
+                model.metrics &&
+                model.metrics.time_series && (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="px-6 pt-5 pb-4">
+                      <CardTitle>Activity</CardTitle>
+                      <CardDescription>
+                        Request volume over time
+                      </CardDescription>
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      <div className="flex items-center justify-center">
+                        <Sparkline
+                          data={model.metrics.time_series}
+                          width={280}
+                          height={60}
+                          className="w-full h-auto"
+                        />
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
+            </div>
+          </div>
+        </TabsContent>
+
+        {canManageGroups && (
+          <TabsContent value="usage">
+            <UserUsageTable modelAlias={model.alias} />
+          </TabsContent>
+        )}
+
+        {canManageGroups && (
+          <TabsContent value="probes">
+            <ModelProbes model={model} canManageProbes={canManageGroups} />
+          </TabsContent>
+        )}
+
+        {canManageGroups && model.is_composite && (
+          <TabsContent value="providers">
+            <ProvidersTab model={model} canManage={canManageGroups} />
+          </TabsContent>
+        )}
+      </Tabs>
+
+      { }
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        model={model}
+      />
+
+      { }
+      <AccessManagementModal
+        isOpen={showAccessModal}
+        onClose={() => setShowAccessModal(false)}
+        model={model}
+      />
+
+      { }
+      <UpdateModelPricingModal
+        isOpen={showPricingModal}
+        modelId={model.id}
+        modelName={model.alias}
+        onClose={() => setShowPricingModal(false)}
+      />
+      <CachePricingModal
+        isOpen={showCachePricingModal}
+        modelId={model.id}
+        modelName={model.alias}
+        onClose={() => setShowCachePricingModal(false)}
+      />
+
+      { }
+      {model.is_composite && (
+        <DeleteVirtualModelModal
+          isOpen={showDeleteVirtualModal}
+          onClose={() => setShowDeleteVirtualModal(false)}
+          onSuccess={() => navigate(fromUrl || "/models/manage")}
+          modelId={model.id}
+          modelAlias={model.alias}
+          modelName={model.model_name}
+          componentCount={components?.length ?? 0}
+        />
+      )}
+    </div>
+  );
+};
+
+export default ModelInfo;

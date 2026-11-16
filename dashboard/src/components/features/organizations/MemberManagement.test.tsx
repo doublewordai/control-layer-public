@@ -1,0 +1,258 @@
+import { render, within, waitFor, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
+import { ReactNode } from "react";
+import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { MemberManagement } from "./MemberManagement";
+import { OrganizationProvider } from "../../../contexts/organization/OrganizationContext";
+import { handlers } from "../../../api/control-layer/mocks/handlers";
+
+const server = setupServer(...handlers);
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <OrganizationProvider>{children}</OrganizationProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+describe("MemberManagement", () => {
+  it("shows loading spinner initially", () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+    expect(container.querySelector(".animate-spin")).toBeInTheDocument();
+  });
+
+  it("displays active members", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+    expect(within(container).getByText("James Wilson")).toBeInTheDocument();
+    expect(
+      within(container).getByText("sarah.chen@acme.com"),
+    ).toBeInTheDocument();
+  });
+
+  it("displays pending invites", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("newuser@acme.com"),
+      ).toBeInTheDocument();
+    });
+
+    expect(within(container).getByText(/Pending Invites/)).toBeInTheDocument();
+  });
+
+  it("shows empty state when no members", async () => {
+    server.use(
+      http.get("/admin/api/v1/organizations/:orgId/members", () => {
+        return HttpResponse.json([]);
+      }),
+    );
+
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("No members yet")).toBeInTheDocument();
+    });
+  });
+
+  it("opens the invite modal when clicking Invite Member", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", { name: /invite member/i }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByPlaceholderText("Enter email address..."),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByRole("radio", { name: "Member" })).toBeChecked();
+    expect(
+      within(dialog).getByRole("switch", { name: "Can generate API keys" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("button", { name: /send invite/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides management controls in readOnly mode", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" readOnly />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).queryByRole("button", { name: /invite member/i }),
+    ).not.toBeInTheDocument();
+
+    expect(
+      within(container).queryByTitle("Remove member"),
+    ).not.toBeInTheDocument();
+
+    expect(
+      within(container).queryByRole("button", { name: /change role for/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("opens remove member dialog", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("James Wilson")).toBeInTheDocument();
+    });
+
+    const removeButtons = within(container).getAllByTitle("Remove member");
+    await user.click(removeButtons[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Remove Member")).toBeInTheDocument();
+    expect(within(dialog).getByText(/James Wilson/)).toBeInTheDocument();
+  });
+
+  it("cancels remove member dialog", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    const removeButtons = within(container).getAllByTitle("Remove member");
+    await user.click(removeButtons[0]);
+
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /cancel/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+  });
+
+  it("shows leave button for current user and no remove button", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByTitle("Leave organization"),
+    ).toBeInTheDocument();
+
+    const removeButtons = within(container).getAllByTitle("Remove member");
+    expect(removeButtons).toHaveLength(1);
+  });
+
+  it("opens leave confirmation dialog", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    await user.click(within(container).getByTitle("Leave organization"));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Leave Organization")).toBeInTheDocument();
+    expect(within(dialog).getByText(/API keys will be deleted/)).toBeInTheDocument();
+  });
+
+  it("shows cancel invite button for pending invites", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("newuser@acme.com"),
+      ).toBeInTheDocument();
+    });
+
+    expect(within(container).getByTitle("Cancel invite")).toBeInTheDocument();
+  });
+
+  it("hides cancel invite button in readOnly mode", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" readOnly />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("newuser@acme.com"),
+      ).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).queryByTitle("Cancel invite"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows member count in heading", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Members (2)")).toBeInTheDocument();
+    });
+  });
+});

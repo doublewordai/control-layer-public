@@ -1,0 +1,3979 @@
+# Changelog
+
+## [17.1.4](https://github.com/doublewordai/control-layer/compare/v17.1.3...v17.1.4) (2026-11-16)
+
+
+### Continuous Integration
+
+* export releases to a public repository ([#2194](https://github.com/doublewordai/control-layer/issues/2194)) ([27e5d18](https://github.com/doublewordai/control-layer/commit/27e5d189018bfdf8fd86941ce9463e5918ff04e1))
+
+## [17.1.3](https://github.com/doublewordai/control-layer/compare/v17.1.2...v17.1.3) (2026-11-15)
+
+
+### Bug Fixes
+
+* **limits:** isolate in-flight Redis I/O on a dedicated thread and partition fallback ([#2186](https://github.com/doublewordai/control-layer/issues/2186)) ([8c7cfbb](https://github.com/doublewordai/control-layer/commit/8c7cfbb2634fab3250837b7395b2638fc3de05de))
+
+## [17.1.2](https://github.com/doublewordai/control-layer/compare/v17.1.1...v17.1.2) (2026-11-12)
+
+
+### Bug Fixes
+
+* **inference:** apply per-key policy to Anthropic /v1/messages callers ([#2184](https://github.com/doublewordai/control-layer/issues/2184)) ([f13841a](https://github.com/doublewordai/control-layer/commit/f13841a00c56cc0122d7a32c5a2b6ce7e2001e93))
+
+## [17.1.1](https://github.com/doublewordai/control-layer/compare/v17.1.0...v17.1.1) (2026-11-11)
+
+
+### Bug Fixes
+
+* **inference:** normalise stream options on outbound requests ([#2181](https://github.com/doublewordai/control-layer/issues/2181)) ([6e9c234](https://github.com/doublewordai/control-layer/commit/6e9c2344cdc3e68a9a59115c06da94db022d78dd))
+
+## [17.1.0](https://github.com/doublewordai/control-layer/compare/v17.0.0...v17.1.0) (2026-11-06)
+
+
+### Features
+
+* list class usage separately and keep class routes unlisted by default ([#2178](https://github.com/doublewordai/control-layer/issues/2178)) ([85f2ef3](https://github.com/doublewordai/control-layer/commit/85f2ef3a80ab55b0ef70643e4c8058eecb91614d))
+
+## [17.0.0](https://github.com/doublewordai/control-layer/compare/v16.6.0...v17.0.0) (2026-11-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173))
+
+### Features
+
+* **fusillade:** drop the plaintext API key columns (DW-1013) ([#2173](https://github.com/doublewordai/control-layer/issues/2173)) ([e3c4de0](https://github.com/doublewordai/control-layer/commit/e3c4de08db28366fdce9c04b42cf87d5abf40244))
+
+## [16.6.0](https://github.com/doublewordai/control-layer/compare/v16.5.0...v16.6.0) (2026-11-06)
+
+
+### Features
+
+* route serving classes to their own upstreams ([#2100](https://github.com/doublewordai/control-layer/issues/2100)) ([7e40b8f](https://github.com/doublewordai/control-layer/commit/7e40b8f49cddd6cce04e9b4a077c993bda0ceb43))
+
+## [16.5.0](https://github.com/doublewordai/control-layer/compare/v16.4.0...v16.5.0) (2026-11-06)
+
+
+### Features
+
+* **api-keys:** stop storing API key plaintext (DW-1012) ([#2172](https://github.com/doublewordai/control-layer/issues/2172)) ([dde6a1c](https://github.com/doublewordai/control-layer/commit/dde6a1cd608a96bb917a1007e15299e6e295cff8))
+
+## [16.4.0](https://github.com/doublewordai/control-layer/compare/v16.3.0...v16.4.0) (2026-11-05)
+
+
+### Features
+
+* **api-keys:** record when each API key was last used (DW-979) ([#2162](https://github.com/doublewordai/control-layer/issues/2162)) ([ff3b78c](https://github.com/doublewordai/control-layer/commit/ff3b78c78f06d2d7f77d0f13f46d47a6d4173cf1))
+
+
+### Bug Fixes
+
+* **api-keys:** attribute keys the system key creates for another user to that user ([#2171](https://github.com/doublewordai/control-layer/issues/2171)) ([46cb7a9](https://github.com/doublewordai/control-layer/commit/46cb7a9a2ca466992c1ad19e777782127d1980ca))
+
+## [16.3.0](https://github.com/doublewordai/control-layer/compare/v16.2.0...v16.3.0) (2026-11-05)
+
+
+### Features
+
+* **api-keys:** hold issued keys' pending secrets keystore-wrapped (DW-1011) ([#2153](https://github.com/doublewordai/control-layer/issues/2153)) ([c3ca16c](https://github.com/doublewordai/control-layer/commit/c3ca16c76c48b45bdd5e0d25bfd4733e335fa269))
+
+## [16.2.0](https://github.com/doublewordai/control-layer/compare/v16.1.0...v16.2.0) (2026-11-05)
+
+
+### Features
+
+* **analytics:** shadow reference-cache estimate per allowlisted principal ([#2161](https://github.com/doublewordai/control-layer/issues/2161)) ([3aedbcb](https://github.com/doublewordai/control-layer/commit/3aedbcb52f2320adaa1ad3f267f37c2ff2c671cb))
+
+
+### Bug Fixes
+
+* **retention:** stop retried and cancelled batches mis-holding retention weeks (DW-992) ([#2159](https://github.com/doublewordai/control-layer/issues/2159)) ([3de9325](https://github.com/doublewordai/control-layer/commit/3de9325de1a487e71f963b8ac49f07845f88c4e6))
+
+## [16.1.0](https://github.com/doublewordai/control-layer/compare/v16.0.1...v16.1.0) (2026-11-04)
+
+
+### Features
+
+* **onwards:** per-model exceptions to the parameter reject list ([#2163](https://github.com/doublewordai/control-layer/issues/2163)) ([268e458](https://github.com/doublewordai/control-layer/commit/268e45819505bdfbf2ccd601c97138f52d6ae148))
+
+
+### Continuous Integration
+
+* label release images with their commit and stop dispatching deploys ([#2166](https://github.com/doublewordai/control-layer/issues/2166)) ([6297c27](https://github.com/doublewordai/control-layer/commit/6297c276303a9885d62ec954662425e342eb9cdc))
+
+## [16.0.1](https://github.com/doublewordai/control-layer/compare/v16.0.0...v16.0.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **auth:** restore system and platform-manager key permissions ([#2164](https://github.com/doublewordai/control-layer/issues/2164)) ([24f0651](https://github.com/doublewordai/control-layer/commit/24f065149f555cd6aa058124a8666dcf2137c261))
+* **dwctl:** map Messages structured output and replayed thinking ([#2121](https://github.com/doublewordai/control-layer/issues/2121)) ([20400a2](https://github.com/doublewordai/control-layer/commit/20400a2593b0b37124b73aac1dd4397a4421b385))
+
+## [16.0.0](https://github.com/doublewordai/control-layer/compare/v15.11.0...v16.0.0) (2026-11-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131))
+
+### Features
+
+* **dwctl:** per-process internal credential for calls into /ai (DW-1009) ([#2154](https://github.com/doublewordai/control-layer/issues/2154)) ([33457cb](https://github.com/doublewordai/control-layer/commit/33457cb2bbe41f401cd06e6437a7df836aaf25c4))
+* **fusillade:** dispatch by API key id (DW-1010) ([#2156](https://github.com/doublewordai/control-layer/issues/2156)) ([1284778](https://github.com/doublewordai/control-layer/commit/12847787a11281babd5452ac4377ebf278397960))
+
+
+### Bug Fixes
+
+* **auth:** confine platform privileges to SSO ([#2131](https://github.com/doublewordai/control-layer/issues/2131)) ([bc76dbd](https://github.com/doublewordai/control-layer/commit/bc76dbd5f0f321ef326c668d1c1be28155c9ab1b))
+
+## [15.11.0](https://github.com/doublewordai/control-layer/compare/v15.10.0...v15.11.0) (2026-11-02)
+
+
+### Features
+
+* **files:** make expires_at the truth for file content (DW-992) ([#2113](https://github.com/doublewordai/control-layer/issues/2113)) ([03b5467](https://github.com/doublewordai/control-layer/commit/03b5467c9ded7271b72856b2acc50bfcb8e50b44))
+* **retention:** retire content weeks on one creation-anchored clock (DW-992) ([#2115](https://github.com/doublewordai/control-layer/issues/2115)) ([1a57f82](https://github.com/doublewordai/control-layer/commit/1a57f8267bc34198ceaa87917965960e2d0f9a6e))
+
+## [15.10.0](https://github.com/doublewordai/control-layer/compare/v15.9.0...v15.10.0) (2026-11-01)
+
+
+### Features
+
+* **dwctl:** send each request's prices to dynamo endpoints as nvext.billing ([#2124](https://github.com/doublewordai/control-layer/issues/2124)) ([395efa5](https://github.com/doublewordai/control-layer/commit/395efa5a20cf82fddb70760e8bec8640fec8af98))
+
+## [15.9.0](https://github.com/doublewordai/control-layer/compare/v15.8.0...v15.9.0) (2026-10-30)
+
+
+### Features
+
+* **models:** retired models return 410 with a configurable shutdown message ([#2146](https://github.com/doublewordai/control-layer/issues/2146)) ([00f00f5](https://github.com/doublewordai/control-layer/commit/00f00f56e64e7c786a85dbe4a63309c9ffc27a8e))
+
+## [15.8.0](https://github.com/doublewordai/control-layer/compare/v15.7.0...v15.8.0) (2026-10-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **onwards:** hold API keys by SHA-256 hash (DW-1008) ([#2140](https://github.com/doublewordai/control-layer/issues/2140))
+
+### Features
+
+* **api-keys:** backfill secret_hash and look API keys up by hash (DW-1008) ([#2139](https://github.com/doublewordai/control-layer/issues/2139)) ([1016706](https://github.com/doublewordai/control-layer/commit/1016706bed278b861fe8009e17adefeb6158a921))
+* **onwards:** hold API keys by SHA-256 hash (DW-1008) ([#2140](https://github.com/doublewordai/control-layer/issues/2140)) ([3b8e349](https://github.com/doublewordai/control-layer/commit/3b8e349b6a656aa690ccab7a98394db0a51ed302))
+
+
+### Documentation
+
+* **migrations:** record the API key hashing rollback floor (DW-1008) ([0c6ecb9](https://github.com/doublewordai/control-layer/commit/0c6ecb9873c0fc6c727174595606a6adec32c510))
+
+
+### Continuous Integration
+
+* send the deploy dispatch with a release-app token ([#2142](https://github.com/doublewordai/control-layer/issues/2142)) ([00e5f6e](https://github.com/doublewordai/control-layer/commit/00e5f6e1ae4f72c14bc43bbefc2d87db80fd1b1b))
+
+## [15.7.0](https://github.com/doublewordai/control-layer/compare/v15.6.0...v15.7.0) (2026-10-29)
+
+
+### Features
+
+* **metrics:** expose aggregate batch SLA health ([#2137](https://github.com/doublewordai/control-layer/issues/2137)) ([6c150d7](https://github.com/doublewordai/control-layer/commit/6c150d71835a31ece0b808d860d123c73a4bbf55))
+
+## [15.6.0](https://github.com/doublewordai/control-layer/compare/v15.5.1...v15.6.0) (2026-10-29)
+
+
+### Features
+
+* **api-keys:** store a SHA-256 hash and display prefix of each key secret (DW-1007) ([#2138](https://github.com/doublewordai/control-layer/issues/2138)) ([22908c5](https://github.com/doublewordai/control-layer/commit/22908c5038fbc266b48179c9a4d80b0f35284c00))
+
+
+### Build System
+
+* **deps:** bump rustls from 0.23.45 to 0.23.46 ([#2135](https://github.com/doublewordai/control-layer/issues/2135)) ([17e9d6f](https://github.com/doublewordai/control-layer/commit/17e9d6f9fa8a6ee87d0f3e19513b7f6a769560b4))
+
+## [15.5.1](https://github.com/doublewordai/control-layer/compare/v15.5.0...v15.5.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **deps:** update redis to 0.32 and deadpool-redis to 0.22 ([#2104](https://github.com/doublewordai/control-layer/issues/2104)) ([59b55f1](https://github.com/doublewordai/control-layer/commit/59b55f1be5660304377f843622b3184ffafa742d))
+* **deps:** update rust crate parking_lot to 0.13 ([#2101](https://github.com/doublewordai/control-layer/issues/2101)) ([0d2bdbb](https://github.com/doublewordai/control-layer/commit/0d2bdbbb4bf5a2ea313d81740ee0c4bfa44fdeb3))
+* **deps:** update rust crate zstd to 0.14 ([#2120](https://github.com/doublewordai/control-layer/issues/2120)) ([c04bcd3](https://github.com/doublewordai/control-layer/commit/c04bcd336e4931893b9d3d1761b6e106f3f4a7a9))
+* **dwctl:** carry prompt_cache_key through the Responses translation ([#2112](https://github.com/doublewordai/control-layer/issues/2112)) ([c8274db](https://github.com/doublewordai/control-layer/commit/c8274db739307b38f37dc45c6523842f949ca344))
+* **fusillade:** keep batch API keys out of debug logs ([#2129](https://github.com/doublewordai/control-layer/issues/2129)) ([ecb1cd0](https://github.com/doublewordai/control-layer/commit/ecb1cd0a6895c9d11b65a1b62162e9a0ea82fb0e))
+* **inference:** reject unsupported server-side tools ([#2095](https://github.com/doublewordai/control-layer/issues/2095)) ([f8dfb35](https://github.com/doublewordai/control-layer/commit/f8dfb359d9419a534847620624e93285f8ffeba2))
+* make the unverified flex volume count cheap (route probes + cap) ([#2132](https://github.com/doublewordai/control-layer/issues/2132)) ([d531d95](https://github.com/doublewordai/control-layer/commit/d531d95dbb50861077524b031979ea3f27b7677d))
+* **telemetry:** redact credentials at the log and trace sinks ([#2130](https://github.com/doublewordai/control-layer/issues/2130)) ([5b3dcb1](https://github.com/doublewordai/control-layer/commit/5b3dcb18a170850f5abbd2f613e9e4ad8f86a0de))
+* **tests:** stabilise underway plan assertion ([#2117](https://github.com/doublewordai/control-layer/issues/2117)) ([eeaaf93](https://github.com/doublewordai/control-layer/commit/eeaaf93d05f6a69fee0ff50b70fee901a40808b0))
+
+
+### Continuous Integration
+
+* run release-please with a GitHub App token ([#2134](https://github.com/doublewordai/control-layer/issues/2134)) ([44b0521](https://github.com/doublewordai/control-layer/commit/44b052110046c34eb95b8a13c69bf3e293059939))
+
+
+### Miscellaneous
+
+* **deps:** update rust crate uuid to v1.29.0 ([#2118](https://github.com/doublewordai/control-layer/issues/2118)) ([094cdb3](https://github.com/doublewordai/control-layer/commit/094cdb3e9ffcd10ccf71b6b7448362ee5f52ec44))
+
+## [15.5.0](https://github.com/doublewordai/control-layer/compare/v15.4.0...v15.5.0) (2026-10-23)
+
+
+### Features
+
+* **dwctl:** count upload refusals by code and measure decode-slot waits ([#2096](https://github.com/doublewordai/control-layer/issues/2096)) ([a901412](https://github.com/doublewordai/control-layer/commit/a9014125a4b21b2b0f1b750da53673bb02218d4c))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate aes-gcm to 0.11.0 ([#2091](https://github.com/doublewordai/control-layer/issues/2091)) ([ba03d73](https://github.com/doublewordai/control-layer/commit/ba03d73e1242180c9e6a6956b08a400432577250))
+* **deps:** update rust crate argon2 to 0.6 ([#2092](https://github.com/doublewordai/control-layer/issues/2092)) ([87e0e6f](https://github.com/doublewordai/control-layer/commit/87e0e6f80bca1977a85a195980a9e4e0d9adaa44))
+* **deps:** update rust crate base64 to 0.23 ([#2093](https://github.com/doublewordai/control-layer/issues/2093)) ([a33f0c4](https://github.com/doublewordai/control-layer/commit/a33f0c4762763d4542aec3d31e82a85b55efa950))
+* **dwctl:** pass CORS preflights through the admin AI proxy ([#2109](https://github.com/doublewordai/control-layer/issues/2109)) ([f0abf9c](https://github.com/doublewordai/control-layer/commit/f0abf9c6e5d386e5ab143cb6f325189372a402c4))
+
+
+### Miscellaneous
+
+* **deps:** update google-cloud-rust monorepo ([#2090](https://github.com/doublewordai/control-layer/issues/2090)) ([7088a7c](https://github.com/doublewordai/control-layer/commit/7088a7c9a78b43c19c883954252c38797a0de107))
+* **deps:** update rust crate aws-sdk-s3 to v1.154.0 ([#2062](https://github.com/doublewordai/control-layer/issues/2062)) ([920df6f](https://github.com/doublewordai/control-layer/commit/920df6ff8736d65f0e7984e83520b27ebeb5ffbb))
+* **deps:** update rust crate serde_with to v3.24.0 ([#2065](https://github.com/doublewordai/control-layer/issues/2065)) ([00859d9](https://github.com/doublewordai/control-layer/commit/00859d92119415d088fe5dd7ce94ab1779fd573f))
+* **deps:** update rust crate serial_test to v3.5.0 ([#2067](https://github.com/doublewordai/control-layer/issues/2067)) ([cc10d16](https://github.com/doublewordai/control-layer/commit/cc10d1627b6687091336c1ce966a82b8003615c4))
+
+## [15.4.0](https://github.com/doublewordai/control-layer/compare/v15.3.0...v15.4.0) (2026-10-22)
+
+
+### Features
+
+* overlay targets are scheduling hints, not a serving class ([#2087](https://github.com/doublewordai/control-layer/issues/2087)) ([4723cfa](https://github.com/doublewordai/control-layer/commit/4723cfa5453762d1f40e4afe3e6bdf8ffd68e31e))
+
+
+### Bug Fixes
+
+* report truncated Responses output as incomplete (DW-976) ([#2079](https://github.com/doublewordai/control-layer/issues/2079)) ([43e6729](https://github.com/doublewordai/control-layer/commit/43e6729f96e3f2623979e290aa78413e7b747be0))
+
+
+### Miscellaneous
+
+* **deps:** update npm non-major dependencies ([#2066](https://github.com/doublewordai/control-layer/issues/2066)) ([d12f0f9](https://github.com/doublewordai/control-layer/commit/d12f0f9a422d3edd0c71b167e3a7e36364843fab))
+* **deps:** update rust crate rust_decimal to v1.43.0 ([#2063](https://github.com/doublewordai/control-layer/issues/2063)) ([758a753](https://github.com/doublewordai/control-layer/commit/758a7531f880ae88c2378122c641d95c74186a75))
+* **deps:** update rust crate rust-embed to v8.13.0 ([#2064](https://github.com/doublewordai/control-layer/issues/2064)) ([ed7ecfd](https://github.com/doublewordai/control-layer/commit/ed7ecfd1032995819a55c1094f747a64d155378c))
+* **deps:** update rust crate tokio to v1.54.1 ([#2069](https://github.com/doublewordai/control-layer/issues/2069)) ([ee9a165](https://github.com/doublewordai/control-layer/commit/ee9a1651f96cd2b9269110041bd162154ccf194a))
+* **deps:** update rust crate uuid to v1.28.0 ([#2070](https://github.com/doublewordai/control-layer/issues/2070)) ([6a02d72](https://github.com/doublewordai/control-layer/commit/6a02d724f2250fb2064e6be28cbfe16f56b09959))
+* **deps:** update rust docker tag to v1.99.1 ([#2072](https://github.com/doublewordai/control-layer/issues/2072)) ([a07b9de](https://github.com/doublewordai/control-layer/commit/a07b9de12b2dfff14835b96b4f1bd27a472446fa))
+
+## [15.3.0](https://github.com/doublewordai/control-layer/compare/v15.2.0...v15.3.0) (2026-10-22)
+
+
+### Features
+
+* **dwctl:** accept gzip, zstd and br request bodies and compressed batch files (DW-985) ([#2082](https://github.com/doublewordai/control-layer/issues/2082)) ([673a64c](https://github.com/doublewordai/control-layer/commit/673a64c471e3026336803b29e45e228713f87ff2))
+
+
+### Bug Fixes
+
+* answer unreadable request formats with 415, and count content types (DW-985) ([#2083](https://github.com/doublewordai/control-layer/issues/2083)) ([58e3a52](https://github.com/doublewordai/control-layer/commit/58e3a527a892c9a3be0c6b2f20c7b8671babac76))
+* **build:** refresh the image CA bundle after eMudhra intermediate compromise ([#2077](https://github.com/doublewordai/control-layer/issues/2077)) ([ae3442c](https://github.com/doublewordai/control-layer/commit/ae3442c03c4a2ea7c42771499039febc20932a57))
+* **deps:** bump webpki-roots to 1.0.10 to drop the compromised emSign root ([#2078](https://github.com/doublewordai/control-layer/issues/2078)) ([552993e](https://github.com/doublewordai/control-layer/commit/552993e14111f07619e387d68a27d423ff62e34c))
+* **dwctl:** store /v1/messages request bodies as sent (DW-984) ([#2085](https://github.com/doublewordai/control-layer/issues/2085)) ([c4bb16f](https://github.com/doublewordai/control-layer/commit/c4bb16f299f44fe0f3bf900613d22f985862ac5d))
+
+## [15.2.0](https://github.com/doublewordai/control-layer/compare/v15.1.0...v15.2.0) (2026-10-21)
+
+
+### Features
+
+* per-model and per-class toleration presets in account files ([#2081](https://github.com/doublewordai/control-layer/issues/2081)) ([d916973](https://github.com/doublewordai/control-layer/commit/d916973cd77971e79e7088edbc4a3d46b90fd1a0))
+
+## [15.1.0](https://github.com/doublewordai/control-layer/compare/v15.0.0...v15.1.0) (2026-10-21)
+
+
+### Features
+
+* account files carry priority, latency targets and prices ([#2075](https://github.com/doublewordai/control-layer/issues/2075)) ([a2f91a6](https://github.com/doublewordai/control-layer/commit/a2f91a6e2bfad9f67af1a47116aa9e613c1d29dc))
+
+## [15.0.0](https://github.com/doublewordai/control-layer/compare/v14.5.0...v15.0.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068))
+
+### Code Refactoring
+
+* retire the serving-class presets, grants and default classes ([#2068](https://github.com/doublewordai/control-layer/issues/2068)) ([a28e3b3](https://github.com/doublewordai/control-layer/commit/a28e3b345dad73a30820d3b8498357e9a7d97a94))
+
+## [14.5.0](https://github.com/doublewordai/control-layer/compare/v14.4.0...v14.5.0) (2026-10-21)
+
+
+### Features
+
+* **telemetry:** add JSON log format ([#2044](https://github.com/doublewordai/control-layer/issues/2044)) ([1e87af0](https://github.com/doublewordai/control-layer/commit/1e87af07c096a8a028556794f649823e5c5a5e83))
+
+## [14.4.0](https://github.com/doublewordai/control-layer/compare/v14.3.1...v14.4.0) (2026-10-20)
+
+
+### Features
+
+* **analytics:** record client disconnects on streamed responses ([#2018](https://github.com/doublewordai/control-layer/issues/2018)) ([5dc99eb](https://github.com/doublewordai/control-layer/commit/5dc99ebb20abe9acbef814d1b5d662b7f2c1ecf4))
+* **api:** expose model pricing to inference keys ([#2050](https://github.com/doublewordai/control-layer/issues/2050)) ([f9b536a](https://github.com/doublewordai/control-layer/commit/f9b536af3c50eed7132363b37c59d5507ffe1d3b))
+* **dwctl:** record batch size class and deadline outcome on batch spans (DW-952) ([#2010](https://github.com/doublewordai/control-layer/issues/2010)) ([44ae3f4](https://github.com/doublewordai/control-layer/commit/44ae3f479aa084d8a49aecea3ed031eaa2234d03))
+* **onwards:** count sanitized third-party errors ([#2054](https://github.com/doublewordai/control-layer/issues/2054)) ([dc82a0b](https://github.com/doublewordai/control-layer/commit/dc82a0be4ba644fa3563d9ea8d306a5fe072f1b0))
+
+
+### Bug Fixes
+
+* **deps:** patch source-map-js vulnerability ([#2035](https://github.com/doublewordai/control-layer/issues/2035)) ([a5e4275](https://github.com/doublewordai/control-layer/commit/a5e4275bf366eab7f769fed4b0157f6b28fd89a7))
+* **deps:** pin pnpm for lockfile generation ([#2024](https://github.com/doublewordai/control-layer/issues/2024)) ([4470775](https://github.com/doublewordai/control-layer/commit/44707755ce0389d2b06f563bebad6baa52f0c7c5))
+* **fusillade:** exit after heartbeat lease loss ([#2039](https://github.com/doublewordai/control-layer/issues/2039)) ([6e499f7](https://github.com/doublewordai/control-layer/commit/6e499f7ed8e801aec3ef9cd6c2132f944adf4474))
+* **images:** name the failing image in image normaliser errors ([#2045](https://github.com/doublewordai/control-layer/issues/2045)) ([81a950e](https://github.com/doublewordai/control-layer/commit/81a950e168f80bc47917c5b4b0601df8d5191adb))
+* **request-logging:** keep credentials out of the outlet request log ([#1968](https://github.com/doublewordai/control-layer/issues/1968)) ([41cddc3](https://github.com/doublewordai/control-layer/commit/41cddc36720cd98a3f6ac0d337e9e0ec21d7c541))
+
+
+### Build System
+
+* **deps:** bump @humanfs/node from 0.16.7 to 0.16.8 in /dashboard ([#2000](https://github.com/doublewordai/control-layer/issues/2000)) ([aaf2d5e](https://github.com/doublewordai/control-layer/commit/aaf2d5e53a734b682665e042e0f61d4319666d9a))
+
+
+### Continuous Integration
+
+* streamline frontend dependency updates ([#2053](https://github.com/doublewordai/control-layer/issues/2053)) ([836a6f0](https://github.com/doublewordai/control-layer/commit/836a6f00f8a80f8ca23d77918b0923d87bc957dc))
+
+
+### Miscellaneous
+
+* **deps:** update actions/setup-node action to v7 ([#2001](https://github.com/doublewordai/control-layer/issues/2001)) ([647d8ef](https://github.com/doublewordai/control-layer/commit/647d8efe57fb1e0ecc137f5e53c120c4d43f3c03))
+* **deps:** update aws-sdk-rust monorepo ([#2016](https://github.com/doublewordai/control-layer/issues/2016)) ([e476146](https://github.com/doublewordai/control-layer/commit/e476146765857a0260a2fa5202f2834f12494f4e))
+* **deps:** update cargo patch dependencies ([#2012](https://github.com/doublewordai/control-layer/issues/2012)) ([ba651d3](https://github.com/doublewordai/control-layer/commit/ba651d3941710fe20720859bb4d7bbf52182b38b))
+* **deps:** update dependency @fontsource/space-grotesk to v5.3.0 ([#2017](https://github.com/doublewordai/control-layer/issues/2017)) ([b43ec60](https://github.com/doublewordai/control-layer/commit/b43ec603b55e3550444e437e29453b4a8021e316))
+* **deps:** update dependency @hookform/resolvers to v5.9.2 ([#2021](https://github.com/doublewordai/control-layer/issues/2021)) ([88a3c4b](https://github.com/doublewordai/control-layer/commit/88a3c4b6d5435aca629abcae56d4282972ba1493))
+* **deps:** update dependency @playwright/test to v1.64.1 ([#2023](https://github.com/doublewordai/control-layer/issues/2023)) ([c9bd711](https://github.com/doublewordai/control-layer/commit/c9bd7115397d47098fa228a7a99de8b86f20bb90))
+* **deps:** update dependency @testing-library/jest-dom to v7 ([#2009](https://github.com/doublewordai/control-layer/issues/2009)) ([b1e1bef](https://github.com/doublewordai/control-layer/commit/b1e1bef60df17abde49123cedab85d7d50df3bd5))
+* **deps:** update dependency @types/node to v24.19.2 ([#2026](https://github.com/doublewordai/control-layer/issues/2026)) ([d2c0658](https://github.com/doublewordai/control-layer/commit/d2c0658edd34cbfdc2328e8cadd1e03555a6cbc2))
+* **deps:** update dependency autoprefixer to v10.6.1 ([#2027](https://github.com/doublewordai/control-layer/issues/2027)) ([c30980e](https://github.com/doublewordai/control-layer/commit/c30980e88fa7c675b137f1091a5c8e1b7dad8003))
+* **deps:** update dependency date-fns to v4.4.0 ([#2028](https://github.com/doublewordai/control-layer/issues/2028)) ([36ea1c3](https://github.com/doublewordai/control-layer/commit/36ea1c38a50a22420ac8293671c9b503640bc1e6))
+* **deps:** update dependency globals to v17.13.0 ([#2029](https://github.com/doublewordai/control-layer/issues/2029)) ([f15921e](https://github.com/doublewordai/control-layer/commit/f15921e388369f644dfefa56e3b9e40e02777f1b))
+* **deps:** update dependency jsdom to v29.1.1 ([#2030](https://github.com/doublewordai/control-layer/issues/2030)) ([d6fa1d6](https://github.com/doublewordai/control-layer/commit/d6fa1d67b765ba9f05d2d98ab798c4b4b3d71d24))
+* **deps:** update dependency just to v1.59.0 ([#2031](https://github.com/doublewordai/control-layer/issues/2031)) ([1a1a82e](https://github.com/doublewordai/control-layer/commit/1a1a82e17b9f2dd1d18c85083ca721fe217ea76d))
+* **deps:** update dependency msw to v2.15.0 ([#2032](https://github.com/doublewordai/control-layer/issues/2032)) ([c17e562](https://github.com/doublewordai/control-layer/commit/c17e562840f36763e798f7637266b9d3b1075469))
+* **deps:** update dependency openai to v6.49.0 ([#2033](https://github.com/doublewordai/control-layer/issues/2033)) ([7e94d0b](https://github.com/doublewordai/control-layer/commit/7e94d0bf6a704a42bb8da215b8638cb962e8f9eb))
+* **deps:** update dependency react-hook-form to v7.90.0 ([#2036](https://github.com/doublewordai/control-layer/issues/2036)) ([c383abf](https://github.com/doublewordai/control-layer/commit/c383abf10ea9f26f29196381ce22d02967515ba7))
+* **deps:** update dependency rollup-plugin-visualizer to v7.1.1 ([#2037](https://github.com/doublewordai/control-layer/issues/2037)) ([3392ec5](https://github.com/doublewordai/control-layer/commit/3392ec5716c29e686a0d61d8ba6bab2ebd12fb9e))
+* **deps:** update dependency undici to v7.30.1 ([#2043](https://github.com/doublewordai/control-layer/issues/2043)) ([f0b683f](https://github.com/doublewordai/control-layer/commit/f0b683f211c0accaadc365acaf3391db7013e50c))
+* **deps:** update dependency vitest to v4.1.12 [security] ([#1727](https://github.com/doublewordai/control-layer/issues/1727)) ([edb099e](https://github.com/doublewordai/control-layer/commit/edb099eba58a177d133c1021878835d9aaa303f3))
+* **deps:** update extractions/setup-just action to v4 ([#951](https://github.com/doublewordai/control-layer/issues/951)) ([d4d9e87](https://github.com/doublewordai/control-layer/commit/d4d9e87a633869c6fb216e984d9411b65214ea68))
+* **deps:** update google-cloud-rust monorepo ([#2046](https://github.com/doublewordai/control-layer/issues/2046)) ([bb85689](https://github.com/doublewordai/control-layer/commit/bb85689a3aeb1efe5d0e97d2d031c41d9feba1d6))
+* **deps:** update npm non-major dependencies ([#2057](https://github.com/doublewordai/control-layer/issues/2057)) ([d761ea5](https://github.com/doublewordai/control-layer/commit/d761ea5f4370c982e8b25069df444589f92a5568))
+* **deps:** update npm patch dependencies ([#2013](https://github.com/doublewordai/control-layer/issues/2013)) ([447c548](https://github.com/doublewordai/control-layer/commit/447c548416fb9d1e1f862e8d9c0cd51854d14e0a))
+* **deps:** update react monorepo ([#2048](https://github.com/doublewordai/control-layer/issues/2048)) ([fd1bced](https://github.com/doublewordai/control-layer/commit/fd1bced0d3e072dbcd956cb95bbc96e856635044))
+* **deps:** update rust crate bon to v3.10.2 ([#2049](https://github.com/doublewordai/control-layer/issues/2049)) ([88ea55b](https://github.com/doublewordai/control-layer/commit/88ea55b3c1ba80a68bcdfc7a466677f5dc43a559))
+* **deps:** update rust crate either to v1.19.0 ([#2051](https://github.com/doublewordai/control-layer/issues/2051)) ([e41d922](https://github.com/doublewordai/control-layer/commit/e41d9222d74cbf06d4b7f22a5b96eb6938a70fc4))
+* **deps:** update rust crate humantime to v2.4.0 ([#2052](https://github.com/doublewordai/control-layer/issues/2052)) ([7ba95be](https://github.com/doublewordai/control-layer/commit/7ba95beb42f09bab548297cf758129ecad5852a2))
+* **deps:** update rust crate hyper to v1.12.0 ([#2055](https://github.com/doublewordai/control-layer/issues/2055)) ([399af4c](https://github.com/doublewordai/control-layer/commit/399af4c391e7cca0aa20fd07c3dcea032c91053f))
+* **deps:** update rust crate jsonwebtoken to v10.4.0 ([#2056](https://github.com/doublewordai/control-layer/issues/2056)) ([a5f77c9](https://github.com/doublewordai/control-layer/commit/a5f77c9ea4ecd92e349e6cfefafb25b5d5df182a))
+* **deps:** update rust crate minijinja to v2.24.0 ([#2058](https://github.com/doublewordai/control-layer/issues/2058)) ([650a581](https://github.com/doublewordai/control-layer/commit/650a5813a4aad92f3fb099fcc001450c6c8f45cd))
+* **deps:** update rust crate reqwest to 0.13 ([#2060](https://github.com/doublewordai/control-layer/issues/2060)) ([c14e964](https://github.com/doublewordai/control-layer/commit/c14e964a763cc7bf6d82a02a982b57d4c3b65468))
+* **deps:** update Vite tooling to v8 ([#870](https://github.com/doublewordai/control-layer/issues/870)) ([81246ac](https://github.com/doublewordai/control-layer/commit/81246aca25af6c3720f10882cccf84ec8dd28033))
+
+## [14.3.1](https://github.com/doublewordai/control-layer/compare/v14.3.0...v14.3.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **analytics:** restore custom ID index ([#2011](https://github.com/doublewordai/control-layer/issues/2011)) ([81a9465](https://github.com/doublewordai/control-layer/commit/81a9465bb291c9bc2121e5092b69de6bab836068))
+* **connections:** release API key on deletion ([#2015](https://github.com/doublewordai/control-layer/issues/2015)) ([c13638b](https://github.com/doublewordai/control-layer/commit/c13638ba42594906937a2a54d12817c980f9acb1))
+* **control-layer:** keep response writer supervised while draining ([#2014](https://github.com/doublewordai/control-layer/issues/2014)) ([1be1dcd](https://github.com/doublewordai/control-layer/commit/1be1dcdaa43d0f049d7a4373311f3cc07afa489e))
+
+
+### Miscellaneous
+
+* **deps:** bump requests from 2.32.5 to 2.33.0 in /scripts/tests/pooled ([#1720](https://github.com/doublewordai/control-layer/issues/1720)) ([96de52b](https://github.com/doublewordai/control-layer/commit/96de52b60817d088e0103f63a76ce743d794ae40))
+* **deps:** split Renovate updates by ecosystem ([#2006](https://github.com/doublewordai/control-layer/issues/2006)) ([f619cf7](https://github.com/doublewordai/control-layer/commit/f619cf700a72055bb16bdc02e9e2611d0bc7f67f))
+* **deps:** update actions/setup-python action to v7 ([#2003](https://github.com/doublewordai/control-layer/issues/2003)) ([c09267d](https://github.com/doublewordai/control-layer/commit/c09267dae4065e8434081dc0a82ea012120aabad))
+* **deps:** update actions/upload-pages-artifact action to v5 ([#2004](https://github.com/doublewordai/control-layer/issues/2004)) ([5f73f1c](https://github.com/doublewordai/control-layer/commit/5f73f1c0adb6984965e4ba54c6ef048d9812a2e0))
+* **deps:** update zerob13/mock-openai-api docker digest to 9c9fdcf ([#1147](https://github.com/doublewordai/control-layer/issues/1147)) ([72ad884](https://github.com/doublewordai/control-layer/commit/72ad884d95f73269be401d0f6fd674b7323d2a5d))
+
+## [14.3.0](https://github.com/doublewordai/control-layer/compare/v14.2.0...v14.3.0) (2026-10-19)
+
+
+### Features
+
+* **dwctl:** record where a translated body fails its schema, without its content (DW-951) ([#1991](https://github.com/doublewordai/control-layer/issues/1991)) ([53b07dc](https://github.com/doublewordai/control-layer/commit/53b07dc2bf5932cc3c037f803095eb46e90b161f))
+* **onwards:** check legacy completions for unsupported parameters (DW-855) ([#1996](https://github.com/doublewordai/control-layer/issues/1996)) ([500873b](https://github.com/doublewordai/control-layer/commit/500873b76a678ff2d2983d04c5e797121a285111))
+* **onwards:** record where a body fails the strict schema, without its content (DW-951) ([#1990](https://github.com/doublewordai/control-layer/issues/1990)) ([e1cb85a](https://github.com/doublewordai/control-layer/commit/e1cb85a5a525bb360edaf0ab2005fed0db6b680e))
+
+
+### Bug Fixes
+
+* **analytics:** use indexed exact custom id lookup ([#1998](https://github.com/doublewordai/control-layer/issues/1998)) ([a40d0ed](https://github.com/doublewordai/control-layer/commit/a40d0edbcbdbfe1f04fb131de5d4c4a31fcfabf2))
+* **batch:** delete generated files with batch ([#1997](https://github.com/doublewordai/control-layer/issues/1997)) ([45aeaa1](https://github.com/doublewordai/control-layer/commit/45aeaa1676427f26768c7a4cd06ac37bec137221))
+* **dwctl:** export the request span as a server span (DW-954) ([#1993](https://github.com/doublewordai/control-layer/issues/1993)) ([57ded54](https://github.com/doublewordai/control-layer/commit/57ded542e15168eb22818bb7e82cbac6e0e4d833))
+* **inference:** preserve flex chat service tier ([#1995](https://github.com/doublewordai/control-layer/issues/1995)) ([a8a7d74](https://github.com/doublewordai/control-layer/commit/a8a7d745a020c1532cdea3cbb054adc01d99dba7))
+
+
+### Build System
+
+* **deps:** bump hickory-resolver from 0.26.1 to 0.26.3 ([#1921](https://github.com/doublewordai/control-layer/issues/1921)) ([d91050e](https://github.com/doublewordai/control-layer/commit/d91050ef3427456168df95aacc0abfccebf2d4d5))
+* **deps:** bump rustls from 0.23.40 to 0.23.45 ([#1920](https://github.com/doublewordai/control-layer/issues/1920)) ([2a0c05b](https://github.com/doublewordai/control-layer/commit/2a0c05bf48ae73a478017bef2d8a2d0a470d8e3d))
+
+
+### Miscellaneous
+
+* **deps:** bump cmov from 0.5.3 to 0.5.4 ([#1228](https://github.com/doublewordai/control-layer/issues/1228)) ([4f328f6](https://github.com/doublewordai/control-layer/commit/4f328f616c9171216a63da9d308a1aaf28a69bed))
+* **deps:** update actions/checkout action to v7 ([#1182](https://github.com/doublewordai/control-layer/issues/1182)) ([8e49bd5](https://github.com/doublewordai/control-layer/commit/8e49bd549a5c721a4ef904dca059a5a3ef781fe6))
+* **deps:** update actions/deploy-pages action to v5 ([#1549](https://github.com/doublewordai/control-layer/issues/1549)) ([1288494](https://github.com/doublewordai/control-layer/commit/1288494b427596d19d4d11e29368c6da2e492c49))
+* **deps:** update googleapis/release-please-action action to v5 ([#1019](https://github.com/doublewordai/control-layer/issues/1019)) ([4878fe9](https://github.com/doublewordai/control-layer/commit/4878fe9ff74d219d0fcbbffd756013062a0e9210))
+* **deps:** update pnpm/action-setup action to v6 ([#977](https://github.com/doublewordai/control-layer/issues/977)) ([867cfbc](https://github.com/doublewordai/control-layer/commit/867cfbcef201613b9b279d88a3446a91797df7fb))
+* **deps:** update rust crate rustls to v0.23.45 [security] ([#1923](https://github.com/doublewordai/control-layer/issues/1923)) ([27f8503](https://github.com/doublewordai/control-layer/commit/27f8503e8c0358fdba9defa6e7cab55401bb3436))
+
+## [14.2.0](https://github.com/doublewordai/control-layer/compare/v14.1.0...v14.2.0) (2026-10-15)
+
+
+### Features
+
+* **metrics:** the credits metric names the model that served each request ([#1987](https://github.com/doublewordai/control-layer/issues/1987)) ([589a262](https://github.com/doublewordai/control-layer/commit/589a26284dd77d8b00cc9a5ff3f138bd44121ff8))
+* **tracing:** customer attributes on request and batch spans ([#1972](https://github.com/doublewordai/control-layer/issues/1972)) ([60db3ec](https://github.com/doublewordai/control-layer/commit/60db3ec246429061cc153b9b5bfea07abc218ca2))
+
+
+### Bug Fixes
+
+* **fusillade:** stop daemon maintenance from stalling writes to files ([#1986](https://github.com/doublewordai/control-layer/issues/1986)) ([fc5b7f7](https://github.com/doublewordai/control-layer/commit/fc5b7f7f6b3e74c0a208243641307442ae0f9c5a))
+
+
+### Performance Improvements
+
+* **tracing:** filter and slim the spans sent to the trace backend (DW-931) ([#1984](https://github.com/doublewordai/control-layer/issues/1984)) ([4a07bb1](https://github.com/doublewordai/control-layer/commit/4a07bb1199d8aaf25cec7a6c19f3815d63b5a3b7))
+
+## [14.1.0](https://github.com/doublewordai/control-layer/compare/v14.0.1...v14.1.0) (2026-10-15)
+
+
+### Features
+
+* correlate requests end to end with x_request_id ([#1970](https://github.com/doublewordai/control-layer/issues/1970)) ([f61e00f](https://github.com/doublewordai/control-layer/commit/f61e00fe5c898b4bf3fda97eef2f34578e059c23))
+* count the inference requests dwctl's own layers refuse (DW-851) ([#1978](https://github.com/doublewordai/control-layer/issues/1978)) ([b822bd0](https://github.com/doublewordai/control-layer/commit/b822bd0bae2731a1db94679479ae86e5b304e6e2))
+* make auto-top-up retry delay configurable ([#1966](https://github.com/doublewordai/control-layer/issues/1966)) ([d1f96b3](https://github.com/doublewordai/control-layer/commit/d1f96b3bb22b2cc978c1b84f3329ed67bbf39e62))
+
+
+### Bug Fixes
+
+* **dashboard:** keep the edit user and organization dialogs within the viewport ([#1975](https://github.com/doublewordai/control-layer/issues/1975)) ([3f0c3cf](https://github.com/doublewordai/control-layer/commit/3f0c3cf13d96b24a6d3d78069e8010ba434beb2d))
+* **dwctl:** map Anthropic thinking types and output_config.effort to reasoning_effort ([#1981](https://github.com/doublewordai/control-layer/issues/1981)) ([87362dd](https://github.com/doublewordai/control-layer/commit/87362dd857fd2ad174cc6070a48f65dd6b650500))
+* end interrupted streams with an error event (DW-851) ([#1979](https://github.com/doublewordai/control-layer/issues/1979)) ([843f421](https://github.com/doublewordai/control-layer/commit/843f421ef04ec8d4ca29c762f01aae9be1dc7206))
+* give every response the gateway id and send streamed usage only on request ([#1973](https://github.com/doublewordai/control-layer/issues/1973)) ([ccb3919](https://github.com/doublewordai/control-layer/commit/ccb3919682884ea2fb963eb48d55b690d6bd6877))
+* **onwards:** give trusted providers' errors the OpenAI envelope ([#1977](https://github.com/doublewordai/control-layer/issues/1977)) ([8d2960e](https://github.com/doublewordai/control-layer/commit/8d2960e1734b6a9efc38f321757811ea64b5171e))
+* remove two lock races behind flaky CI tests ([#1982](https://github.com/doublewordai/control-layer/issues/1982)) ([2163e35](https://github.com/doublewordai/control-layer/commit/2163e3541137332aeb22c167a78355aeb6a53b32))
+
+
+### Tests
+
+* **stripe:** cover the Stripe provider against a mock Stripe API ([#1971](https://github.com/doublewordai/control-layer/issues/1971)) ([cd42cbc](https://github.com/doublewordai/control-layer/commit/cd42cbc420a72ade25c8faa3060272ec7ce8455e))
+* **sync:** keep the reconnect test from killing other tests' listeners ([#1983](https://github.com/doublewordai/control-layer/issues/1983)) ([ad8bd06](https://github.com/doublewordai/control-layer/commit/ad8bd065287dd3f826ec31091816be3c5ad2fc17))
+
+## [14.0.1](https://github.com/doublewordai/control-layer/compare/v14.0.0...v14.0.1) (2026-10-13)
+
+
+### Bug Fixes
+
+* **fusillade:** index batches that finished after their deadline ([#1969](https://github.com/doublewordai/control-layer/issues/1969)) ([04beeb4](https://github.com/doublewordai/control-layer/commit/04beeb4760a6cca460091c67ac9119ea598100e7))
+* **responses:** preserve prior input in continuations ([#1964](https://github.com/doublewordai/control-layer/issues/1964)) ([e299065](https://github.com/doublewordai/control-layer/commit/e29906525eeff70544ab7e0c5b755f30d58174cf))
+
+
+### Tests
+
+* **pricing:** stamp fixture tariffs with the host clock ([#1967](https://github.com/doublewordai/control-layer/issues/1967)) ([86cc1d9](https://github.com/doublewordai/control-layer/commit/86cc1d9f9d4bb50de025973f5b5452e643ea3371))
+
+## [14.0.0](https://github.com/doublewordai/control-layer/compare/v13.7.0...v14.0.0) (2026-10-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575))
+
+### Features
+
+* **accounts:** per-account scheduling toleration presets ([#1954](https://github.com/doublewordai/control-layer/issues/1954)) ([124032b](https://github.com/doublewordai/control-layer/commit/124032bb7ed2857855c3428768839d803c8b5fc8))
+* **dashboard:** add dark mode with light/dark/system switcher ([#1942](https://github.com/doublewordai/control-layer/issues/1942)) ([d4a9547](https://github.com/doublewordai/control-layer/commit/d4a9547f5d2e90b16bf1a76fe1489ba03e96aade))
+* **onwards:** stop logging rejections and unsupported parameters ([#1963](https://github.com/doublewordai/control-layer/issues/1963)) ([68315f4](https://github.com/doublewordai/control-layer/commit/68315f4941a15217cdbd31f0adba3a0c22aa9478))
+* retire the generation-1 request template heap ([#1575](https://github.com/doublewordai/control-layer/issues/1575)) ([ebe9807](https://github.com/doublewordai/control-layer/commit/ebe980704bc29f751e425b86ff3df259fa841ed3))
+
+
+### Bug Fixes
+
+* keep API keys out of rate-limit and proxy debug logs ([#1960](https://github.com/doublewordai/control-layer/issues/1960)) ([43bf8e8](https://github.com/doublewordai/control-layer/commit/43bf8e84cf8e08a0d863351b86b12c913f57ec92))
+
+## [13.7.0](https://github.com/doublewordai/control-layer/compare/v13.6.0...v13.7.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** name the account and report its limit on in-flight metrics ([#1958](https://github.com/doublewordai/control-layer/issues/1958)) ([72c6e97](https://github.com/doublewordai/control-layer/commit/72c6e974d435a20ed5cd36f977016434b3b7be4b))
+
+## [13.6.0](https://github.com/doublewordai/control-layer/compare/v13.5.0...v13.6.0) (2026-10-10)
+
+
+### Features
+
+* **limits:** count in-flight limit checks and refusals per account ([#1957](https://github.com/doublewordai/control-layer/issues/1957)) ([f6a7486](https://github.com/doublewordai/control-layer/commit/f6a74865a43a71bb9c3d9228958dfde66c364477))
+* **onwards:** trace rejections and stop logging caller-limit refusals ([#1952](https://github.com/doublewordai/control-layer/issues/1952)) ([f051e4c](https://github.com/doublewordai/control-layer/commit/f051e4c8324f413422fc237abcf3ddac504b9650))
+
+## [13.5.0](https://github.com/doublewordai/control-layer/compare/v13.4.3...v13.5.0) (2026-10-09)
+
+
+### Features
+
+* **zdr:** encrypt images at rest for zero-data-retention requests ([#1953](https://github.com/doublewordai/control-layer/issues/1953)) ([f63e795](https://github.com/doublewordai/control-layer/commit/f63e795fc79f4871b4b85f6fc7d9cc57c0752e4b))
+
+## [13.4.3](https://github.com/doublewordai/control-layer/compare/v13.4.2...v13.4.3) (2026-10-09)
+
+
+### Bug Fixes
+
+* **db:** connect to Postgres with rustls ([#1948](https://github.com/doublewordai/control-layer/issues/1948)) ([baafb4b](https://github.com/doublewordai/control-layer/commit/baafb4b1acf066272b28aa2837eab2b219662823))
+* **images:** look up the caller only for requests with image inputs ([#1949](https://github.com/doublewordai/control-layer/issues/1949)) ([6d71346](https://github.com/doublewordai/control-layer/commit/6d7134641fc5a948bfe317ac28196d0de9303fbd))
+* **limits:** retry failed in-flight slot releases until Redis is back ([#1950](https://github.com/doublewordai/control-layer/issues/1950)) ([26d88b4](https://github.com/doublewordai/control-layer/commit/26d88b4869f2e2c886272d1a7ab2d1baa7893236))
+
+## [13.4.2](https://github.com/doublewordai/control-layer/compare/v13.4.1...v13.4.2) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** retry in-flight Redis reconnects every second ([#1946](https://github.com/doublewordai/control-layer/issues/1946)) ([39af83c](https://github.com/doublewordai/control-layer/commit/39af83ccdfccc1677749dc3eacfa214d6a3a2beb))
+
+## [13.4.1](https://github.com/doublewordai/control-layer/compare/v13.4.0...v13.4.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* **limits:** share one Redis connection for in-flight checks ([#1940](https://github.com/doublewordai/control-layer/issues/1940)) ([1177b69](https://github.com/doublewordai/control-layer/commit/1177b69660044dd09c33bfdf153ecb23b60f2417))
+
+## [13.4.0](https://github.com/doublewordai/control-layer/compare/v13.3.1...v13.4.0) (2026-10-08)
+
+
+### Features
+
+* **responses:** accept Codex tool namespace groups ([#1935](https://github.com/doublewordai/control-layer/issues/1935)) ([9d46bf7](https://github.com/doublewordai/control-layer/commit/9d46bf782d49dec56fa0c262c76e503c3d98e422))
+
+## [13.3.1](https://github.com/doublewordai/control-layer/compare/v13.3.0...v13.3.1) (2026-10-08)
+
+
+### Bug Fixes
+
+* write new request templates to generation two ([6c26427](https://github.com/doublewordai/control-layer/commit/6c264272d0f301f810e06af2a6a65531fc86880f))
+
+## [13.3.0](https://github.com/doublewordai/control-layer/compare/v13.2.0...v13.3.0) (2026-10-08)
+
+
+### Features
+
+* **onwards:** count and log the requests onwards rejects itself (DW-851) ([#1937](https://github.com/doublewordai/control-layer/issues/1937)) ([98c234e](https://github.com/doublewordai/control-layer/commit/98c234e6c97fd154496c6c2554683c124270b8bb))
+
+## [13.2.0](https://github.com/doublewordai/control-layer/compare/v13.1.2...v13.2.0) (2026-10-07)
+
+
+### Features
+
+* **limits:** cap batch requests in flight per model in onwards ([#1924](https://github.com/doublewordai/control-layer/issues/1924)) ([834827d](https://github.com/doublewordai/control-layer/commit/834827dbc2b09604e9759f8b715eb85b3e2c1e22))
+
+
+### Bug Fixes
+
+* **deps:** update undici to 7.29.1 ([#1933](https://github.com/doublewordai/control-layer/issues/1933)) ([c73c641](https://github.com/doublewordai/control-layer/commit/c73c64132731b91ae2aae466e8498736902da962))
+
+## [13.1.2](https://github.com/doublewordai/control-layer/compare/v13.1.1...v13.1.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* preserve JSON key order in forwarded request bodies ([#1930](https://github.com/doublewordai/control-layer/issues/1930)) ([a8721a8](https://github.com/doublewordai/control-layer/commit/a8721a8ca8886b2437648131488a833e9461be0f))
+* set TCP_NODELAY on gateway sockets ([#1931](https://github.com/doublewordai/control-layer/issues/1931)) ([909a27e](https://github.com/doublewordai/control-layer/commit/909a27e95f7ace63385c8b8d3872b5a2290dd0d3))
+
+## [13.1.1](https://github.com/doublewordai/control-layer/compare/v13.1.0...v13.1.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **notifications:** send organization low-balance alerts to owners and admins ([#1863](https://github.com/doublewordai/control-layer/issues/1863)) ([c90dc91](https://github.com/doublewordai/control-layer/commit/c90dc913290fb0b57f0a6c0b449f9f3b6f545671))
+
+## [13.1.0](https://github.com/doublewordai/control-layer/compare/v13.0.0...v13.1.0) (2026-10-06)
+
+
+### Features
+
+* **onwards:** flag chat parameters not every backend supports ([#1925](https://github.com/doublewordai/control-layer/issues/1925)) ([b2271fb](https://github.com/doublewordai/control-layer/commit/b2271fb2b626d760937cfaf7ed77b0b0a6fe5ecb))
+
+
+### Bug Fixes
+
+* **security:** avoid raw HTML in chart styles (DW-927) ([#1926](https://github.com/doublewordai/control-layer/issues/1926)) ([312e7a3](https://github.com/doublewordai/control-layer/commit/312e7a3e991fe57629b92da4aaf10fd9619368ba))
+
+## [13.0.0](https://github.com/doublewordai/control-layer/compare/v12.11.3...v13.0.0) (2026-10-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915))
+
+### Features
+
+* **limits:** replace gateway rate limits with per-account realtime in-flight limits ([#1915](https://github.com/doublewordai/control-layer/issues/1915)) ([be53043](https://github.com/doublewordai/control-layer/commit/be530434b6d2fec1c5c2cfa0c366c9ced6954a5e))
+
+
+### Bug Fixes
+
+* **deps:** resolve patched js-yaml in dashboard lockfile ([#1918](https://github.com/doublewordai/control-layer/issues/1918)) ([5b53b45](https://github.com/doublewordai/control-layer/commit/5b53b45eb742367d27e2a3cb20615541aa274459))
+
+## [12.11.3](https://github.com/doublewordai/control-layer/compare/v12.11.2...v12.11.3) (2026-10-03)
+
+
+### Bug Fixes
+
+* **onwards:** answer every capacity refusal with 529 and Retry-After ([#1913](https://github.com/doublewordai/control-layer/issues/1913)) ([8ca5e6d](https://github.com/doublewordai/control-layer/commit/8ca5e6d4802ebc0e3fe85802d35c7dffd06680d4))
+
+## [12.11.2](https://github.com/doublewordai/control-layer/compare/v12.11.1...v12.11.2) (2026-10-03)
+
+
+### Bug Fixes
+
+* **files:** ride out brief image-store outages during upload ([#1910](https://github.com/doublewordai/control-layer/issues/1910)) ([0468610](https://github.com/doublewordai/control-layer/commit/0468610f797dab33e388b5e6bc2c04f954de8969))
+
+## [12.11.1](https://github.com/doublewordai/control-layer/compare/v12.11.0...v12.11.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **onwards:** stop re-asking overloaded providers and answer 429 when every provider is full ([#1911](https://github.com/doublewordai/control-layer/issues/1911)) ([ad19d05](https://github.com/doublewordai/control-layer/commit/ad19d05bcda37f50cbf258a79882b75df3efed39))
+
+
+### Tests
+
+* speed up the Rust test suite with migrated database templates ([#1907](https://github.com/doublewordai/control-layer/issues/1907)) ([db1fb7f](https://github.com/doublewordai/control-layer/commit/db1fb7f4f97134b1465627e3e0a9b3f12a73723e))
+
+## [12.11.0](https://github.com/doublewordai/control-layer/compare/v12.10.1...v12.11.0) (2026-10-02)
+
+
+### Features
+
+* **catalog:** stage model class routes and public class pricing ([#1902](https://github.com/doublewordai/control-layer/issues/1902)) ([62693eb](https://github.com/doublewordai/control-layer/commit/62693eb52a7e3b182b636a968e2940331884a8a4))
+
+
+### Continuous Integration
+
+* pin every workflow to Rust 1.99.0 ([#1904](https://github.com/doublewordai/control-layer/issues/1904)) ([4486335](https://github.com/doublewordai/control-layer/commit/4486335098975c43cabe52e938aa130f3914cf69))
+
+## [12.10.1](https://github.com/doublewordai/control-layer/compare/v12.10.0...v12.10.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **dwctl:** reap completed underway worker tasks ([#1867](https://github.com/doublewordai/control-layer/issues/1867)) ([3cd8524](https://github.com/doublewordai/control-layer/commit/3cd8524122b40a84ba155877beecd9ffdff6af81))
+
+## [12.10.0](https://github.com/doublewordai/control-layer/compare/v12.9.0...v12.10.0) (2026-10-01)
+
+
+### Features
+
+* **db:** add dormant model serving class and alias storage ([#1896](https://github.com/doublewordai/control-layer/issues/1896)) ([fc10154](https://github.com/doublewordai/control-layer/commit/fc1015429b53354d4b36929e3a30287c649150eb))
+
+
+### Performance Improvements
+
+* **onwards:** share a pool's key set between requests ([#1901](https://github.com/doublewordai/control-layer/issues/1901)) ([18cd38c](https://github.com/doublewordai/control-layer/commit/18cd38c64a5f6af25a85d29120a3ca186e382226))
+
+
+### Build System
+
+* keep clippy clean on Rust 1.99 ([#1900](https://github.com/doublewordai/control-layer/issues/1900)) ([9d14bee](https://github.com/doublewordai/control-layer/commit/9d14beec7ecadbba51a0e8e18ac3d3556d34bcd8))
+
+
+### Continuous Integration
+
+* run the test suite when a pull request changes dependencies ([#1899](https://github.com/doublewordai/control-layer/issues/1899)) ([eef7079](https://github.com/doublewordai/control-layer/commit/eef7079c064503342a0864423b2979c92e18996d))
+
+
+### Tests
+
+* **dwctl:** budget complete responses and use realistic payloads ([#1897](https://github.com/doublewordai/control-layer/issues/1897)) ([4307200](https://github.com/doublewordai/control-layer/commit/4307200c38c1a6a1f6948870804e402fe06d1b8b))
+
+## [12.9.0](https://github.com/doublewordai/control-layer/compare/v12.8.0...v12.9.0) (2026-10-01)
+
+
+### Features
+
+* **image-normalizer:** store each ingested image under its own key ([#1894](https://github.com/doublewordai/control-layer/issues/1894)) ([71dffe1](https://github.com/doublewordai/control-layer/commit/71dffe14df99fe457f834a5eef8a0af97464c2a4))
+
+
+### Bug Fixes
+
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+
+## [12.8.0](https://github.com/doublewordai/control-layer/compare/v12.7.4...v12.8.0) (2026-10-01)
+
+
+### Features
+
+* **onwards:** conversation affinity for priority pools ([#1892](https://github.com/doublewordai/control-layer/issues/1892)) ([b2ff624](https://github.com/doublewordai/control-layer/commit/b2ff624480cade3f985b1a02045304add2339705))
+
+## [12.7.4](https://github.com/doublewordai/control-layer/compare/v12.7.3...v12.7.4) (2026-09-30)
+
+
+### Bug Fixes
+
+* autovacuum large churning tables on a fixed row count ([#1883](https://github.com/doublewordai/control-layer/issues/1883)) ([43e1aae](https://github.com/doublewordai/control-layer/commit/43e1aae14904af4d333dd25e716f2d61462b74a4))
+* **fusillade:** bound maintenance transactions on the server ([#1878](https://github.com/doublewordai/control-layer/issues/1878)) ([e5b76af](https://github.com/doublewordai/control-layer/commit/e5b76af02688470048f6d56808ffdcc12b33ebb4))
+* **prompt-cache:** delete long-expired entries and vacuum on a fixed count ([#1881](https://github.com/doublewordai/control-layer/issues/1881)) ([a32b41a](https://github.com/doublewordai/control-layer/commit/a32b41af11040b6815677476cc37cd043245ff47))
+
+
+### Performance Improvements
+
+* **fusillade:** index deleted batches and files awaiting purge ([#1884](https://github.com/doublewordai/control-layer/issues/1884)) ([1a748c3](https://github.com/doublewordai/control-layer/commit/1a748c38ba7af880d5ecf7168ea7fb4f9c515859))
+* **fusillade:** index file-content expiry candidates ([#1882](https://github.com/doublewordai/control-layer/issues/1882)) ([7c2ce88](https://github.com/doublewordai/control-layer/commit/7c2ce8822f7a48dae7db5b899dd4c0ae945f172e))
+
+
+### Tests
+
+* **fusillade:** pin batch index plans to production statements ([#1886](https://github.com/doublewordai/control-layer/issues/1886)) ([301e131](https://github.com/doublewordai/control-layer/commit/301e131050ff46a77d6820a7c37f0a9325da75c1))
+
+## [12.7.3](https://github.com/doublewordai/control-layer/compare/v12.7.2...v12.7.3) (2026-09-30)
+
+
+### Performance Improvements
+
+* **fusillade:** probe live requests by id in trailing demand ([#1889](https://github.com/doublewordai/control-layer/issues/1889)) ([4e6209b](https://github.com/doublewordai/control-layer/commit/4e6209b50867dc2e54952f949b4c869f46e92b2f))
+* **fusillade:** skip batches with live requests before finalizer counts ([#1879](https://github.com/doublewordai/control-layer/issues/1879)) ([79193b3](https://github.com/doublewordai/control-layer/commit/79193b39dfe91ab68de8e832087e22f586ffab90))
+
+## [12.7.2](https://github.com/doublewordai/control-layer/compare/v12.7.1...v12.7.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **dwctl:** autovacuum underway.task on a fixed row count ([#1873](https://github.com/doublewordai/control-layer/issues/1873)) ([fc5e13b](https://github.com/doublewordai/control-layer/commit/fc5e13b90d1c7e1ae50126832b2d71fb9713f45c))
+* **dwctl:** bound dashboard analytics reads and keep outbox gauges live ([#1874](https://github.com/doublewordai/control-layer/issues/1874)) ([e08fa25](https://github.com/doublewordai/control-layer/commit/e08fa25fe8f78b66b28cc18b98347fea92a23714))
+* **dwctl:** drop realtime writer records instead of blocking outlet ([#1888](https://github.com/doublewordai/control-layer/issues/1888)) ([854c099](https://github.com/doublewordai/control-layer/commit/854c099e8051fe2258f96e11927fba9b49ca33dd))
+
+
+### Performance Improvements
+
+* **fusillade:** index cancelling batches for the cancellation poll ([#1877](https://github.com/doublewordai/control-layer/issues/1877)) ([04763b7](https://github.com/doublewordai/control-layer/commit/04763b7406743210a17bdff3ed928c4be83e50a9))
+* **fusillade:** index pending batch notifications ([#1876](https://github.com/doublewordai/control-layer/issues/1876)) ([57738ae](https://github.com/doublewordai/control-layer/commit/57738aea3abf9f5660b3ec8e91fbc449f57caf9a))
+
+
+### Tests
+
+* **dwctl:** heap budgets for requests in flight ([#1870](https://github.com/doublewordai/control-layer/issues/1870)) ([95715ca](https://github.com/doublewordai/control-layer/commit/95715ca7671a386f910ce39ebb773ebd7d4d41a5))
+
+## [12.7.1](https://github.com/doublewordai/control-layer/compare/v12.7.0...v12.7.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **prompt-cache:** skip negligible TTL refreshes so a hot prefix cannot queue on one row ([#1869](https://github.com/doublewordai/control-layer/issues/1869)) ([69849f0](https://github.com/doublewordai/control-layer/commit/69849f08e807be01a87ca678b124859de26496bd))
+
+## [12.7.0](https://github.com/doublewordai/control-layer/compare/v12.6.3...v12.7.0) (2026-09-29)
+
+
+### Features
+
+* add allocator metrics and opt-in jemalloc heap profiling ([#1862](https://github.com/doublewordai/control-layer/issues/1862)) ([da88718](https://github.com/doublewordai/control-layer/commit/da8871818f4e92c5f63db9b90c5ec8ebd2a4320b))
+
+## [12.6.3](https://github.com/doublewordai/control-layer/compare/v12.6.2...v12.6.3) (2026-09-28)
+
+
+### Bug Fixes
+
+* debounce config notifications after reload completion ([#1856](https://github.com/doublewordai/control-layer/issues/1856)) ([5cf22c5](https://github.com/doublewordai/control-layer/commit/5cf22c5cf115cd8d3dcb8881bf55a223ab2b6845))
+
+## [12.6.2](https://github.com/doublewordai/control-layer/compare/v12.6.1...v12.6.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* show organization display names in pricing selector ([#1855](https://github.com/doublewordai/control-layer/issues/1855)) ([5ed9e3b](https://github.com/doublewordai/control-layer/commit/5ed9e3b575951d1822b6de86cebff345d6d0bc02))
+
+## [12.6.1](https://github.com/doublewordai/control-layer/compare/v12.6.0...v12.6.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **image-normalizer:** re-upload dedup hits before the bucket lifecycle expires them ([#1843](https://github.com/doublewordai/control-layer/issues/1843)) ([268b3a4](https://github.com/doublewordai/control-layer/commit/268b3a48d6c2e3cb7659b8d01c84006534903068))
+
+## [12.6.0](https://github.com/doublewordai/control-layer/compare/v12.5.0...v12.6.0) (2026-09-25)
+
+
+### Features
+
+* **preview:** validate serving classes and class pricing ([#1825](https://github.com/doublewordai/control-layer/issues/1825)) ([99b92b0](https://github.com/doublewordai/control-layer/commit/99b92b031a755a81e8a3969a330d28070fd5225b))
+
+## [12.5.0](https://github.com/doublewordai/control-layer/compare/v12.4.0...v12.5.0) (2026-09-24)
+
+
+### Features
+
+* **organizations:** let owners disable modalities for their organization ([#1842](https://github.com/doublewordai/control-layer/issues/1842)) ([ed76744](https://github.com/doublewordai/control-layer/commit/ed76744541e475a6c07e18eb63ba2d24d6e4f6fd))
+
+## [12.4.0](https://github.com/doublewordai/control-layer/compare/v12.3.2...v12.4.0) (2026-09-24)
+
+
+### Features
+
+* **onwards:** send a scheduling priority on every dynamo request ([#1848](https://github.com/doublewordai/control-layer/issues/1848)) ([094fe22](https://github.com/doublewordai/control-layer/commit/094fe227e2bcd3c86f2b090a6b7a4fa44eb2d17d))
+
+
+### Bug Fixes
+
+* **batches:** scope per-request retry to its batch ([#1847](https://github.com/doublewordai/control-layer/issues/1847)) ([695112e](https://github.com/doublewordai/control-layer/commit/695112e9c932aec65a46a43681f360b717114b82))
+* **underway:** index terminal tasks for retention sweeps ([#1845](https://github.com/doublewordai/control-layer/issues/1845)) ([1b6b4a0](https://github.com/doublewordai/control-layer/commit/1b6b4a034b83c1b34e028245a80b0a8377b99fda))
+
+## [12.3.2](https://github.com/doublewordai/control-layer/compare/v12.3.1...v12.3.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **provisioning:** keep existing components' enabled state on startup ([#1840](https://github.com/doublewordai/control-layer/issues/1840)) ([8e0d127](https://github.com/doublewordai/control-layer/commit/8e0d1279359115c046790f310a3c47380f909c4c))
+
+## [12.3.1](https://github.com/doublewordai/control-layer/compare/v12.3.0...v12.3.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **analytics:** enforce queued request success uniqueness ([#1835](https://github.com/doublewordai/control-layer/issues/1835)) ([61d48a8](https://github.com/doublewordai/control-layer/commit/61d48a809ced2d306ee20b30994265555e165bbf))
+* **inference:** enforce body limits before buffering and parsing ([#1836](https://github.com/doublewordai/control-layer/issues/1836)) ([e0b9899](https://github.com/doublewordai/control-layer/commit/e0b9899a831fa5a19232d4822e868b0593a76439))
+
+## [12.3.0](https://github.com/doublewordai/control-layer/compare/v12.2.2...v12.3.0) (2026-09-23)
+
+
+### Features
+
+* **dashboard:** let admins remove funds from the gift funds dialog ([#1832](https://github.com/doublewordai/control-layer/issues/1832)) ([3ef94e5](https://github.com/doublewordai/control-layer/commit/3ef94e504860ba69cb08a2a0021f8c6f0c87a272))
+
+
+### Bug Fixes
+
+* **underway:** ordered claim index, bounded task retention, purge script ([#1828](https://github.com/doublewordai/control-layer/issues/1828)) ([a888adb](https://github.com/doublewordai/control-layer/commit/a888adb5cdcc17db120db15fcfb6d67fb3016d97))
+
+## [12.2.2](https://github.com/doublewordai/control-layer/compare/v12.2.1...v12.2.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* Correctly handle otel tracing through onwards ([#1827](https://github.com/doublewordai/control-layer/issues/1827)) ([107d619](https://github.com/doublewordai/control-layer/commit/107d619195a55c5b0cac65801aaffad06256668a))
+
+## [12.2.1](https://github.com/doublewordai/control-layer/compare/v12.2.0...v12.2.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **responses:** accept encrypted reasoning projection as a no-op ([#1829](https://github.com/doublewordai/control-layer/issues/1829)) ([87efcc3](https://github.com/doublewordai/control-layer/commit/87efcc3f19283fcfa90097d948c126d63785e217))
+
+## [12.2.0](https://github.com/doublewordai/control-layer/compare/v12.1.1...v12.2.0) (2026-09-21)
+
+
+### Features
+
+* serving classes v1 ([#1774](https://github.com/doublewordai/control-layer/issues/1774)) ([e1c9275](https://github.com/doublewordai/control-layer/commit/e1c92756cbe16953360aa4055cf1011992c55767))
+
+## [12.1.1](https://github.com/doublewordai/control-layer/compare/v12.1.0...v12.1.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **credits:** one payment instrument verifies one account; verification Checkout offers cards only ([#1820](https://github.com/doublewordai/control-layer/issues/1820)) ([2619b7f](https://github.com/doublewordai/control-layer/commit/2619b7fc2a494d0c4377e4dfd1546f4942df3333))
+* **dashboard:** show clean error for empty-body 503/529 failures ([#1660](https://github.com/doublewordai/control-layer/issues/1660)) ([798870b](https://github.com/doublewordai/control-layer/commit/798870b355056b96b4e8ceef8d58f46d4d7d9985))
+* **keystore:** reject empty/whitespace wrap-key secrets at config load ([#1651](https://github.com/doublewordai/control-layer/issues/1651)) ([4562d9c](https://github.com/doublewordai/control-layer/commit/4562d9c4acadd83c092de780c4a99cb287a7d18c))
+
+
+### Documentation
+
+* correct model provisioning config to not require a non-empty directory ([#1760](https://github.com/doublewordai/control-layer/issues/1760)) ([e72c203](https://github.com/doublewordai/control-layer/commit/e72c20340ae1829f36866bccce4340249fcfd3f8))
+
+## [12.1.0](https://github.com/doublewordai/control-layer/compare/v12.0.1...v12.1.0) (2026-09-18)
+
+
+### Features
+
+* **accounts:** add feature flags with negative-balance opt-in ([#1817](https://github.com/doublewordai/control-layer/issues/1817)) ([dc3bb30](https://github.com/doublewordai/control-layer/commit/dc3bb30e9416c1697d356ddc5fc89e3a4873d111))
+
+
+### Bug Fixes
+
+* **analytics:** checkpoint records before enrichment ([#1789](https://github.com/doublewordai/control-layer/issues/1789)) ([7ed4000](https://github.com/doublewordai/control-layer/commit/7ed4000159b0ea8ef496e84437517c7511a0bce6))
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+
+## [12.0.1](https://github.com/doublewordai/control-layer/compare/v12.0.0...v12.0.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* honor configured SSE limits in cache and continuation streams ([#1816](https://github.com/doublewordai/control-layer/issues/1816)) ([7f823cc](https://github.com/doublewordai/control-layer/commit/7f823cc299f0f227bb2e0ad5f6c4cf2a3bbd33e6))
+* keep image prefix cache identity stable across flex/batch dispat… ([#1806](https://github.com/doublewordai/control-layer/issues/1806)) ([b41cf6d](https://github.com/doublewordai/control-layer/commit/b41cf6d72a1ae7fa252b09f93b7c82036001bb68))
+
+## [12.0.0](https://github.com/doublewordai/control-layer/compare/v11.17.1...v12.0.0) (2026-09-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **onwards:** frame SSE before applying buffer limit
+
+### Bug Fixes
+
+* **onwards:** frame SSE before applying buffer limit ([5ebb4f1](https://github.com/doublewordai/control-layer/commit/5ebb4f122e5cba74fc971afd0e94b4d050ae96a4))
+* **underway:** index task claiming and completion lookups ([#1807](https://github.com/doublewordai/control-layer/issues/1807)) ([524cea4](https://github.com/doublewordai/control-layer/commit/524cea42d5381e9e39c4c4ce0d378d914eae4483))
+
+## [11.17.1](https://github.com/doublewordai/control-layer/compare/v11.17.0...v11.17.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **onwards:** return realtime-only failover statuses as sent when no provider is left ([#1811](https://github.com/doublewordai/control-layer/issues/1811)) ([2b954b9](https://github.com/doublewordai/control-layer/commit/2b954b9b22620e4764fffc5793c9e65303170e37))
+
+## [11.17.0](https://github.com/doublewordai/control-layer/compare/v11.16.0...v11.17.0) (2026-09-17)
+
+
+### Features
+
+* **dwctl:** let slow first tokens stream until a 20-second failover deadline ([#1808](https://github.com/doublewordai/control-layer/issues/1808)) ([444ad7c](https://github.com/doublewordai/control-layer/commit/444ad7cfd5d04d5077ef62b61a2fb9cd72b5f03e))
+
+## [11.16.0](https://github.com/doublewordai/control-layer/compare/v11.15.1...v11.16.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** make AIMD share control decide under overload and recover ([#1803](https://github.com/doublewordai/control-layer/issues/1803)) ([8bb4a6f](https://github.com/doublewordai/control-layer/commit/8bb4a6fc3a865993d810bcd671165e13fe7c7ce7))
+
+## [11.15.1](https://github.com/doublewordai/control-layer/compare/v11.15.0...v11.15.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **proxy:** preserve upstream rate-limit responses ([#1800](https://github.com/doublewordai/control-layer/issues/1800)) ([8a2052b](https://github.com/doublewordai/control-layer/commit/8a2052b3627d7c120b42bf436891529ba3de3f89))
+
+## [11.15.0](https://github.com/doublewordai/control-layer/compare/v11.14.0...v11.15.0) (2026-09-17)
+
+
+### Features
+
+* run schema migrations from `dwctl migrate` and check compatibility at startup ([#1756](https://github.com/doublewordai/control-layer/issues/1756)) ([38ac719](https://github.com/doublewordai/control-layer/commit/38ac71914ea151205cbf631ecbbf29ccd95ffbc0))
+
+
+### Bug Fixes
+
+* cover /completions with the cache layer (implicit billing + prov… ([#1796](https://github.com/doublewordai/control-layer/issues/1796)) ([4699d2b](https://github.com/doublewordai/control-layer/commit/4699d2b96c3aa7268eccb484ca6a425c6a61bec2))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* **responses:** validate stateful requests and include projections ([#1480](https://github.com/doublewordai/control-layer/issues/1480)) ([c91f33b](https://github.com/doublewordai/control-layer/commit/c91f33b3b2b229c83c6144a7d1b431a1f371ea9b))
+
+## [11.14.0](https://github.com/doublewordai/control-layer/compare/v11.13.0...v11.14.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
+## [11.13.0](https://github.com/doublewordai/control-layer/compare/v11.12.0...v11.13.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [11.12.0](https://github.com/doublewordai/control-layer/compare/v11.11.0...v11.12.0) (2026-09-16)
+
+
+### Features
+
+* implicit caching using engine / upstream stats ([#1781](https://github.com/doublewordai/control-layer/issues/1781)) ([7f2adb4](https://github.com/doublewordai/control-layer/commit/7f2adb4557a29c6fcc4f4ad5f1860550a1369395))
+
+
+### Bug Fixes
+
+* **analytics:** persist billing writes through outbox ([#1787](https://github.com/doublewordai/control-layer/issues/1787)) ([7896933](https://github.com/doublewordai/control-layer/commit/7896933111c4084706884bbf11972279cb83ec6d))
+* **ci:** track the fusillade-arsenal 4.1.0 and fusillade-core 6.0.0 release baselines ([#1784](https://github.com/doublewordai/control-layer/issues/1784)) ([b644c6f](https://github.com/doublewordai/control-layer/commit/b644c6fbb7727309761f64ea0dae9e4ce2c8c1f9))
+* **retention:** use indexed probes for startup and purge route queries ([#1783](https://github.com/doublewordai/control-layer/issues/1783)) ([364cf42](https://github.com/doublewordai/control-layer/commit/364cf42636935d8d3c1ad1799f3225e392d48d3c))
+
+
+### Miscellaneous
+
+* remove unused TranslationRegistry::default and is_empty ([#1695](https://github.com/doublewordai/control-layer/issues/1695)) ([2358272](https://github.com/doublewordai/control-layer/commit/23582720503bbea35e96597ba439977b37d936f2))
+
+## [11.11.0](https://github.com/doublewordai/control-layer/compare/v11.10.2...v11.11.0) (2026-09-15)
+
+
+### Features
+
+* **onwards:** fail over streamed requests whose first token stalls ([#1780](https://github.com/doublewordai/control-layer/issues/1780)) ([2418bf8](https://github.com/doublewordai/control-layer/commit/2418bf869e9cb3734bb625ab382eae075dab5c0e))
+
+
+### Bug Fixes
+
+* **batches:** results survive input-file deletion, 410 once output/error files are deleted ([#1741](https://github.com/doublewordai/control-layer/issues/1741)) ([144c1e4](https://github.com/doublewordai/control-layer/commit/144c1e460ee563693ceba174d5144db13acd6d4f))
+
+## [11.10.2](https://github.com/doublewordai/control-layer/compare/v11.10.1...v11.10.2) (2026-09-15)
+
+
+### Bug Fixes
+
+* bound retained history reads for single-model response lists ([#1778](https://github.com/doublewordai/control-layer/issues/1778)) ([28a4746](https://github.com/doublewordai/control-layer/commit/28a474683c3c459907531d24e753f7c277d5ceb4))
+
+## [11.10.1](https://github.com/doublewordai/control-layer/compare/v11.10.0...v11.10.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* preserve database result shapes and detect cached plan regressions ([#1759](https://github.com/doublewordai/control-layer/issues/1759)) ([92a4ee4](https://github.com/doublewordai/control-layer/commit/92a4ee45808f793c4018257226ba5d52d959c791))
+* preserve internal cache usage for Responses billing ([#1777](https://github.com/doublewordai/control-layer/issues/1777)) ([b62f94c](https://github.com/doublewordai/control-layer/commit/b62f94c1599d9dbf385ef05e83f439c38555d8fe))
+* preserve model query results across additive schema migrations ([#1758](https://github.com/doublewordai/control-layer/issues/1758)) ([90ae91d](https://github.com/doublewordai/control-layer/commit/90ae91d0364e89040429e9c59a50f14478658122))
+
+
+### Code Refactoring
+
+* bring response reassembly into the Rust workspace ([#1775](https://github.com/doublewordai/control-layer/issues/1775)) ([d75c262](https://github.com/doublewordai/control-layer/commit/d75c26220fbd2660bf19c3e7df11fec4eceed14a))
+
+
+### Documentation
+
+* Add repo-skill for DB migrations ([#1755](https://github.com/doublewordai/control-layer/issues/1755)) ([c28c352](https://github.com/doublewordai/control-layer/commit/c28c3529b5a575d5509f730e7be0d7910d15754c))
+
+## [11.10.0](https://github.com/doublewordai/control-layer/compare/v11.9.1...v11.10.0) (2026-09-11)
+
+
+### Features
+
+* add declarative model provisioning ([#1745](https://github.com/doublewordai/control-layer/issues/1745)) ([7bf0bf6](https://github.com/doublewordai/control-layer/commit/7bf0bf6260ffb5e06f4f1a5a6962c300e7228935))
+
+## [11.9.1](https://github.com/doublewordai/control-layer/compare/v11.9.0...v11.9.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **fusillade:** keep request polling stable during retention ([#1742](https://github.com/doublewordai/control-layer/issues/1742)) ([0ccdf8c](https://github.com/doublewordai/control-layer/commit/0ccdf8c91ef588cc4762469293987e21833e60dc))
+
+## [11.9.0](https://github.com/doublewordai/control-layer/compare/v11.8.0...v11.9.0) (2026-09-10)
+
+
+### Features
+
+* Improve page load for batches page ([#1744](https://github.com/doublewordai/control-layer/issues/1744)) ([e720a9e](https://github.com/doublewordai/control-layer/commit/e720a9e5168d774d503a6b331d23b7388aac5a70))
+
+
+### Performance Improvements
+
+* **fusillade:** make the unscoped Responses page usable ([#1740](https://github.com/doublewordai/control-layer/issues/1740)) ([ddfc06a](https://github.com/doublewordai/control-layer/commit/ddfc06a25832c1e1a89ee1084f06eee10a8ae530))
+
+## [11.8.0](https://github.com/doublewordai/control-layer/compare/v11.7.0...v11.8.0) (2026-09-09)
+
+
+### Features
+
+* **dashboard:** filter responses by account on the console ([#1733](https://github.com/doublewordai/control-layer/issues/1733)) ([6d2f4ba](https://github.com/doublewordai/control-layer/commit/6d2f4bac6eceba5648515459ca71d1f542e4ba46))
+* **responses:** surface the API key holder, not just the billing owner ([#1732](https://github.com/doublewordai/control-layer/issues/1732)) ([f9cc7f3](https://github.com/doublewordai/control-layer/commit/f9cc7f30ea2175819f977a10a53f3d35eb7239fc))
+
+## [11.7.0](https://github.com/doublewordai/control-layer/compare/v11.6.3...v11.7.0) (2026-09-09)
+
+
+### Features
+
+* **organizations:** notify owners of a join request, and the requester on approval ([#1724](https://github.com/doublewordai/control-layer/issues/1724)) ([c45cb28](https://github.com/doublewordai/control-layer/commit/c45cb28b60334ea3c7eb998bd0ba2d66fe47f867))
+
+## [11.6.3](https://github.com/doublewordai/control-layer/compare/v11.6.2...v11.6.3) (2026-09-09)
+
+
+### Bug Fixes
+
+* support scoped owners for pooled component connections ([#1721](https://github.com/doublewordai/control-layer/issues/1721)) ([1bd4127](https://github.com/doublewordai/control-layer/commit/1bd41270c6aac86f7af1deebd96139da8a2383d6))
+
+## [11.6.2](https://github.com/doublewordai/control-layer/compare/v11.6.1...v11.6.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* add index for finalizer sweep ([#1728](https://github.com/doublewordai/control-layer/issues/1728)) ([a983682](https://github.com/doublewordai/control-layer/commit/a98368203a929e647199a6a94385116247214050))
+
+## [11.6.1](https://github.com/doublewordai/control-layer/compare/v11.6.0...v11.6.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* keep the trailing-demand retained arms under the statement timeout ([#1723](https://github.com/doublewordai/control-layer/issues/1723)) ([c4390d3](https://github.com/doublewordai/control-layer/commit/c4390d3d5fd226b912bc374037f3bc953123436c))
+
+## [11.6.0](https://github.com/doublewordai/control-layer/compare/v11.5.2...v11.6.0) (2026-09-08)
+
+
+### Features
+
+* **dwctl:** pooled and direct connection pools per database ([#1565](https://github.com/doublewordai/control-layer/issues/1565)) ([73a2080](https://github.com/doublewordai/control-layer/commit/73a20807dabf0229ca2d41dda8c8630999fd11e6))
+
+
+### Bug Fixes
+
+* soft-delete organization keys on user deletion ([#1488](https://github.com/doublewordai/control-layer/issues/1488)) ([6fc4078](https://github.com/doublewordai/control-layer/commit/6fc4078756fa8308c910eb189497ee56fe50d356))
+
+## [11.5.2](https://github.com/doublewordai/control-layer/compare/v11.5.1...v11.5.2) (2026-09-08)
+
+
+### Bug Fixes
+
+* **organizations:** close the domain-claim hijack and the ownerless-workspace gap ([#1698](https://github.com/doublewordai/control-layer/issues/1698)) ([bd84908](https://github.com/doublewordai/control-layer/commit/bd84908fc435bc5ed90d6d09c707a5ba9985ef35))
+
+
+### Continuous Integration
+
+* bump versions for perf, refactor and other commit types ([#1717](https://github.com/doublewordai/control-layer/issues/1717)) ([f3d90bc](https://github.com/doublewordai/control-layer/commit/f3d90bc14fd40bfff433a3de09e2c8954e03746f))
+
+## [11.5.1](https://github.com/doublewordai/control-layer/compare/v11.5.0...v11.5.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **fusillade:** page batchless archive discovery and hot-loop busy movers ([#1715](https://github.com/doublewordai/control-layer/issues/1715)) ([f4d8737](https://github.com/doublewordai/control-layer/commit/f4d8737c72f9a60befa19fdcf5221143d3548169))
+* **onwards:** preserve trusted embedded client error details ([#1714](https://github.com/doublewordai/control-layer/issues/1714)) ([e2bcc8e](https://github.com/doublewordai/control-layer/commit/e2bcc8ee0328994dc52fe4c1bd82488c9e3e077e))
+
+## [11.5.0](https://github.com/doublewordai/control-layer/compare/v11.4.5...v11.5.0) (2026-09-08)
+
+
+### Features
+
+* **fusillade:** add configurable batch leak intervals ([#1712](https://github.com/doublewordai/control-layer/issues/1712)) ([c4bfb3d](https://github.com/doublewordai/control-layer/commit/c4bfb3d8be587602729efcbd2f1390bd034fa005))
+
+## [11.4.5](https://github.com/doublewordai/control-layer/compare/v11.4.4...v11.4.5) (2026-09-07)
+
+
+### Bug Fixes
+
+* **fusillade:** bound retained response page scans ([#1699](https://github.com/doublewordai/control-layer/issues/1699)) ([f7c64cf](https://github.com/doublewordai/control-layer/commit/f7c64cffe340e18732e6c7dd58d34a65a381eaff))
+
+## [11.4.4](https://github.com/doublewordai/control-layer/compare/v11.4.3...v11.4.4) (2026-09-07)
+
+
+### Bug Fixes
+
+* **fusillade:** give the count-estimate EXPLAIN its own budget ([#1661](https://github.com/doublewordai/control-layer/issues/1661)) ([325ab85](https://github.com/doublewordai/control-layer/commit/325ab8523463485c45699dcc880d507d5d4b731e))
+* **onwards:** pass provider reasoning fields through non-strict gateways ([#1591](https://github.com/doublewordai/control-layer/issues/1591)) ([81e0d38](https://github.com/doublewordai/control-layer/commit/81e0d38b4ff98f1e1d0eb02ed523c19499a94e18))
+
+## [11.4.3](https://github.com/doublewordai/control-layer/compare/v11.4.2...v11.4.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* **onwards:** drain active responses during shutdown ([#1586](https://github.com/doublewordai/control-layer/issues/1586)) ([416ef7f](https://github.com/doublewordai/control-layer/commit/416ef7f1b3cf506a6d4bcec658a3e1ea3d3e7402))
+* prune retained partitions in the trailing-demand query by retent… ([#1587](https://github.com/doublewordai/control-layer/issues/1587)) ([909ec68](https://github.com/doublewordai/control-layer/commit/909ec68d89b5e25d9ea56ce42c15a5166d80a3d3))
+
+## [11.4.2](https://github.com/doublewordai/control-layer/compare/v11.4.1...v11.4.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **billing:** report first-purchase state so the promo can gate on the ledger ([#1562](https://github.com/doublewordai/control-layer/issues/1562)) ([6a16cdd](https://github.com/doublewordai/control-layer/commit/6a16cddc01ae8c6f515577e61267ca01401bce43))
+* **fusillade:** probe the template per picked row in the claim-time stranded check ([#1580](https://github.com/doublewordai/control-layer/issues/1580)) ([1433908](https://github.com/doublewordai/control-layer/commit/1433908c0fbb17fa3ba7b82c543ef5a40730e54c))
+
+## [11.4.1](https://github.com/doublewordai/control-layer/compare/v11.4.0...v11.4.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* Formalize indices missing from migration and drop unused ones ([#1568](https://github.com/doublewordai/control-layer/issues/1568)) ([0866443](https://github.com/doublewordai/control-layer/commit/0866443427b104e17b562fd6bf809da1bb54d855))
+* **fusillade:** drop the stranded-request purge step that times out  ([#1576](https://github.com/doublewordai/control-layer/issues/1576)) ([b9cae7a](https://github.com/doublewordai/control-layer/commit/b9cae7a23c2bd3cafe5c3a20ceb14c62c03f5a90))
+
+## [11.4.0](https://github.com/doublewordai/control-layer/compare/v11.3.0...v11.4.0) (2026-09-04)
+
+
+### Features
+
+* **fusillade:** move overdue batchless graphs concurrently in the backfill ([#1567](https://github.com/doublewordai/control-layer/issues/1567)) ([b0ed45c](https://github.com/doublewordai/control-layer/commit/b0ed45c09b27d1e87022247ea016b212fa958377))
+
+## [11.3.0](https://github.com/doublewordai/control-layer/compare/v11.2.0...v11.3.0) (2026-09-04)
+
+
+### Features
+
+* **prefix_chain:** content-free prompt-structure capture to ClickHouse ([#1555](https://github.com/doublewordai/control-layer/issues/1555)) ([7bf9c92](https://github.com/doublewordai/control-layer/commit/7bf9c922aa0dc4d3df871330af2593c75028e593))
+
+## [11.2.0](https://github.com/doublewordai/control-layer/compare/v11.1.1...v11.2.0) (2026-09-04)
+
+
+### Features
+
+* **analytics:** record engine cached tokens and content-free request params ([#1553](https://github.com/doublewordai/control-layer/issues/1553)) ([411fabc](https://github.com/doublewordai/control-layer/commit/411fabc6cc30b529a7dc11a22d73d69d6864a8c7))
+* **clickhouse:** shared warehouse connection and a generic best-effort insert sink ([#1554](https://github.com/doublewordai/control-layer/issues/1554)) ([6faf6c0](https://github.com/doublewordai/control-layer/commit/6faf6c01bf160e3c594130ebf6925425083e431f))
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+
+
+### Bug Fixes
+
+* **deps:** bump browserslist to 4.28.8 (Dependabot [#175](https://github.com/doublewordai/control-layer/issues/175)/[#176](https://github.com/doublewordai/control-layer/issues/176)) ([#1552](https://github.com/doublewordai/control-layer/issues/1552)) ([9f4d912](https://github.com/doublewordai/control-layer/commit/9f4d912fb4bdd3681c85fbaf14e4dda135a33227))
+* **deps:** finish OpenTelemetry 0.32 migration via outlet 0.10 (CVE-2… ([#1550](https://github.com/doublewordai/control-layer/issues/1550)) ([7c6462f](https://github.com/doublewordai/control-layer/commit/7c6462fecba17688364c208fc0d73c608e483ba1))
+* search customer-visible model fields ([#1560](https://github.com/doublewordai/control-layer/issues/1560)) ([486383d](https://github.com/doublewordai/control-layer/commit/486383d594aae9e0f68f231f9c412fec9f210a8c))
+
+## [11.1.1](https://github.com/doublewordai/control-layer/compare/v11.1.0...v11.1.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **dwctl:** count pending requests outside the admission lock; index the batched demand branch ([#1531](https://github.com/doublewordai/control-layer/issues/1531)) ([73e8f80](https://github.com/doublewordai/control-layer/commit/73e8f8083eb4c7125526b71e89684cc857bb8d6f))
+* surface pending org email-change verification in the dashboard ([#1530](https://github.com/doublewordai/control-layer/issues/1530)) ([27ea5a1](https://github.com/doublewordai/control-layer/commit/27ea5a162eee9da036abeb8bb9d4d935e1c6f949))
+
+## [11.1.0](https://github.com/doublewordai/control-layer/compare/v11.0.2...v11.1.0) (2026-09-01)
+
+
+### Features
+
+* batch model field ([#1539](https://github.com/doublewordai/control-layer/issues/1539)) ([e5813bf](https://github.com/doublewordai/control-layer/commit/e5813bfe0ca4cd84e7eec458703a1ece75852008))
+
+## [11.0.2](https://github.com/doublewordai/control-layer/compare/v11.0.1...v11.0.2) (2026-08-30)
+
+
+### Bug Fixes
+
+* **dwctl:** point unknown-API-key 401s at the regional-endpoints docs ([#1541](https://github.com/doublewordai/control-layer/issues/1541)) ([6c5b1f9](https://github.com/doublewordai/control-layer/commit/6c5b1f92b27a075f935a714156c53d1cee936022))
+* **dwctl:** tolerate backend-omitted fields in Responses translation, stop retry loops on translate failure ([#1544](https://github.com/doublewordai/control-layer/issues/1544)) ([04c07c9](https://github.com/doublewordai/control-layer/commit/04c07c9fad947668b6d0be77a38475528dbdc6de))
+
+## [11.0.1](https://github.com/doublewordai/control-layer/compare/v11.0.0...v11.0.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **dwctl:** mark daemon dispatches instead of inferring them at the edge ([#1538](https://github.com/doublewordai/control-layer/issues/1538)) ([fa16fba](https://github.com/doublewordai/control-layer/commit/fa16fba5145336f7c3dd7b1a2233ed6d7845f214))
+
+## [11.0.0](https://github.com/doublewordai/control-layer/compare/v10.17.1...v11.0.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535))
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518))
+
+### Features
+
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518)) ([4276d91](https://github.com/doublewordai/control-layer/commit/4276d91a4c320bf884ed3ba88004d1ca9265fe12))
+
+
+### Code Refactoring
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535)) ([e9c1795](https://github.com/doublewordai/control-layer/commit/e9c1795043f9de5aef1dc4d62b9915f5b8194f5f))
+
+## [10.17.1](https://github.com/doublewordai/control-layer/compare/v10.17.0...v10.17.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* **fusillade:** retry successful responses with reasoning but no fina… ([#1528](https://github.com/doublewordai/control-layer/issues/1528)) ([fea9a98](https://github.com/doublewordai/control-layer/commit/fea9a983965c682af3c7851a2cdb93098f316c95))
+
+## [10.17.0](https://github.com/doublewordai/control-layer/compare/v10.16.1...v10.17.0) (2026-08-27)
+
+
+### Features
+
+* midstream retries ([#1453](https://github.com/doublewordai/control-layer/issues/1453)) ([48be316](https://github.com/doublewordai/control-layer/commit/48be3169869cad3344a01b9ee4c3952ca8f597d8))
+
+
+### Bug Fixes
+
+* **fusillade:** correct the memory gate's reading and remove its in-flight exit ([#1526](https://github.com/doublewordai/control-layer/issues/1526)) ([fbc8985](https://github.com/doublewordai/control-layer/commit/fbc8985d0b8972d07fe44049cc7ea96e44f5fc06))
+
+## [10.16.1](https://github.com/doublewordai/control-layer/compare/v10.16.0...v10.16.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **dwctl:** export malloc_conf under jemalloc's prefixed symbol name ([#1524](https://github.com/doublewordai/control-layer/issues/1524)) ([b889e88](https://github.com/doublewordai/control-layer/commit/b889e889f79b3c3a575d36c710d49870cfd771e3))
+
+## [10.16.0](https://github.com/doublewordai/control-layer/compare/v10.15.0...v10.16.0) (2026-08-26)
+
+
+### Features
+
+* **onwards:** count gateway failures by reason and upstream status ([#1519](https://github.com/doublewordai/control-layer/issues/1519)) ([fce9cbd](https://github.com/doublewordai/control-layer/commit/fce9cbdc88cbdc81a850bd86660743e3e710758c))
+
+
+### Bug Fixes
+
+* **fusillade:** stop the memory gate ratcheting in-flight work to zero ([#1523](https://github.com/doublewordai/control-layer/issues/1523)) ([e169536](https://github.com/doublewordai/control-layer/commit/e16953622d4bc89f04e53b1db0ddb32c9156005f))
+
+## [10.15.0](https://github.com/doublewordai/control-layer/compare/v10.14.2...v10.15.0) (2026-08-26)
+
+
+### Features
+
+* **dashboard:** explain what the region indicator means ([#1514](https://github.com/doublewordai/control-layer/issues/1514)) ([29c0da3](https://github.com/doublewordai/control-layer/commit/29c0da3f9ef4b8ce96e168c5b753ad8fdcb09357))
+
+
+### Bug Fixes
+
+* **db-setup:** apply underway crate migrations in just db-setup ([#1509](https://github.com/doublewordai/control-layer/issues/1509)) ([98b469f](https://github.com/doublewordai/control-layer/commit/98b469f3a9784667db90e11cc0aa3013dc3c289e))
+
+## [10.14.2](https://github.com/doublewordai/control-layer/compare/v10.14.1...v10.14.2) (2026-08-25)
+
+
+### Performance Improvements
+
+* **fusillade:** index the batchless branch of the demand query ([#1516](https://github.com/doublewordai/control-layer/issues/1516)) ([6833cb0](https://github.com/doublewordai/control-layer/commit/6833cb08f464b0df14782d3b3eeb1fc4126c7c9c))
+
+## [10.14.1](https://github.com/doublewordai/control-layer/compare/v10.14.0...v10.14.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **fusillade:** give the memory gate an exit that can actually be reached ([#1513](https://github.com/doublewordai/control-layer/issues/1513)) ([9c8e57c](https://github.com/doublewordai/control-layer/commit/9c8e57caedd22957b5859accc01f66847aeabcc5))
+* **onwards:** retry slow empty SSE streams ([#1510](https://github.com/doublewordai/control-layer/issues/1510)) ([4df7a30](https://github.com/doublewordai/control-layer/commit/4df7a30f657dd3f87bfc6cf9c07c0a33180cd3a5))
+
+## [10.14.0](https://github.com/doublewordai/control-layer/compare/v10.13.1...v10.14.0) (2026-08-23)
+
+
+### Features
+
+* **fusillade:** discover per-model concurrency from 529 backpressure ([#1486](https://github.com/doublewordai/control-layer/issues/1486)) ([c26e0de](https://github.com/doublewordai/control-layer/commit/c26e0dea90476bad29cc9b49c2dc36caf7c2e246))
+
+## [10.13.1](https://github.com/doublewordai/control-layer/compare/v10.13.0...v10.13.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **payments:** ack webhooks for users this plane does not own (COR-594) ([#1506](https://github.com/doublewordai/control-layer/issues/1506)) ([068455c](https://github.com/doublewordai/control-layer/commit/068455c2f530bfe0fa645e502876653aa3471ae1))
+
+## [10.13.0](https://github.com/doublewordai/control-layer/compare/v10.12.0...v10.13.0) (2026-08-18)
+
+
+### Features
+
+* **analytics:** record when work was submitted, not just dispatched ([#1478](https://github.com/doublewordai/control-layer/issues/1478)) ([e54f08d](https://github.com/doublewordai/control-layer/commit/e54f08d8b1e0ff0f09aa450ef4fa448ece121ba2))
+* **dwctl:** default display name to email prefix instead of random words ([#1469](https://github.com/doublewordai/control-layer/issues/1469)) ([b9043bb](https://github.com/doublewordai/control-layer/commit/b9043bb81c914814a5c5b4594b4b70c13581cf39))
+* **payments:** scaffold invoice billing for enterprise accounts ([#1429](https://github.com/doublewordai/control-layer/issues/1429)) ([ca2da40](https://github.com/doublewordai/control-layer/commit/ca2da40f15b2c661f3a5f9923e14c1110593a464))
+* **recompute:** add the read-only dry-run endpoint ([#1492](https://github.com/doublewordai/control-layer/issues/1492)) ([840484d](https://github.com/doublewordai/control-layer/commit/840484d0eb55f69faaa538936f8180bd47782909))
+* **recompute:** reconstruct the cache split as of a past instant ([#1494](https://github.com/doublewordai/control-layer/issues/1494)) ([f42548c](https://github.com/doublewordai/control-layer/commit/f42548ca6e54ca9bebb39fe689d02826706f9656))
+* **recompute:** surface reasoning and total tokens ([#1491](https://github.com/doublewordai/control-layer/issues/1491)) ([2493605](https://github.com/doublewordai/control-layer/commit/2493605da41313e8ce383f987e8b92ed05f9acdb))
+
+## [10.12.0](https://github.com/doublewordai/control-layer/compare/v10.11.2...v10.12.0) (2026-08-14)
+
+
+### Features
+
+* **cache:** cacheBreakpoint query param for automatic caching ([#1493](https://github.com/doublewordai/control-layer/issues/1493)) ([20a6aa0](https://github.com/doublewordai/control-layer/commit/20a6aa0d5a6985085e4680b37e06e162a84d0318))
+* **recompute:** usage recompute engine (dry-run foundation) ([#1473](https://github.com/doublewordai/control-layer/issues/1473)) ([8a3b144](https://github.com/doublewordai/control-layer/commit/8a3b144f6d85bddf20347c9ae7cb8f8b6d79d1df))
+
+## [10.11.2](https://github.com/doublewordai/control-layer/compare/v10.11.1...v10.11.2) (2026-08-13)
+
+
+### Bug Fixes
+
+* stop a strict request parse from zero-billing streamed requests ([#1483](https://github.com/doublewordai/control-layer/issues/1483)) ([6570648](https://github.com/doublewordai/control-layer/commit/657064892388d29454faa1191336d283baad31fa))
+
+## [10.11.1](https://github.com/doublewordai/control-layer/compare/v10.11.0...v10.11.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **onwards:** accept JSON-escaped model values in model extraction ([#1484](https://github.com/doublewordai/control-layer/issues/1484)) ([4b20813](https://github.com/doublewordai/control-layer/commit/4b208135a5093c54f8ebc9fc06c0409fe9907cd9))
+
+## [10.11.0](https://github.com/doublewordai/control-layer/compare/v10.10.2...v10.11.0) (2026-08-13)
+
+
+### Features
+
+* **fusillade:** own batch finalization in a daemon loop, decouple no… ([#1462](https://github.com/doublewordai/control-layer/issues/1462)) ([83066bb](https://github.com/doublewordai/control-layer/commit/83066bb951405f67569d2776ad96ca61a5c372e6))
+
+## [10.10.2](https://github.com/doublewordai/control-layer/compare/v10.10.1...v10.10.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* antrhopic billing ([#1470](https://github.com/doublewordai/control-layer/issues/1470)) ([c44b73a](https://github.com/doublewordai/control-layer/commit/c44b73ae4a1223ff0174d0fa117f151699bc6e45))
+
+## [10.10.1](https://github.com/doublewordai/control-layer/compare/v10.10.0...v10.10.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **dwctl:** accept system-role messages in the Anthropic /v1/messages ingress ([#1468](https://github.com/doublewordai/control-layer/issues/1468)) ([14656fa](https://github.com/doublewordai/control-layer/commit/14656fa2b6c13b7a6d7da948dc8217b8c5082d12))
+* **inference:** normalize null-like tool call arguments ([#1461](https://github.com/doublewordai/control-layer/issues/1461)) ([5915516](https://github.com/doublewordai/control-layer/commit/591551646f54203c94d5541813499c615eaa8d6d))
+* restore ZDR decrypt and JIT image signing on the daemon dispatch path ([#1467](https://github.com/doublewordai/control-layer/issues/1467)) ([e49ff29](https://github.com/doublewordai/control-layer/commit/e49ff291de9c5856717279f40461f14cec875ffa))
+
+## [10.10.0](https://github.com/doublewordai/control-layer/compare/v10.9.1...v10.10.0) (2026-08-11)
+
+
+### Features
+
+* move the OpenAI Responses API into the dwctl edge (COR-519 + COR-536 + COR-522) ([#1317](https://github.com/doublewordai/control-layer/issues/1317)) ([2061ce0](https://github.com/doublewordai/control-layer/commit/2061ce05c5a0490e74931348da14d5b2d9d0354c))
+
+## [10.9.1](https://github.com/doublewordai/control-layer/compare/v10.9.0...v10.9.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* preserve sanitized upstream error statuses ([#1458](https://github.com/doublewordai/control-layer/issues/1458)) ([5b92a8d](https://github.com/doublewordai/control-layer/commit/5b92a8d9c89a2482441e67e75fc4129e9c1e8535))
+
+## [10.9.0](https://github.com/doublewordai/control-layer/compare/v10.8.0...v10.9.0) (2026-08-07)
+
+
+### Features
+
+* **organizations:** let a user see their own pending join requests ([#1449](https://github.com/doublewordai/control-layer/issues/1449)) ([fda6491](https://github.com/doublewordai/control-layer/commit/fda64919e50e846cf4e291b44ae1bcbba9a573d6))
+* **organizations:** route onboarding on invitation, domain and auto-join ([#1455](https://github.com/doublewordai/control-layer/issues/1455)) ([d1db87a](https://github.com/doublewordai/control-layer/commit/d1db87a3b542a1d1a528a4b2bb3163dc6ab2088b))
+
+
+### Bug Fixes
+
+* **ci:** track the fusillade-arsenal 4.0.0 release baseline ([#1452](https://github.com/doublewordai/control-layer/issues/1452)) ([a090ad6](https://github.com/doublewordai/control-layer/commit/a090ad68ea86ab693a0c8486b5eb8fba69f557ee))
+
+## [10.8.0](https://github.com/doublewordai/control-layer/compare/v10.7.2...v10.8.0) (2026-08-06)
+
+
+### Features
+
+* cache template render counting ([#1441](https://github.com/doublewordai/control-layer/issues/1441)) ([61adf92](https://github.com/doublewordai/control-layer/commit/61adf92618efd8c24e432e375bfde58f9dc7fb07))
+
+## [10.7.2](https://github.com/doublewordai/control-layer/compare/v10.7.1...v10.7.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* hover tooltips on API key action buttons ([#1443](https://github.com/doublewordai/control-layer/issues/1443)) ([a8ecab1](https://github.com/doublewordai/control-layer/commit/a8ecab1ccf914eba2769a001ba260770e0698bb0))
+
+## [10.7.1](https://github.com/doublewordai/control-layer/compare/v10.7.0...v10.7.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* filtered-empty key list keeps scoping controls and correct empty… ([#1440](https://github.com/doublewordai/control-layer/issues/1440)) ([5b29ab9](https://github.com/doublewordai/control-layer/commit/5b29ab969063687b22f856167e6b0ae28c3ca0e8))
+
+## [10.7.0](https://github.com/doublewordai/control-layer/compare/v10.6.0...v10.7.0) (2026-08-05)
+
+
+### Features
+
+* org key filter and reveal ([#1436](https://github.com/doublewordai/control-layer/issues/1436)) ([78a7e37](https://github.com/doublewordai/control-layer/commit/78a7e373de56f389250932bd3f83abc838c3d7ca))
+
+## [10.6.0](https://github.com/doublewordai/control-layer/compare/v10.5.0...v10.6.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** claim the owner's domain, several workspaces allowed ([#1435](https://github.com/doublewordai/control-layer/issues/1435)) ([3d75ff0](https://github.com/doublewordai/control-layer/commit/3d75ff051ce137be93944bdfa20d15b632e2892e))
+
+
+### Bug Fixes
+
+* **ci:** track the fusillade-core 5.0.0 release baseline ([#1437](https://github.com/doublewordai/control-layer/issues/1437)) ([5a8cf30](https://github.com/doublewordai/control-layer/commit/5a8cf30658e3fdfb406147ba7f4d7c56504e854a))
+
+## [10.5.0](https://github.com/doublewordai/control-layer/compare/v10.4.0...v10.5.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** expose the verified flag on org membership summaries ([#1433](https://github.com/doublewordai/control-layer/issues/1433)) ([2deda3b](https://github.com/doublewordai/control-layer/commit/2deda3beb572559a298e50b6181e1b05bcc1dd29))
+
+## [10.4.0](https://github.com/doublewordai/control-layer/compare/v10.3.1...v10.4.0) (2026-08-04)
+
+
+### Features
+
+* **organizations:** replace silent domain auto-join with join requests ([#1431](https://github.com/doublewordai/control-layer/issues/1431)) ([c64b8da](https://github.com/doublewordai/control-layer/commit/c64b8da0de4f75df8f26c6b572540c19b979a801))
+
+## [10.3.1](https://github.com/doublewordai/control-layer/compare/v10.3.0...v10.3.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* missed a comp ([#1427](https://github.com/doublewordai/control-layer/issues/1427)) ([84b0be7](https://github.com/doublewordai/control-layer/commit/84b0be7c3c6a24c988c897520feb7d7d78ea5380))
+* pin Scalar docs renderer to a versioned, integrity-checked URL ([#1426](https://github.com/doublewordai/control-layer/issues/1426)) ([bbf3c24](https://github.com/doublewordai/control-layer/commit/bbf3c24323da982b2a9830090efb0619097f3a46))
+
+## [10.3.0](https://github.com/doublewordai/control-layer/compare/v10.2.1...v10.3.0) (2026-08-04)
+
+
+### Features
+
+* **payments:** add setup-mode checkout for onboarding card verification ([#1421](https://github.com/doublewordai/control-layer/issues/1421)) ([aa18ac7](https://github.com/doublewordai/control-layer/commit/aa18ac72276edebe22f4da332bfb5ea7abc22107))
+* **users:** expose the verified flag on the user API ([#1423](https://github.com/doublewordai/control-layer/issues/1423)) ([15bcee2](https://github.com/doublewordai/control-layer/commit/15bcee2f30fa486bb2791096b758da9156822c8d))
+
+
+### Bug Fixes
+
+* **keystore:** enable TLS for Redis connections ([#1425](https://github.com/doublewordai/control-layer/issues/1425)) ([2d54147](https://github.com/doublewordai/control-layer/commit/2d54147ee2aedae80cf92a98c566014377e2b389))
+
+## [10.2.1](https://github.com/doublewordai/control-layer/compare/v10.2.0...v10.2.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* PM org key view controls and batches error state ([#1419](https://github.com/doublewordai/control-layer/issues/1419)) ([744e035](https://github.com/doublewordai/control-layer/commit/744e035229546dbd86fdb66cd4487b2859c1ef0a))
+
+## [10.2.0](https://github.com/doublewordai/control-layer/compare/v10.1.0...v10.2.0) (2026-08-03)
+
+
+### Features
+
+* org key management (preview) ([#1381](https://github.com/doublewordai/control-layer/issues/1381)) ([124ad97](https://github.com/doublewordai/control-layer/commit/124ad97ce9e741a0afa0ce6819d8f237861296e4))
+
+
+### Bug Fixes
+
+* **fusillade:** add populate-duration histogram and unfrozen-termina… ([#1413](https://github.com/doublewordai/control-layer/issues/1413)) ([081f4d5](https://github.com/doublewordai/control-layer/commit/081f4d52644c8d2ad0c53b78b2e21927db306456))
+* scrub provider-written cache fields from inactive cache-layer re… ([#1411](https://github.com/doublewordai/control-layer/issues/1411)) ([85e5976](https://github.com/doublewordai/control-layer/commit/85e5976f81b71b702f189ae3c6b3040db6f7aa5e))
+
+## [10.1.0](https://github.com/doublewordai/control-layer/compare/v10.0.0...v10.1.0) (2026-07-31)
+
+
+### Features
+
+* attribute batch traffic to the client that submitted it ([#1410](https://github.com/doublewordai/control-layer/issues/1410)) ([2dde662](https://github.com/doublewordai/control-layer/commit/2dde6620ced2d283d1efffa376aa3a86dc7b66c0))
+* back off auto top-up card declines ([#1358](https://github.com/doublewordai/control-layer/issues/1358)) ([c1b26df](https://github.com/doublewordai/control-layer/commit/c1b26dfe1c3840e1f633709b195c673d5d2de335))
+
+## [10.0.0](https://github.com/doublewordai/control-layer/compare/v9.3.0...v10.0.0) (2026-07-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408))
+
+### Features
+
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408)) ([52fa075](https://github.com/doublewordai/control-layer/commit/52fa075cf7e0faa502e8b72af3a5cae73034c771))
+
+## [9.3.0](https://github.com/doublewordai/control-layer/compare/v9.2.1...v9.3.0) (2026-07-30)
+
+
+### Features
+
+* expose cache pricing in admin model responses ([#1405](https://github.com/doublewordai/control-layer/issues/1405)) ([9032b84](https://github.com/doublewordai/control-layer/commit/9032b842af1c269db664dcf2d910833e69361c40))
+
+## [9.2.1](https://github.com/doublewordai/control-layer/compare/v9.2.0...v9.2.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* bind trailing demand window bounds as scalar timestamps ([#1403](https://github.com/doublewordai/control-layer/issues/1403)) ([ff156a6](https://github.com/doublewordai/control-layer/commit/ff156a6a01d3398c55e8d0b932303d3f292c0b85))
+
+## [9.2.0](https://github.com/doublewordai/control-layer/compare/v9.1.0...v9.2.0) (2026-07-30)
+
+
+### Features
+
+* signed demand windows with trailing outcome counts on /monitoring/demand ([#1399](https://github.com/doublewordai/control-layer/issues/1399)) ([24105ac](https://github.com/doublewordai/control-layer/commit/24105ac236c855dd9e4d928ad703a6a7868abf43))
+
+## [9.1.0](https://github.com/doublewordai/control-layer/compare/v9.0.0...v9.1.0) (2026-07-30)
+
+
+### Features
+
+* capture finish_reason and user_agent on http_analytics ([#1389](https://github.com/doublewordai/control-layer/issues/1389)) ([baec631](https://github.com/doublewordai/control-layer/commit/baec6318dc49788ee4b4fe77f950610a93558dc6))
+
+
+### Bug Fixes
+
+* raise test postgres max_connections to 400 ([#1397](https://github.com/doublewordai/control-layer/issues/1397)) ([5196f47](https://github.com/doublewordai/control-layer/commit/5196f47c2584442da0aa5c4f53e26d4f3fbb05c4))
+
+## [9.0.0](https://github.com/doublewordai/control-layer/compare/v8.105.0...v9.0.0) (2026-07-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395))
+
+### Features
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395)) ([ec0d108](https://github.com/doublewordai/control-layer/commit/ec0d108e129f4d5e4c1da41b74dafb6460dfdfdd))
+
+## [8.105.0](https://github.com/doublewordai/control-layer/compare/v8.104.0...v8.105.0) (2026-07-30)
+
+
+### Features
+
+* monitoring demand endpoint decoupled from completion windows ([#987](https://github.com/doublewordai/control-layer/issues/987)) ([1b9fcd0](https://github.com/doublewordai/control-layer/commit/1b9fcd0712b09013fac6192488a5941fadb31d10))
+
+
+### Bug Fixes
+
+* cap the customer-visible cache split to prompt_tokens ([#1390](https://github.com/doublewordai/control-layer/issues/1390)) ([e8cb8c9](https://github.com/doublewordai/control-layer/commit/e8cb8c977c201e48108fefec8b4327c2c76f5f16))
+* stop auto top-up charging from non-leader replicas ([#1371](https://github.com/doublewordai/control-layer/issues/1371)) ([3459363](https://github.com/doublewordai/control-layer/commit/3459363d3918a7cd304ccfceb67d4e6371cf4505))
+
+## [8.104.0](https://github.com/doublewordai/control-layer/compare/v8.103.4...v8.104.0) (2026-07-29)
+
+
+### Features
+
+* restore fusillade storage crate releases ([#1375](https://github.com/doublewordai/control-layer/issues/1375)) ([dce6c1f](https://github.com/doublewordai/control-layer/commit/dce6c1f54f5e9e52984a46d79bee98b44d2d8789))
+
+
+### Bug Fixes
+
+* cap drifted cache splits to prompt_tokens instead of discarding … ([#1386](https://github.com/doublewordai/control-layer/issues/1386)) ([f324633](https://github.com/doublewordai/control-layer/commit/f32463385170193fcd217409b3c0fbc29f9d0c5d))
+* emit required checks for release-only changes ([#1384](https://github.com/doublewordai/control-layer/issues/1384)) ([56a144f](https://github.com/doublewordai/control-layer/commit/56a144f40a51d424b1222807ff035f1729e6ebb8))
+* gracefully handle provider icon fetch failures ([#1378](https://github.com/doublewordai/control-layer/issues/1378)) ([0cd52a2](https://github.com/doublewordai/control-layer/commit/0cd52a2ea0029cd0ba59e0fa004f8059360401b3))
+* publish onwards without fusillade ([#1385](https://github.com/doublewordai/control-layer/issues/1385)) ([97472b7](https://github.com/doublewordai/control-layer/commit/97472b79a4fa34023e3222936f75bb4acc5116d3))
+
+## [8.103.4](https://github.com/doublewordai/control-layer/compare/v8.103.3...v8.103.4) (2026-07-29)
+
+
+### Bug Fixes
+
+* show background batches in filtered lists ([#1376](https://github.com/doublewordai/control-layer/issues/1376)) ([18f1bf9](https://github.com/doublewordai/control-layer/commit/18f1bf96573e5da31f0e78f9b1b835db8440f228))
+
+## [8.103.3](https://github.com/doublewordai/control-layer/compare/v8.103.2...v8.103.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* show all pending background work ([#1373](https://github.com/doublewordai/control-layer/issues/1373)) ([81a8c3c](https://github.com/doublewordai/control-layer/commit/81a8c3c9f5a4a161bfbbe047103b78b401b3ec88))
+
+## [8.103.2](https://github.com/doublewordai/control-layer/compare/v8.103.1...v8.103.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **onwards:** canonicalise reasoning field on strict chat completions ([#1368](https://github.com/doublewordai/control-layer/issues/1368)) ([9a8cd1e](https://github.com/doublewordai/control-layer/commit/9a8cd1e27f0808906394944630d24e7c08ceaa04))
+* show background work throughout dashboard ([#1372](https://github.com/doublewordai/control-layer/issues/1372)) ([c37434a](https://github.com/doublewordai/control-layer/commit/c37434a3d677407518a30faff1ee16ab37e62758))
+
+## [8.103.1](https://github.com/doublewordai/control-layer/compare/v8.103.0...v8.103.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* allow background indexes to be prebuilt ([#1365](https://github.com/doublewordai/control-layer/issues/1365)) ([5da8b9e](https://github.com/doublewordai/control-layer/commit/5da8b9e8d142c7d7f235920028a5563055ff85ec))
+
+## [8.103.0](https://github.com/doublewordai/control-layer/compare/v8.102.0...v8.103.0) (2026-07-28)
+
+
+### Features
+
+* add spare-capacity background workload processing ([#1337](https://github.com/doublewordai/control-layer/issues/1337)) ([5fc036d](https://github.com/doublewordai/control-layer/commit/5fc036dbf531e5adf754a13d94af6dfdffa12f11))
+
+
+### Bug Fixes
+
+* test race condition guard ([#1361](https://github.com/doublewordai/control-layer/issues/1361)) ([6966dd1](https://github.com/doublewordai/control-layer/commit/6966dd1eb92baf053657d32d615e9f0020b7d849))
+
+## [8.102.0](https://github.com/doublewordai/control-layer/compare/v8.101.0...v8.102.0) (2026-07-23)
+
+
+### Features
+
+* UI for capped api keys ([#1355](https://github.com/doublewordai/control-layer/issues/1355)) ([56ac94e](https://github.com/doublewordai/control-layer/commit/56ac94e5de9351da4ced7d23f811dbf27f057de3))
+
+
+### Bug Fixes
+
+* simplify preview dispatch credentials ([#1342](https://github.com/doublewordai/control-layer/issues/1342)) ([d2b1929](https://github.com/doublewordai/control-layer/commit/d2b19293a2ea224af9ae1ecf7fa61f7d08e18126))
+
+## [8.101.0](https://github.com/doublewordai/control-layer/compare/v8.100.0...v8.101.0) (2026-07-23)
+
+
+### Features
+
+* capped api keys, api surface ([#1351](https://github.com/doublewordai/control-layer/issues/1351)) ([8129e1e](https://github.com/doublewordai/control-layer/commit/8129e1ed1a252d5aeee354ce1ac81a634d46690e))
+
+## [8.100.0](https://github.com/doublewordai/control-layer/compare/v8.99.0...v8.100.0) (2026-07-23)
+
+
+### Features
+
+* capped keys part 2 - enforcement and yanking ([#1346](https://github.com/doublewordai/control-layer/issues/1346)) ([c5d8670](https://github.com/doublewordai/control-layer/commit/c5d8670d899e51a38a52256b35229414879e5e0d))
+
+## [8.99.0](https://github.com/doublewordai/control-layer/compare/v8.98.0...v8.99.0) (2026-07-23)
+
+
+### Features
+
+* fusillade submission-epoch latency metrics and per-window completion labels ([#1347](https://github.com/doublewordai/control-layer/issues/1347)) ([9ce69d6](https://github.com/doublewordai/control-layer/commit/9ce69d6145d86819a90e34fe848d78cd1f612bda))
+
+## [8.98.0](https://github.com/doublewordai/control-layer/compare/v8.97.1...v8.98.0) (2026-07-22)
+
+
+### Features
+
+* api-key spend caps schema, cap-scope child keys, and execution-… ([#1344](https://github.com/doublewordai/control-layer/issues/1344)) ([c44557f](https://github.com/doublewordai/control-layer/commit/c44557f9ce9aa8c979bb0f471ca011f28d70972a))
+
+## [8.97.1](https://github.com/doublewordai/control-layer/compare/v8.97.0...v8.97.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* retry cache-index ops once on connection errors (batch-pod burst… ([#1341](https://github.com/doublewordai/control-layer/issues/1341)) ([8d36a94](https://github.com/doublewordai/control-layer/commit/8d36a9412db193026a11ad6ef7920868f85d9a6b))
+
+## [8.97.0](https://github.com/doublewordai/control-layer/compare/v8.96.0...v8.97.0) (2026-07-22)
+
+
+### Features
+
+* add service_tier label to gen_ai metrics and extend TTFT/TPOT buckets ([#1332](https://github.com/doublewordai/control-layer/issues/1332)) ([6c6d459](https://github.com/doublewordai/control-layer/commit/6c6d4598eac3dd89071646ce579b46d2e43376d3))
+* **docs:** link Onwards from mdBook sidebar ([#1340](https://github.com/doublewordai/control-layer/issues/1340)) ([8628fdd](https://github.com/doublewordai/control-layer/commit/8628fddb70f5db2027ef217bbd61daa323e1e544))
+
+
+### Bug Fixes
+
+* **ci:** parallelize dwctl tests ([#1323](https://github.com/doublewordai/control-layer/issues/1323)) ([5191586](https://github.com/doublewordai/control-layer/commit/5191586c16cc54fb8142239618dc927989fbd387))
+
+## [8.96.0](https://github.com/doublewordai/control-layer/compare/v8.95.1...v8.96.0) (2026-07-22)
+
+
+### Features
+
+* publish immutable preview artifacts ([#1324](https://github.com/doublewordai/control-layer/issues/1324)) ([f231ffb](https://github.com/doublewordai/control-layer/commit/f231ffbf5c1892333b4a3a37a2e3cd6137b28417))
+
+
+### Bug Fixes
+
+* combined batch results stream (inout and output) was missing the… ([#1335](https://github.com/doublewordai/control-layer/issues/1335)) ([52fd53b](https://github.com/doublewordai/control-layer/commit/52fd53b965c8fc02abf6a58bceb4c0177f9ba6fb))
+* preserve release component identity ([#1333](https://github.com/doublewordai/control-layer/issues/1333)) ([ef5583d](https://github.com/doublewordai/control-layer/commit/ef5583da1afc73455141438d64dbb1e3da7c706f))
+
+## [8.95.1](https://github.com/doublewordai/control-layer/compare/v8.95.0...v8.95.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* batch analytics endpoints must return the billed (discounted) c… ([#1329](https://github.com/doublewordai/control-layer/issues/1329)) ([435d945](https://github.com/doublewordai/control-layer/commit/435d945519e9b6449d8eb25fd3d34a3eadf4ae18))
+
+## [8.95.0](https://github.com/doublewordai/control-layer/compare/v8.94.2...v8.95.0) (2026-07-22)
+
+
+### Features
+
+* integrate Fusillade and Onwards into the Rust workspace ([#1325](https://github.com/doublewordai/control-layer/issues/1325)) ([6f712ba](https://github.com/doublewordai/control-layer/commit/6f712ba299eb1144d20e294b11ced08d3ef4224e))
+
+## [8.94.2](https://github.com/doublewordai/control-layer/compare/v8.94.1...v8.94.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* fusillade 24.1.0 ([#1327](https://github.com/doublewordai/control-layer/issues/1327)) ([624b2a9](https://github.com/doublewordai/control-layer/commit/624b2a9495f5d05d27224a1d7dfdd61d64509e11))
+
+## [8.94.1](https://github.com/doublewordai/control-layer/compare/v8.94.0...v8.94.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* bump fusillade 24.0.0 ([#1326](https://github.com/doublewordai/control-layer/issues/1326)) ([cd2b5a0](https://github.com/doublewordai/control-layer/commit/cd2b5a038226265986426bed0c24090074da8ae9))
+* reject zero upload watchdog settings ([#1320](https://github.com/doublewordai/control-layer/issues/1320)) ([ea03e16](https://github.com/doublewordai/control-layer/commit/ea03e16b2f259768de1cf86e7580c2839d55b212))
+
+## [8.94.0](https://github.com/doublewordai/control-layer/compare/v8.93.1...v8.94.0) (2026-07-20)
+
+
+### Features
+
+* expose upload watchdog configuration ([#1318](https://github.com/doublewordai/control-layer/issues/1318)) ([d797258](https://github.com/doublewordai/control-layer/commit/d797258c0759e3a54bf63d4c8aa3e57c7f0ce489))
+
+## [8.93.1](https://github.com/doublewordai/control-layer/compare/v8.93.0...v8.93.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* bump fusillade to 22.1.2 (archive migration checksum restore) ([#1315](https://github.com/doublewordai/control-layer/issues/1315)) ([3aa7d7e](https://github.com/doublewordai/control-layer/commit/3aa7d7ec88acc68006f2d99b8c997cf62ddcbdf4))
+
+## [8.93.0](https://github.com/doublewordai/control-layer/compare/v8.92.0...v8.93.0) (2026-07-20)
+
+
+### Features
+
+* fusillade archive knobs ([#1312](https://github.com/doublewordai/control-layer/issues/1312)) ([520a52f](https://github.com/doublewordai/control-layer/commit/520a52f58777733cb66002b17195e3fecdfe5f8f))
+
+## [8.92.0](https://github.com/doublewordai/control-layer/compare/v8.91.0...v8.92.0) (2026-07-17)
+
+
+### Features
+
+* let organization owners manage ZDR ([#1310](https://github.com/doublewordai/control-layer/issues/1310)) ([28bc540](https://github.com/doublewordai/control-layer/commit/28bc540ca68e57e3316f0d8eedaccb2a784f893b))
+
+## [8.91.0](https://github.com/doublewordai/control-layer/compare/v8.90.0...v8.91.0) (2026-07-17)
+
+
+### Features
+
+* export dwctl_model_tariff gauge from active tariff rows ([#1308](https://github.com/doublewordai/control-layer/issues/1308)) ([2c30f90](https://github.com/doublewordai/control-layer/commit/2c30f90f7efa91018b08b188362436026e8c271b))
+
+## [8.90.0](https://github.com/doublewordai/control-layer/compare/v8.89.0...v8.90.0) (2026-07-17)
+
+
+### Features
+
+* **usage-e:** repoint responses-view cost to credits ledger (contract, after backfill) ([#1278](https://github.com/doublewordai/control-layer/issues/1278)) ([7d0c2d3](https://github.com/doublewordai/control-layer/commit/7d0c2d3113f755f5664946df7144737cdeb188dd))
+
+
+### Bug Fixes
+
+* don't block flex requests with realtime deny rules ([#1303](https://github.com/doublewordai/control-layer/issues/1303)) ([efa2824](https://github.com/doublewordai/control-layer/commit/efa2824ab71041967344751e28a8940b2df3c20f))
+* record real realtime response duration instead of zero ([#1287](https://github.com/doublewordai/control-layer/issues/1287)) ([c4a8a80](https://github.com/doublewordai/control-layer/commit/c4a8a80b7933afa1458327c32fcd584d4f3fdf27))
+
+## [8.89.0](https://github.com/doublewordai/control-layer/compare/v8.88.0...v8.89.0) (2026-07-17)
+
+
+### Features
+
+* allow users to update their own ZDR setting ([#1296](https://github.com/doublewordai/control-layer/issues/1296)) ([34f0cea](https://github.com/doublewordai/control-layer/commit/34f0ceaf9bbea6ded67cdb23e592f4ee836f6753))
+
+
+### Bug Fixes
+
+* emit credits metric in nanocredits, not rounded cents ([#1304](https://github.com/doublewordai/control-layer/issues/1304)) ([e849359](https://github.com/doublewordai/control-layer/commit/e849359ec14e9c5e711e3db2ba79760b56416efb))
+
+## [8.88.0](https://github.com/doublewordai/control-layer/compare/v8.87.2...v8.88.0) (2026-07-17)
+
+
+### Features
+
+* attribute served upstream on analytics, token and credits metrics ([#1300](https://github.com/doublewordai/control-layer/issues/1300)) ([baa6931](https://github.com/doublewordai/control-layer/commit/baa693130d5534f560fe65f651707e8200136eaa))
+
+## [8.87.2](https://github.com/doublewordai/control-layer/compare/v8.87.1...v8.87.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* advertise reasoning capabilities for disabled virtual backends ([#1297](https://github.com/doublewordai/control-layer/issues/1297)) ([f98a576](https://github.com/doublewordai/control-layer/commit/f98a576f660d60ba37302b80e28b14707f2162fa))
+
+## [8.87.1](https://github.com/doublewordai/control-layer/compare/v8.87.0...v8.87.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.2.0 / fusillade-arsenal 1.2.0 ([#1295](https://github.com/doublewordai/control-layer/issues/1295)) ([0a539cd](https://github.com/doublewordai/control-layer/commit/0a539cdb07285c430fb74c43008e36ac9bb8175c))
+
+## [8.87.0](https://github.com/doublewordai/control-layer/compare/v8.86.1...v8.87.0) (2026-07-16)
+
+
+### Features
+
+* **usage-e:** denormalize fusillade_request_id onto credits + backfill (expand) ([#1275](https://github.com/doublewordai/control-layer/issues/1275)) ([f56984b](https://github.com/doublewordai/control-layer/commit/f56984beff6d49b72045cac2c6510588e39dbc5c))
+
+## [8.86.1](https://github.com/doublewordai/control-layer/compare/v8.86.0...v8.86.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.1.3 / fusillade-arsenal 1.1.1 ([#1292](https://github.com/doublewordai/control-layer/issues/1292)) ([a1077f8](https://github.com/doublewordai/control-layer/commit/a1077f8bbe59b03a5a554a71a178499287f1cbae))
+
+## [8.86.0](https://github.com/doublewordai/control-layer/compare/v8.85.0...v8.86.0) (2026-07-16)
+
+
+### Features
+
+* repoint batch analytics ([#1291](https://github.com/doublewordai/control-layer/issues/1291)) ([e8ae677](https://github.com/doublewordai/control-layer/commit/e8ae67790bbaa06427f76f66addce02b10152da7))
+* serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract) ([#1263](https://github.com/doublewordai/control-layer/issues/1263)) ([83968fa](https://github.com/doublewordai/control-layer/commit/83968fa1ca1caa286419fd7f6a999b73f0bfb710))
+
+
+### Bug Fixes
+
+* enable HTTP 499 retries and virtual model failover ([#1283](https://github.com/doublewordai/control-layer/issues/1283)) ([2c4757c](https://github.com/doublewordai/control-layer/commit/2c4757ccd49732ad7ab9c9ddfeab607a1c041f57))
+* **revert:** "serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract)" ([#1290](https://github.com/doublewordai/control-layer/issues/1290)) ([a1e266b](https://github.com/doublewordai/control-layer/commit/a1e266be07b3907dc16cdde037fe5b2c33550547))
+
+## [8.85.0](https://github.com/doublewordai/control-layer/compare/v8.84.0...v8.85.0) (2026-07-15)
+
+
+### Features
+
+* expose reasoning capabilities on admin models ([#1286](https://github.com/doublewordai/control-layer/issues/1286)) ([d239fe9](https://github.com/doublewordai/control-layer/commit/d239fe926f1d74a54c6ada5581dbaecabca2a831))
+
+
+### Reverts
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([#1284](https://github.com/doublewordai/control-layer/issues/1284)) ([d9218a1](https://github.com/doublewordai/control-layer/commit/d9218a182b36b9e747b4cce5c6c36952fe90d09e))
+
+## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
+
+
+### Features
+
+* expose and validate reasoning capabilities ([#1279](https://github.com/doublewordai/control-layer/issues/1279)) ([40a3452](https://github.com/doublewordai/control-layer/commit/40a3452ade751cf198deea072b0bd8e6fdb08485))
+
+## [8.83.0](https://github.com/doublewordai/control-layer/compare/v8.82.1...v8.83.0) (2026-07-14)
+
+
+### Features
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([9d20aa1](https://github.com/doublewordai/control-layer/commit/9d20aa1fd7d99d20798769525d7af4742e4de69e))
+
+## [8.82.1](https://github.com/doublewordai/control-layer/compare/v8.82.0...v8.82.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* add some extra model labels for metrics to tokenizer svc ([#1276](https://github.com/doublewordai/control-layer/issues/1276)) ([3bd3496](https://github.com/doublewordai/control-layer/commit/3bd3496021a6886b019b616279d79a1dd2a76a28))
+
+## [8.82.0](https://github.com/doublewordai/control-layer/compare/v8.81.2...v8.82.0) (2026-07-14)
+
+
+### Features
+
+* configure provider reasoning translation ([#1267](https://github.com/doublewordai/control-layer/issues/1267)) ([61de3ab](https://github.com/doublewordai/control-layer/commit/61de3ab91ba20fc3278eb546d20a5ed25ca3bce4))
+
+## [8.81.2](https://github.com/doublewordai/control-layer/compare/v8.81.1...v8.81.2) (2026-07-14)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.1.0 / fusillade-arsenal 1.1.0 ([#1269](https://github.com/doublewordai/control-layer/issues/1269)) ([7f32926](https://github.com/doublewordai/control-layer/commit/7f329260c02618806bbffe4f492aba06cf8a43f4))
+
+## [8.81.1](https://github.com/doublewordai/control-layer/compare/v8.81.0...v8.81.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* tool use needs to be cacheable ([#1266](https://github.com/doublewordai/control-layer/issues/1266)) ([e6d3c4a](https://github.com/doublewordai/control-layer/commit/e6d3c4ab70b9a08f9327ff7d83bd9f1e643538e7))
+
+## [8.81.0](https://github.com/doublewordai/control-layer/compare/v8.80.0...v8.81.0) (2026-07-14)
+
+
+### Features
+
+* denormalize per-batch analytics onto batch_aggregates (COR-524 expand) ([#1262](https://github.com/doublewordai/control-layer/issues/1262)) ([861f5d9](https://github.com/doublewordai/control-layer/commit/861f5d9e3f094ec0ff9614384a43feee70e3a529))
+* read billing fields off denormalized columns + drop 23 GB usage index (COR-514/516) ([#1256](https://github.com/doublewordai/control-layer/issues/1256)) ([887b1cc](https://github.com/doublewordai/control-layer/commit/887b1cc119dcdbc14a10bb9db7495832731a834e))
+
+## [8.80.0](https://github.com/doublewordai/control-layer/compare/v8.79.1...v8.80.0) (2026-07-13)
+
+
+### Features
+
+* filter model discovery by group and realtime availability ([#1264](https://github.com/doublewordai/control-layer/issues/1264)) ([49ccb54](https://github.com/doublewordai/control-layer/commit/49ccb54405490b22fca85f950b01294c5e1c64d6))
+
+## [8.79.1](https://github.com/doublewordai/control-layer/compare/v8.79.0...v8.79.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* index seq before credits backfill sweep + day-level model-usage ranges ([#1259](https://github.com/doublewordai/control-layer/issues/1259)) ([b7fc059](https://github.com/doublewordai/control-layer/commit/b7fc059fd4f81b4d5b429e1003ca7699c6135f31))
+
+## [8.79.0](https://github.com/doublewordai/control-layer/compare/v8.78.0...v8.79.0) (2026-07-10)
+
+
+### Features
+
+* denormalize billing cols onto credits_transactions + drop legacy usage tables ([#1254](https://github.com/doublewordai/control-layer/issues/1254)) ([0d38ef4](https://github.com/doublewordai/control-layer/commit/0d38ef422e8a1a425c2d6cff00cea34f78559745))
+
+## [8.78.0](https://github.com/doublewordai/control-layer/compare/v8.77.0...v8.78.0) (2026-07-10)
+
+
+### Features
+
+* upgrade fusillade split daemon runtime ([#1252](https://github.com/doublewordai/control-layer/issues/1252)) ([6c0607c](https://github.com/doublewordai/control-layer/commit/6c0607cdac1d7b0daafe65d209fbd6587405e6a6))
+
+## [8.77.0](https://github.com/doublewordai/control-layer/compare/v8.76.0...v8.77.0) (2026-07-10)
+
+
+### Features
+
+* serve /usage from user_model_usage_daily rollup (COR-506 cutover) ([#1248](https://github.com/doublewordai/control-layer/issues/1248)) ([48187a0](https://github.com/doublewordai/control-layer/commit/48187a054ce67db01ff8512590d53bc7df649df1))
+
+## [8.76.0](https://github.com/doublewordai/control-layer/compare/v8.75.1...v8.76.0) (2026-07-09)
+
+
+### Features
+
+* make user balances a synchronously-maintained read model ([#1238](https://github.com/doublewordai/control-layer/issues/1238)) ([64483c0](https://github.com/doublewordai/control-layer/commit/64483c01b998cdbdd20abdab4ae37a2eba8f327a))
+
+## [8.75.1](https://github.com/doublewordai/control-layer/compare/v8.75.0...v8.75.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* dont flatten asst and tool result blocks in anthropic adapter ([#1247](https://github.com/doublewordai/control-layer/issues/1247)) ([9ec3d15](https://github.com/doublewordai/control-layer/commit/9ec3d1503c0f1489b2d6b236e74db562f2d2a92d))
+
+## [8.75.0](https://github.com/doublewordai/control-layer/compare/v8.74.1...v8.75.0) (2026-07-09)
+
+
+### Features
+
+* cap unverified users' upload volume instead of throttling throughput ([#1204](https://github.com/doublewordai/control-layer/issues/1204)) ([eaa7170](https://github.com/doublewordai/control-layer/commit/eaa717035dfecddd282b51ec8faaab7eeafa9875))
+
+## [8.74.1](https://github.com/doublewordai/control-layer/compare/v8.74.0...v8.74.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* fusillade 20.0.2 ([#1241](https://github.com/doublewordai/control-layer/issues/1241)) ([d585d09](https://github.com/doublewordai/control-layer/commit/d585d09996d86101ec29ec0baf5d57180afa4190))
+
+## [8.74.0](https://github.com/doublewordai/control-layer/compare/v8.73.0...v8.74.0) (2026-07-08)
+
+
+### Features
+
+* default pending request counts to batch tier ([#1242](https://github.com/doublewordai/control-layer/issues/1242)) ([cdc6aae](https://github.com/doublewordai/control-layer/commit/cdc6aaee4e6d50bc62268bf50e3efdaca7c1aad8))
+
+## [8.73.0](https://github.com/doublewordai/control-layer/compare/v8.72.1...v8.73.0) (2026-07-08)
+
+
+### Features
+
+* analytics batcher notification for daily usage aggregations ([#1234](https://github.com/doublewordai/control-layer/issues/1234)) ([5eb8918](https://github.com/doublewordai/control-layer/commit/5eb891889198eb629c58d1dfe1a75341337aca37))
+* enable automatic prefix caching with top level cache control ma… ([#1239](https://github.com/doublewordai/control-layer/issues/1239)) ([7610bec](https://github.com/doublewordai/control-layer/commit/7610bec3d80f7de8f4cc4da8d5a93c62b6068a51))
+
+## [8.72.1](https://github.com/doublewordai/control-layer/compare/v8.72.0...v8.72.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* bump onwards to 0.34.5 ([#1236](https://github.com/doublewordai/control-layer/issues/1236)) ([a7e11d4](https://github.com/doublewordai/control-layer/commit/a7e11d47e70472b0b208152f41eb7b1cf4129c81))
+* classify unsupported response payloads as non-retryable ([#1233](https://github.com/doublewordai/control-layer/issues/1233)) ([b454389](https://github.com/doublewordai/control-layer/commit/b454389ca6de0648a2273d386acdc92c2639eb40))
+* list accessible models without credit filtering ([#1237](https://github.com/doublewordai/control-layer/issues/1237)) ([0ea2834](https://github.com/doublewordai/control-layer/commit/0ea28343c5a1de840fcfd69e6b773975f7ad16e0))
+
+## [8.72.0](https://github.com/doublewordai/control-layer/compare/v8.71.0...v8.72.0) (2026-07-07)
+
+
+### Features
+
+* fusillade 20.0.0 ([#1231](https://github.com/doublewordai/control-layer/issues/1231)) ([1cac7ce](https://github.com/doublewordai/control-layer/commit/1cac7ce2c365d0d6e721d484914adba067f64fe0))
+
+## [8.71.0](https://github.com/doublewordai/control-layer/compare/v8.70.3...v8.71.0) (2026-07-06)
+
+
+### Features
+
+* zero-data-retention for flex (encryption) and realtime (non-persistence) ([#1218](https://github.com/doublewordai/control-layer/issues/1218)) ([7248f88](https://github.com/doublewordai/control-layer/commit/7248f880ab02228fef2ef58e17e89b294d873e11))
+
+## [8.70.3](https://github.com/doublewordai/control-layer/compare/v8.70.2...v8.70.3) (2026-07-06)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.34.3 ([#1227](https://github.com/doublewordai/control-layer/issues/1227)) ([1c93378](https://github.com/doublewordai/control-layer/commit/1c93378fde99a139db62a1b2fa37523eab2119a3))
+
+## [8.70.2](https://github.com/doublewordai/control-layer/compare/v8.70.1...v8.70.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* some sdks inject extra blocks that invalidate cache, remove em ([#1224](https://github.com/doublewordai/control-layer/issues/1224)) ([064dbf7](https://github.com/doublewordai/control-layer/commit/064dbf70c5876e968310bead4c792f63518beafd))
+
+## [8.70.1](https://github.com/doublewordai/control-layer/compare/v8.70.0...v8.70.1) (2026-07-03)
+
+
+### Bug Fixes
+
+* disable batch capacity pending counts by default ([#1222](https://github.com/doublewordai/control-layer/issues/1222)) ([051c737](https://github.com/doublewordai/control-layer/commit/051c73777bca6c47d9abfca2c2cef2be09b37c63))
+
+## [8.70.0](https://github.com/doublewordai/control-layer/compare/v8.69.0...v8.70.0) (2026-07-02)
+
+
+### Features
+
+* surface zero data retention to org members (summary + org/profile pages) ([#1217](https://github.com/doublewordai/control-layer/issues/1217)) ([db5f1e9](https://github.com/doublewordai/control-layer/commit/db5f1e92325c23d3da272d73e89c91436d7cafe7))
+* tool definitions included in inour caching ([#1220](https://github.com/doublewordai/control-layer/issues/1220)) ([c82fb39](https://github.com/doublewordai/control-layer/commit/c82fb39dba91709ff0b43aab10473167514bb5b6))
+
+## [8.69.0](https://github.com/doublewordai/control-layer/compare/v8.68.3...v8.69.0) (2026-07-02)
+
+
+### Features
+
+* account-wide zero data retention toggle for users and orgs ([#1214](https://github.com/doublewordai/control-layer/issues/1214)) ([67e9612](https://github.com/doublewordai/control-layer/commit/67e961224b3f36e8ada222e1c1450b834eadbeac))
+
+
+### Bug Fixes
+
+* route flex requests through hidden batch keys ([#1215](https://github.com/doublewordai/control-layer/issues/1215)) ([58580e1](https://github.com/doublewordai/control-layer/commit/58580e1b4e3ab97b180de7a950ffe4720c92c381))
+
+## [8.68.3](https://github.com/doublewordai/control-layer/compare/v8.68.2...v8.68.3) (2026-07-01)
+
+
+### Bug Fixes
+
+* **db:** bound credits_transactions autovacuum + raise user_id stats target ([#1212](https://github.com/doublewordai/control-layer/issues/1212)) ([5cb550b](https://github.com/doublewordai/control-layer/commit/5cb550b1132764b08cf4cedd829163f1127d9ae2))
+
+## [8.68.2](https://github.com/doublewordai/control-layer/compare/v8.68.1...v8.68.2) (2026-07-01)
+
+
+### Bug Fixes
+
+* optimize onwards config balance queries ([#1210](https://github.com/doublewordai/control-layer/issues/1210)) ([0ad44f2](https://github.com/doublewordai/control-layer/commit/0ad44f2b4f1740d70ef36c827fac150efbcc3aff))
+* **perf:** defer cache classify-await into the SSE stream so it never holds the first token ([#1208](https://github.com/doublewordai/control-layer/issues/1208)) ([7316834](https://github.com/doublewordai/control-layer/commit/73168347509e293de018da0efe0bd37b1279a1b1))
+
+## [8.68.1](https://github.com/doublewordai/control-layer/compare/v8.68.0...v8.68.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* stop logging tool response bodies and serde body fragments ([#1202](https://github.com/doublewordai/control-layer/issues/1202)) ([f21c29b](https://github.com/doublewordai/control-layer/commit/f21c29b82b232855365b9c8f12507b5c1895da50))
+
+## [8.68.0](https://github.com/doublewordai/control-layer/compare/v8.67.1...v8.68.0) (2026-06-30)
+
+
+### Features
+
+* global config for activated cache ttl's, and param errors surfacing t… ([#1206](https://github.com/doublewordai/control-layer/issues/1206)) ([1712a07](https://github.com/doublewordai/control-layer/commit/1712a077d4f53e940a9a7aca0069cb30725c4298))
+
+## [8.67.1](https://github.com/doublewordai/control-layer/compare/v8.67.0...v8.67.1) (2026-06-30)
+
+
+### Bug Fixes
+
+* extra prometheus markers for dashboard ([#1201](https://github.com/doublewordai/control-layer/issues/1201)) ([85c2a34](https://github.com/doublewordai/control-layer/commit/85c2a347a669d8cab0fb912c8b5a688a5a0ec79a))
+
+## [8.67.0](https://github.com/doublewordai/control-layer/compare/v8.66.0...v8.67.0) (2026-06-30)
+
+
+### Features
+
+* api wiring for adding/editing/deleting input cache pricing tariffs ([#1198](https://github.com/doublewordai/control-layer/issues/1198)) ([6608b0c](https://github.com/doublewordai/control-layer/commit/6608b0ca297c7967c215b39201c62408b4f23823))
+
+## [8.66.0](https://github.com/doublewordai/control-layer/compare/v8.65.1...v8.66.0) (2026-06-29)
+
+
+### Features
+
+* /v1/messages parity - batch endpoint and flex tier ([#1191](https://github.com/doublewordai/control-layer/issues/1191)) ([519afa6](https://github.com/doublewordai/control-layer/commit/519afa612f468b4347eb44863c10265940462fc1))
+* **prompt-cache:** Prometheus instrumentation for cached-input pricing ([#1196](https://github.com/doublewordai/control-layer/issues/1196)) ([7bb9112](https://github.com/doublewordai/control-layer/commit/7bb9112c386d899fdb648accefe03fda9f24eea1))
+
+## [8.65.1](https://github.com/doublewordai/control-layer/compare/v8.65.0...v8.65.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* enforce unique priority order for composite model components ([#1189](https://github.com/doublewordai/control-layer/issues/1189)) ([6ac734c](https://github.com/doublewordai/control-layer/commit/6ac734c4204c143ca409b3dcde4abdc254032bac))
+
+## [8.65.0](https://github.com/doublewordai/control-layer/compare/v8.64.0...v8.65.0) (2026-06-26)
+
+
+### Features
+
+* serve GET /v1/models in Anthropic format ([#1181](https://github.com/doublewordai/control-layer/issues/1181)) ([7ee3ac6](https://github.com/doublewordai/control-layer/commit/7ee3ac69c7b89466d5da7f666d8d3a563c4a554b))
+
+## [8.64.0](https://github.com/doublewordai/control-layer/compare/v8.63.0...v8.64.0) (2026-06-26)
+
+
+### Features
+
+* erase a deleted user's API keys and fusillade data ([#1174](https://github.com/doublewordai/control-layer/issues/1174)) ([c5182c8](https://github.com/doublewordai/control-layer/commit/c5182c8952036823bc0a734dc478382a7860c01c))
+
+## [8.63.0](https://github.com/doublewordai/control-layer/compare/v8.62.0...v8.63.0) (2026-06-25)
+
+
+### Features
+
+* input-caching ([#1172](https://github.com/doublewordai/control-layer/issues/1172)) ([9bf7a0b](https://github.com/doublewordai/control-layer/commit/9bf7a0b5631a3606a6d951ff8600b7a0577be40a))
+
+## [8.62.0](https://github.com/doublewordai/control-layer/compare/v8.61.3...v8.62.0) (2026-06-25)
+
+
+### Features
+
+* add Anthropic /v1/messages ingress ([#1177](https://github.com/doublewordai/control-layer/issues/1177)) ([d24bd11](https://github.com/doublewordai/control-layer/commit/d24bd11ca00a8ff797c310e89cc0cd5edd32e8c4))
+* support flex + streaming for chat completions and responses ([#1171](https://github.com/doublewordai/control-layer/issues/1171)) ([e48702a](https://github.com/doublewordai/control-layer/commit/e48702a1e812d322a3b4f74d2b7fc5f43a172aa9))
+
+## [8.61.3](https://github.com/doublewordai/control-layer/compare/v8.61.2...v8.61.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.33.3 ([#1173](https://github.com/doublewordai/control-layer/issues/1173)) ([12d50c8](https://github.com/doublewordai/control-layer/commit/12d50c8d3424e647a371f529bc5a3e48b79300af))
+* stop sending generated display name to stripe on customer creation ([#1169](https://github.com/doublewordai/control-layer/issues/1169)) ([7870071](https://github.com/doublewordai/control-layer/commit/7870071ace5f91a593e1867f943c3421910d55fc))
+
+## [8.61.2](https://github.com/doublewordai/control-layer/compare/v8.61.1...v8.61.2) (2026-06-22)
+
+
+### Bug Fixes
+
+* **dashboard:** show a clean error message for failed responses ([#1153](https://github.com/doublewordai/control-layer/issues/1153)) ([d7011de](https://github.com/doublewordai/control-layer/commit/d7011de39f45c6139a284dbdfb74e45a1b632891))
+* **responses:** translate content parts in multi-step executor input ([#1161](https://github.com/doublewordai/control-layer/issues/1161)) ([ce50bd7](https://github.com/doublewordai/control-layer/commit/ce50bd7c13d525a299848772c11ed6965847f84c))
+
+## [8.61.1](https://github.com/doublewordai/control-layer/compare/v8.61.0...v8.61.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 19.0.0 ([#1162](https://github.com/doublewordai/control-layer/issues/1162)) ([e041b40](https://github.com/doublewordai/control-layer/commit/e041b40d7e86ff26d7d973bf7ee0f853230bb9d1))
+* **playground:** render reasoning from all backend fields ([#1158](https://github.com/doublewordai/control-layer/issues/1158)) ([e1ee0a6](https://github.com/doublewordai/control-layer/commit/e1ee0a6b22d89853f1e3d012ebde41ea21120ce0))
+
+## [8.61.0](https://github.com/doublewordai/control-layer/compare/v8.60.7...v8.61.0) (2026-06-18)
+
+
+### Features
+
+* **cors:** optional any-origin CORS without credentials ([#1155](https://github.com/doublewordai/control-layer/issues/1155)) ([c00b0a5](https://github.com/doublewordai/control-layer/commit/c00b0a51a2c0f83cf527aa8112e726a91ebc9c6a))
+
+
+### Bug Fixes
+
+* **cors:** correct scheme in default dev-frontend origin ([#1156](https://github.com/doublewordai/control-layer/issues/1156)) ([33b6b48](https://github.com/doublewordai/control-layer/commit/33b6b484f490d7d8c1e4034431e5326fe3831631))
+
+## [8.60.7](https://github.com/doublewordai/control-layer/compare/v8.60.6...v8.60.7) (2026-06-17)
+
+
+### Bug Fixes
+
+* block platform keys from doing inference ([#1148](https://github.com/doublewordai/control-layer/issues/1148)) ([5b25362](https://github.com/doublewordai/control-layer/commit/5b253627f8f92cb5cf498c3ab50b68a1045fab3a))
+* bump fusillade to 18.0.2 ([#1154](https://github.com/doublewordai/control-layer/issues/1154)) ([ca91646](https://github.com/doublewordai/control-layer/commit/ca916460e71a228fef258cdc0d66fdeb842d1096))
+
+## [8.60.6](https://github.com/doublewordai/control-layer/compare/v8.60.5...v8.60.6) (2026-06-16)
+
+
+### Bug Fixes
+
+* **image-normalizer:** don't re-sign URLs already in our own store ([#1150](https://github.com/doublewordai/control-layer/issues/1150)) ([2aaa8ab](https://github.com/doublewordai/control-layer/commit/2aaa8ab6f853594d6939aa2f723616d11d968be3))
+
+## [8.60.5](https://github.com/doublewordai/control-layer/compare/v8.60.4...v8.60.5) (2026-06-16)
+
+
+### Bug Fixes
+
+* bump fusillade ([#1144](https://github.com/doublewordai/control-layer/issues/1144)) ([eb14b5c](https://github.com/doublewordai/control-layer/commit/eb14b5c13bb7dd7bdaf9ff6dac594b11a08fe08f))
+
+## [8.60.4](https://github.com/doublewordai/control-layer/compare/v8.60.3...v8.60.4) (2026-06-15)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.31.1 and fusillade to 18.0.0 ([#1140](https://github.com/doublewordai/control-layer/issues/1140)) ([ab97e7c](https://github.com/doublewordai/control-layer/commit/ab97e7c82ff0d8ef8bb39f61924365226c6f6af5))
+
+## [8.60.3](https://github.com/doublewordai/control-layer/compare/v8.60.2...v8.60.3) (2026-06-15)
+
+
+### Bug Fixes
+
+* count only successful requests in per-user model usage ([#1129](https://github.com/doublewordai/control-layer/issues/1129)) ([626ae97](https://github.com/doublewordai/control-layer/commit/626ae971c27476a06db21e950bc80ca782eccfcd))
+
+## [8.60.2](https://github.com/doublewordai/control-layer/compare/v8.60.1...v8.60.2) (2026-06-15)
+
+
+### Bug Fixes
+
+* any non success response when fetching images gets turned into a 502, implying an error on our server ([#1132](https://github.com/doublewordai/control-layer/issues/1132)) ([b500fbb](https://github.com/doublewordai/control-layer/commit/b500fbbd2e75a0c73967454c06bfc342dc834f6a))
+* onwards body limit ([#1135](https://github.com/doublewordai/control-layer/issues/1135)) ([1a66eac](https://github.com/doublewordai/control-layer/commit/1a66eac585ca659ddd9eb35d7207279de6270d74))
+* validate purpose on file upload ([#1137](https://github.com/doublewordai/control-layer/issues/1137)) ([eede166](https://github.com/doublewordai/control-layer/commit/eede166a5df3024c7268ce91fbbb86f99193e605))
+
+## [8.60.1](https://github.com/doublewordai/control-layer/compare/v8.60.0...v8.60.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 17.3.1 for batchless flex pending counts ([#1134](https://github.com/doublewordai/control-layer/issues/1134)) ([4ad4e88](https://github.com/doublewordai/control-layer/commit/4ad4e88c5bc49f9acc29d0bcc420d73269b33aec))
+
+## [8.60.0](https://github.com/doublewordai/control-layer/compare/v8.59.0...v8.60.0) (2026-06-11)
+
+
+### Features
+
+* standardise error logs into having metric emissions ([#1130](https://github.com/doublewordai/control-layer/issues/1130)) ([bfda345](https://github.com/doublewordai/control-layer/commit/bfda34584ed12fe179c087c1c3e89d26bbba398a))
+
+## [8.59.0](https://github.com/doublewordai/control-layer/compare/v8.58.1...v8.59.0) (2026-06-05)
+
+
+### Features
+
+* image input normalisation ([#1083](https://github.com/doublewordai/control-layer/issues/1083)) ([97d006c](https://github.com/doublewordai/control-layer/commit/97d006c4231dd00c490ce9fa94a3a6476dad38dc))
+
+
+### Bug Fixes
+
+* **openapi:** use Doubleword-served models in API doc examples ([#1125](https://github.com/doublewordai/control-layer/issues/1125)) ([27fc25f](https://github.com/doublewordai/control-layer/commit/27fc25fffd140c51874e8ec66dafc5e8db2b324f))
+
+## [8.58.1](https://github.com/doublewordai/control-layer/compare/v8.58.0...v8.58.1) (2026-06-03)
+
+
+### Performance Improvements
+
+* **sync:** raise onwards fallback resync default 10s-&gt;5min ([#1118](https://github.com/doublewordai/control-layer/issues/1118)) ([86b9049](https://github.com/doublewordai/control-layer/commit/86b9049a7dfb625b77174d02fbf3131fbe868519))
+* **sync:** stop api_keys no-op upserts from triggering onwards reloads ([#1119](https://github.com/doublewordai/control-layer/issues/1119)) ([d0ca45d](https://github.com/doublewordai/control-layer/commit/d0ca45d84bfb8c308817bc13b7e567f8655a673f))
+
+## [8.58.0](https://github.com/doublewordai/control-layer/compare/v8.57.0...v8.58.0) (2026-06-02)
+
+
+### Features
+
+* match initial purchase amount ([#1113](https://github.com/doublewordai/control-layer/issues/1113)) ([f09db56](https://github.com/doublewordai/control-layer/commit/f09db563e84f1daf324aaff488768197b085da3c))
+
+
+### Bug Fixes
+
+* **deps:** bump hickory-resolver to 0.26 + aws-sdk-s3 to 1.134 (closes 4 backend alerts) ([#1116](https://github.com/doublewordai/control-layer/issues/1116)) ([d90d7b0](https://github.com/doublewordai/control-layer/commit/d90d7b07a414f45d09cafaa1e15c7f8bc6528315))
+* Give the pre-tax total as credits, not the total. ([#1115](https://github.com/doublewordai/control-layer/issues/1115)) ([7abae48](https://github.com/doublewordai/control-layer/commit/7abae48b94f20f26477e9290987a8e7859fa0fea))
+
+## [8.57.0](https://github.com/doublewordai/control-layer/compare/v8.56.0...v8.57.0) (2026-06-01)
+
+
+### Features
+
+* add pending request decay window ([#1107](https://github.com/doublewordai/control-layer/issues/1107)) ([5eda366](https://github.com/doublewordai/control-layer/commit/5eda3665580509ab8466948bc14f66ac2499a066))
+
+
+### Bug Fixes
+
+* **deps:** bump tar from 0.4.45 to 0.4.46 in /dwctl ([#1109](https://github.com/doublewordai/control-layer/issues/1109)) ([5381f6d](https://github.com/doublewordai/control-layer/commit/5381f6d54f1c6832d5b3f053e963f84fe008a8b2))
+
+## [8.56.0](https://github.com/doublewordai/control-layer/compare/v8.55.0...v8.56.0) (2026-06-01)
+
+
+### Features
+
+* adds rate limits for unverified users ([#1105](https://github.com/doublewordai/control-layer/issues/1105)) ([3e07a01](https://github.com/doublewordai/control-layer/commit/3e07a01765170ac36a3ce436ca9e750da1c2a205))
+
+## [8.55.0](https://github.com/doublewordai/control-layer/compare/v8.54.2...v8.55.0) (2026-05-29)
+
+
+### Features
+
+* expose onwards 0.29 retry backoff per composite model ([#1097](https://github.com/doublewordai/control-layer/issues/1097)) ([fbe6717](https://github.com/doublewordai/control-layer/commit/fbe67170b33331eb01b9c43eba8e0b36d2faedef))
+* replace underway for response creation to use channel system ([#1101](https://github.com/doublewordai/control-layer/issues/1101)) ([9fdcb96](https://github.com/doublewordai/control-layer/commit/9fdcb963e8dbfcce295723242db4cce049ac5445))
+
+## [8.54.2](https://github.com/doublewordai/control-layer/compare/v8.54.1...v8.54.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* **files:** return 400 not 500 for malformed multipart uploads ([#1102](https://github.com/doublewordai/control-layer/issues/1102)) ([8e11774](https://github.com/doublewordai/control-layer/commit/8e11774fb880b696e62836af6ea2532461c9a918))
+
+## [8.54.1](https://github.com/doublewordai/control-layer/compare/v8.54.0...v8.54.1) (2026-05-27)
+
+
+### Bug Fixes
+
+* **dashboard:** load provider icons via the icon proxy ([#1099](https://github.com/doublewordai/control-layer/issues/1099)) ([afaee05](https://github.com/doublewordai/control-layer/commit/afaee05c756a90860dc0e67a79ccc1260e95e344))
+
+## [8.54.0](https://github.com/doublewordai/control-layer/compare/v8.53.0...v8.54.0) (2026-05-27)
+
+
+### Features
+
+* proxy provider-display-config icons through the API ([#1096](https://github.com/doublewordai/control-layer/issues/1096)) ([f460543](https://github.com/doublewordai/control-layer/commit/f4605435070461edddcd933c1c70737ebc00ba09))
+
+## [8.53.0](https://github.com/doublewordai/control-layer/compare/v8.52.2...v8.53.0) (2026-05-26)
+
+
+### Features
+
+* add configurable browser security response headers ([#1091](https://github.com/doublewordai/control-layer/issues/1091)) ([0357624](https://github.com/doublewordai/control-layer/commit/03576247b13cb70b26f4338624b039c4153d8df8))
+
+## [8.52.2](https://github.com/doublewordai/control-layer/compare/v8.52.1...v8.52.2) (2026-05-21)
+
+
+### Bug Fixes
+
+* **openapi:** gate admin spec behind admin auth and disable by default ([#1089](https://github.com/doublewordai/control-layer/issues/1089)) ([56b145c](https://github.com/doublewordai/control-layer/commit/56b145ce6f8932bedaffc2f4d07a1009c2b7e3c4))
+
+## [8.52.1](https://github.com/doublewordai/control-layer/compare/v8.52.0...v8.52.1) (2026-05-20)
+
+
+### Bug Fixes
+
+* **organizations:** verify and validate contact-email changes ([#1080](https://github.com/doublewordai/control-layer/issues/1080)) ([4f91377](https://github.com/doublewordai/control-layer/commit/4f91377ed7e10f32e1c607073df01beda27d8591))
+
+## [8.52.0](https://github.com/doublewordai/control-layer/compare/v8.51.0...v8.52.0) (2026-05-20)
+
+
+### Features
+
+* **usage:** scope /usage to active organization and accept user_id filter ([#1086](https://github.com/doublewordai/control-layer/issues/1086)) ([1d4a05c](https://github.com/doublewordai/control-layer/commit/1d4a05c66f063176232d43630e408ffa065b3426))
+
+## [8.51.0](https://github.com/doublewordai/control-layer/compare/v8.50.0...v8.51.0) (2026-05-20)
+
+
+### Features
+
+* single request deletion ([#1082](https://github.com/doublewordai/control-layer/issues/1082)) ([379e705](https://github.com/doublewordai/control-layer/commit/379e70597935e095cc7131d7137678dfc1b6585c))
+* unified http client ([#1078](https://github.com/doublewordai/control-layer/issues/1078)) ([106b78e](https://github.com/doublewordai/control-layer/commit/106b78e4ab775e425d29fa3fe6ffdc1f7eb80004))
+
+
+### Bug Fixes
+
+* open responses compliant deletion ([#1084](https://github.com/doublewordai/control-layer/issues/1084)) ([2de7390](https://github.com/doublewordai/control-layer/commit/2de7390227ce2376741902e54104ee4d731a9c63))
+
+## [8.50.0](https://github.com/doublewordai/control-layer/compare/v8.49.1...v8.50.0) (2026-05-15)
+
+
+### Features
+
+* Remove virtual batches ([#1065](https://github.com/doublewordai/control-layer/issues/1065)) ([3a30d90](https://github.com/doublewordai/control-layer/commit/3a30d90daa0b9363770a45691a96e80fd8141afc))
+
+
+### Bug Fixes
+
+* Bump fusillade to speedup batch page query ([#1077](https://github.com/doublewordai/control-layer/issues/1077)) ([970f7c2](https://github.com/doublewordai/control-layer/commit/970f7c28fb13ed8de41594128af53a4859f6221d))
+
+## [8.49.1](https://github.com/doublewordai/control-layer/compare/v8.49.0...v8.49.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* **endpoints:** paginate edit modal and stop dropping models on save ([#1071](https://github.com/doublewordai/control-layer/issues/1071)) ([73c2073](https://github.com/doublewordai/control-layer/commit/73c207353f4e57e0bccf2c5e072e1e2ac2fdf6aa))
+
+## [8.49.0](https://github.com/doublewordai/control-layer/compare/v8.48.0...v8.49.0) (2026-05-13)
+
+
+### Features
+
+* create response UI ([#1067](https://github.com/doublewordai/control-layer/issues/1067)) ([c6e69e3](https://github.com/doublewordai/control-layer/commit/c6e69e37c6688acf26139e07daee99f931642d41))
+
+
+### Bug Fixes
+
+* **responses:** mark parent row processing during multi-step loop ([#1069](https://github.com/doublewordai/control-layer/issues/1069)) ([1b86515](https://github.com/doublewordai/control-layer/commit/1b865152c24197cf3bcf4bd8c764935397a9f510))
+* **responses:** terminate fusillade row on client cancel ([#1070](https://github.com/doublewordai/control-layer/issues/1070)) ([602df7f](https://github.com/doublewordai/control-layer/commit/602df7fa568d7f6096efdee7f1672af3da9b167c))
+
+## [8.48.0](https://github.com/doublewordai/control-layer/compare/v8.47.0...v8.48.0) (2026-05-11)
+
+
+### Features
+
+* **chat-completions:** support service_tier:"flex" via fusillade ([#1056](https://github.com/doublewordai/control-layer/issues/1056)) ([20b77ef](https://github.com/doublewordai/control-layer/commit/20b77ef1b6fe9699d3af1ed2e0f4fd4b35906ed8))
+
+
+### Bug Fixes
+
+* **responses:** wire DwctlRequestProcessor end-to-end on the flex daemon path ([#1064](https://github.com/doublewordai/control-layer/issues/1064)) ([66e7564](https://github.com/doublewordai/control-layer/commit/66e756425271f0c12171cab249d1d127659fd1af))
+
+## [8.47.0](https://github.com/doublewordai/control-layer/compare/v8.46.4...v8.47.0) (2026-05-08)
+
+
+### Features
+
+* **api:** explain modality-blocked 403s in AI proxy errors ([#1062](https://github.com/doublewordai/control-layer/issues/1062)) ([4e32c41](https://github.com/doublewordai/control-layer/commit/4e32c41353f8748f1185a29e6e9fa8f4ff08132a))
+* redesign endpoint model editing UX ([#1060](https://github.com/doublewordai/control-layer/issues/1060)) ([c26ed46](https://github.com/doublewordai/control-layer/commit/c26ed46af8b8b686ce35f0c569bc4853c3a26825))
+
+## [8.46.4](https://github.com/doublewordai/control-layer/compare/v8.46.3...v8.46.4) (2026-05-08)
+
+
+### Bug Fixes
+
+* **responses:** make complete-response idempotent against terminal-state rows ([#1050](https://github.com/doublewordai/control-layer/issues/1050)) ([1bbec2d](https://github.com/doublewordai/control-layer/commit/1bbec2df3178152cce05db642ff01caae744555d))
+* **responses:** translate Open Responses input items to chat-completions shape ([#1058](https://github.com/doublewordai/control-layer/issues/1058)) ([7f700c4](https://github.com/doublewordai/control-layer/commit/7f700c43537259e7a589e4d62cfaae7dba795728))
+* **responses:** wire service_tier:flex to the daemon for /v1/responses ([#1059](https://github.com/doublewordai/control-layer/issues/1059)) ([35ff4f1](https://github.com/doublewordai/control-layer/commit/35ff4f1fc5e045081664df89bdcb6d0302657bf8))
+
+## [8.46.3](https://github.com/doublewordai/control-layer/compare/v8.46.2...v8.46.3) (2026-05-07)
+
+
+### Bug Fixes
+
+* bump fusillade + minor deps ([#1054](https://github.com/doublewordai/control-layer/issues/1054)) ([306ef31](https://github.com/doublewordai/control-layer/commit/306ef315b30786b4194240edea824de1b6560724))
+
+## [8.46.2](https://github.com/doublewordai/control-layer/compare/v8.46.1...v8.46.2) (2026-05-07)
+
+
+### Bug Fixes
+
+* Do not record requests as successful in outlet/http-analytics if they actually had errors mid-sse-stream ([#1048](https://github.com/doublewordai/control-layer/issues/1048)) ([2b6e252](https://github.com/doublewordai/control-layer/commit/2b6e252e353445c97d5c09c713f276b162a0ee61))
+
+## [8.46.1](https://github.com/doublewordai/control-layer/compare/v8.46.0...v8.46.1) (2026-05-07)
+
+
+### Bug Fixes
+
+* pass through client-side tool_calls instead of dispatching them ([#1049](https://github.com/doublewordai/control-layer/issues/1049)) ([88ac176](https://github.com/doublewordai/control-layer/commit/88ac176d60b0a0b518d7b7b4ae3f5ff3d48ef129))
+
+## [8.46.0](https://github.com/doublewordai/control-layer/compare/v8.45.0...v8.46.0) (2026-05-05)
+
+
+### Features
+
+* **webhooks:** allow org members read-only access to org webhooks ([#1043](https://github.com/doublewordai/control-layer/issues/1043)) ([4bf5b54](https://github.com/doublewordai/control-layer/commit/4bf5b54142b57d34bdf2456202f1db30d539461f))
+
+
+### Bug Fixes
+
+* **deps:** clear all 36 open Dependabot vulnerabilities ([#1045](https://github.com/doublewordai/control-layer/issues/1045)) ([fa79316](https://github.com/doublewordai/control-layer/commit/fa793161b73ae32432cd8a7d1e5f2ca0554469c2))
+
+## [8.45.0](https://github.com/doublewordai/control-layer/compare/v8.44.3...v8.45.0) (2026-04-30)
+
+
+### Features
+
+* dwctl migration for multi-step response analytics linkage ([#1036](https://github.com/doublewordai/control-layer/issues/1036)) ([d9eb4bd](https://github.com/doublewordai/control-layer/commit/d9eb4bd562b507183cf8cb2dc6f64fab78b7bff9))
+
+## [8.44.3](https://github.com/doublewordai/control-layer/compare/v8.44.2...v8.44.3) (2026-04-28)
+
+
+### Bug Fixes
+
+* preserve upstream error codes instead of wrapping as 500 ([#1031](https://github.com/doublewordai/control-layer/issues/1031)) ([ddd7079](https://github.com/doublewordai/control-layer/commit/ddd7079c1af3e12e6b4e4d7e7f10a5dd7824731f))
+
+## [8.44.2](https://github.com/doublewordai/control-layer/compare/v8.44.1...v8.44.2) (2026-04-27)
+
+
+### Bug Fixes
+
+* filter priority from queue metrics ([#1029](https://github.com/doublewordai/control-layer/issues/1029)) ([89c92d5](https://github.com/doublewordai/control-layer/commit/89c92d57c6151e5e26818abd5b93c91a6e68db7d))
+
+## [8.44.1](https://github.com/doublewordai/control-layer/compare/v8.44.0...v8.44.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* batch id attribution and completion window filtering ([#1025](https://github.com/doublewordai/control-layer/issues/1025)) ([2928686](https://github.com/doublewordai/control-layer/commit/29286866bbe40991c09b3a601899ca841d23d41b))
+
+## [8.44.0](https://github.com/doublewordai/control-layer/compare/v8.43.0...v8.44.0) (2026-04-25)
+
+
+### Features
+
+* service_tier and background handlers ([#1007](https://github.com/doublewordai/control-layer/issues/1007)) ([43e4239](https://github.com/doublewordai/control-layer/commit/43e4239ccb7f033ccb94f6f47dbd97c96a4c9531))
+
+## [8.43.0](https://github.com/doublewordai/control-layer/compare/v8.42.3...v8.43.0) (2026-04-24)
+
+
+### Features
+
+* mobile swimlane view for models page ([#1022](https://github.com/doublewordai/control-layer/issues/1022)) ([4237a96](https://github.com/doublewordai/control-layer/commit/4237a96f5a045f012e753e49d66c786cc4147f35))
+
+## [8.42.3](https://github.com/doublewordai/control-layer/compare/v8.42.2...v8.42.3) (2026-04-22)
+
+
+### Bug Fixes
+
+* models sort ([#1016](https://github.com/doublewordai/control-layer/issues/1016)) ([2bd3635](https://github.com/doublewordai/control-layer/commit/2bd36356dff5cc393448366d43673598004fd129))
+
+## [8.42.2](https://github.com/doublewordai/control-layer/compare/v8.42.1...v8.42.2) (2026-04-22)
+
+
+### Bug Fixes
+
+* fmt changelog ([007cc7d](https://github.com/doublewordai/control-layer/commit/007cc7dd78003203818b10eeb2a346b0c2fb2898))
+
+## [8.42.1](https://github.com/doublewordai/control-layer/compare/v8.42.0...v8.42.1) (2026-04-22)
+
+
+### Bug Fixes
+
+* updated readme formatting ([41f0e63](https://github.com/doublewordai/control-layer/commit/41f0e634506ea48a0699c6956dcd2eab4ab2fa73))
+
+## [8.42.0](https://github.com/doublewordai/control-layer/compare/v8.41.0...v8.42.0) (2026-04-22)
+
+
+### Features
+
+* upgrade fusillade 16.3.0 and switch async view to service_tier=flex ([#1009](https://github.com/doublewordai/control-layer/issues/1009)) ([c98bc38](https://github.com/doublewordai/control-layer/commit/c98bc386e1de4b19e3732a6771f613cd90c90c13))
+
+## [8.41.0](https://github.com/doublewordai/control-layer/compare/v8.40.1...v8.41.0) (2026-04-17)
+
+
+### Features
+
+* cascade batch state to child requests via background job ([#1001](https://github.com/doublewordai/control-layer/issues/1001)) ([0071c85](https://github.com/doublewordai/control-layer/commit/0071c85cdb0a8139e568be31bf6e61c06ba3854f))
+
+## [8.40.1](https://github.com/doublewordai/control-layer/compare/v8.40.0...v8.40.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* center tooltips and make model/user cells click-to-copy ([#998](https://github.com/doublewordai/control-layer/issues/998)) ([e2fb2f5](https://github.com/doublewordai/control-layer/commit/e2fb2f5fab090e4265e1236ff94f7dc553b466e6))
+
+## [8.40.0](https://github.com/doublewordai/control-layer/compare/v8.39.0...v8.40.0) (2026-04-16)
+
+
+### Features
+
+* async-ui followups - onwards 0.24.2, user in metadata, cleaner batch view ([#995](https://github.com/doublewordai/control-layer/issues/995)) ([7284c07](https://github.com/doublewordai/control-layer/commit/7284c0762194fd4b446d5141dc372d8af5832c48))
+
+
+### Bug Fixes
+
+* bump fusillade to 16.1.2 ([#997](https://github.com/doublewordai/control-layer/issues/997)) ([24117da](https://github.com/doublewordai/control-layer/commit/24117da746058abbd4cd6bb3f52d02e521926851))
+
+## [8.39.0](https://github.com/doublewordai/control-layer/compare/v8.38.2...v8.39.0) (2026-04-15)
+
+
+### Features
+
+* async requests UI and streamlined batch experience ([#989](https://github.com/doublewordai/control-layer/issues/989)) ([76cd01b](https://github.com/doublewordai/control-layer/commit/76cd01baff9fe6b36d22d5549f92a03524aeb3c8))
+
+## [8.38.2](https://github.com/doublewordai/control-layer/compare/v8.38.1...v8.38.2) (2026-04-15)
+
+
+### Bug Fixes
+
+* batch creation from sync respects queue capacity, jobs backoff and retry ([#990](https://github.com/doublewordai/control-layer/issues/990)) ([dafed4a](https://github.com/doublewordai/control-layer/commit/dafed4a072eae6e638fcf26ff25503af84603abc))
+
+## [8.38.1](https://github.com/doublewordai/control-layer/compare/v8.38.0...v8.38.1) (2026-04-15)
+
+
+### Bug Fixes
+
+* bump onwards to 0.24.1 ([#991](https://github.com/doublewordai/control-layer/issues/991)) ([9058b99](https://github.com/doublewordai/control-layer/commit/9058b99cdf8ea64b01032c55503337c76ca88658))
+
+## [8.38.0](https://github.com/doublewordai/control-layer/compare/v8.37.1...v8.38.0) (2026-04-14)
+
+
+### Features
+
+* connections role for gating feature ([#981](https://github.com/doublewordai/control-layer/issues/981)) ([5ce28e2](https://github.com/doublewordai/control-layer/commit/5ce28e212fa7a52299e4328451210079a4f30757))
+
+## [8.37.1](https://github.com/doublewordai/control-layer/compare/v8.37.0...v8.37.1) (2026-04-13)
+
+
+### Bug Fixes
+
+* document dynamo nvext.agent_hints.priority injection path ([#984](https://github.com/doublewordai/control-layer/issues/984)) ([cf613b0](https://github.com/doublewordai/control-layer/commit/cf613b0d90cf1a224bbaa817e22640bb0452c28c))
+
+## [8.37.0](https://github.com/doublewordai/control-layer/compare/v8.36.0...v8.37.0) (2026-04-13)
+
+
+### Features
+
+* allow platform managers to use any batch completion window ([#978](https://github.com/doublewordai/control-layer/issues/978)) ([5ac8ef5](https://github.com/doublewordai/control-layer/commit/5ac8ef5de021d67092b3952e3f45a5425083237e))
+* wire fusillade deadline-priority injection into batch_daemon config ([#980](https://github.com/doublewordai/control-layer/issues/980)) ([f653871](https://github.com/doublewordai/control-layer/commit/f65387119bc11c9632ecf5f3d49185335c877fea))
+
+## [8.36.0](https://github.com/doublewordai/control-layer/compare/v8.35.1...v8.36.0) (2026-04-10)
+
+
+### Features
+
+* more transparent and intuitive handling of errors in ingested jsonl ([#967](https://github.com/doublewordai/control-layer/issues/967)) ([a9a7365](https://github.com/doublewordai/control-layer/commit/a9a7365afd45a03c87ba7c8107dc555fd0a2f440))
+
+
+### Bug Fixes
+
+* missed an index migration ([#975](https://github.com/doublewordai/control-layer/issues/975)) ([9643080](https://github.com/doublewordai/control-layer/commit/9643080edb66bd6f5446c229ca65937a6dcb2a72))
+
+## [8.35.1](https://github.com/doublewordai/control-layer/compare/v8.35.0...v8.35.1) (2026-04-10)
+
+
+### Bug Fixes
+
+* hide reasoning tokens if zero ([#970](https://github.com/doublewordai/control-layer/issues/970)) ([f647cd9](https://github.com/doublewordai/control-layer/commit/f647cd9a70fc5f9ce74a8d184adf1291ceb9118d))
+
+## [8.35.0](https://github.com/doublewordai/control-layer/compare/v8.34.0...v8.35.0) (2026-04-09)
+
+
+### Features
+
+* expose reasoning token analytics ([#939](https://github.com/doublewordai/control-layer/issues/939)) ([070fbaa](https://github.com/doublewordai/control-layer/commit/070fbaaf3a5166e56390fb8ac780dd9ab4e8817e))
+
+## [8.34.0](https://github.com/doublewordai/control-layer/compare/v8.33.4...v8.34.0) (2026-04-09)
+
+
+### Features
+
+* external connections ([#956](https://github.com/doublewordai/control-layer/issues/956)) ([61df97b](https://github.com/doublewordai/control-layer/commit/61df97b20e7895d9f01224b9d37a222400abcb35))
+
+## [8.33.4](https://github.com/doublewordai/control-layer/compare/v8.33.3...v8.33.4) (2026-04-09)
+
+
+### Bug Fixes
+
+* update cost names ([#963](https://github.com/doublewordai/control-layer/issues/963)) ([a671cde](https://github.com/doublewordai/control-layer/commit/a671cde8a491cecc3832b9c27e2a5ad9c810a70d))
+
+## [8.33.3](https://github.com/doublewordai/control-layer/compare/v8.33.2...v8.33.3) (2026-04-08)
+
+
+### Bug Fixes
+
+* allow standard users to read all provider display configs ([#959](https://github.com/doublewordai/control-layer/issues/959)) ([8b9ae4e](https://github.com/doublewordai/control-layer/commit/8b9ae4e5e12e1f2acd8334eaccc8aaa04116ca1c))
+
+## [8.33.2](https://github.com/doublewordai/control-layer/compare/v8.33.1...v8.33.2) (2026-04-07)
+
+
+### Bug Fixes
+
+* autotopup fixes ([#940](https://github.com/doublewordai/control-layer/issues/940)) ([ab79595](https://github.com/doublewordai/control-layer/commit/ab795952ed0ab73bc402d84ee9b669df34905f27))
+* bump fusillade for new reassembler ([#958](https://github.com/doublewordai/control-layer/issues/958)) ([be5d4aa](https://github.com/doublewordai/control-layer/commit/be5d4aa7ba9f52dda5f2a883863942cca47eb704))
+
+## [8.33.1](https://github.com/doublewordai/control-layer/compare/v8.33.0...v8.33.1) (2026-04-07)
+
+
+### Bug Fixes
+
+* allow standard users to load provider display configs ([#950](https://github.com/doublewordai/control-layer/issues/950)) ([ae649e6](https://github.com/doublewordai/control-layer/commit/ae649e6bed6eab1633c0b1b5d414512f904c8e9a))
+
+## [8.33.0](https://github.com/doublewordai/control-layer/compare/v8.32.1...v8.33.0) (2026-04-02)
+
+
+### Features
+
+* add live reload for config.yaml ([#879](https://github.com/doublewordai/control-layer/issues/879)) ([7394715](https://github.com/doublewordai/control-layer/commit/73947151b95b8ca403eff6a33f8b851573516543))
+* add provider display configuration to model catalog ([#945](https://github.com/doublewordai/control-layer/issues/945)) ([ad14021](https://github.com/doublewordai/control-layer/commit/ad14021f92c7b6c13cad14b7f06b7dfdd6ad9ebd))
+
+## [8.32.1](https://github.com/doublewordai/control-layer/compare/v8.32.0...v8.32.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* update personal domain list ([#943](https://github.com/doublewordai/control-layer/issues/943)) ([b29cd0a](https://github.com/doublewordai/control-layer/commit/b29cd0a7a1ada44ceec50467a8dbc9c08efd046e))
+
+## [8.32.0](https://github.com/doublewordai/control-layer/compare/v8.31.1...v8.32.0) (2026-03-31)
+
+
+### Features
+
+* org auto-enrollment ([#938](https://github.com/doublewordai/control-layer/issues/938)) ([2563db3](https://github.com/doublewordai/control-layer/commit/2563db35e29c20027b18fa27436ab5778a8e7ec9))
+* self serve orgs ([#936](https://github.com/doublewordai/control-layer/issues/936)) ([ab8b48f](https://github.com/doublewordai/control-layer/commit/ab8b48fcc9edc52ba9c17983ee7338aaba71675c))
+
+## [8.31.1](https://github.com/doublewordai/control-layer/compare/v8.31.0...v8.31.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* Handle errors appearing in sse streams ([#934](https://github.com/doublewordai/control-layer/issues/934)) ([dce40fa](https://github.com/doublewordai/control-layer/commit/dce40faa9db51322de3f610ef1976e94cf26d9d5))
+
+## [8.31.0](https://github.com/doublewordai/control-layer/compare/v8.30.2...v8.31.0) (2026-03-31)
+
+
+### Features
+
+* migration to allow multiple orgs with same email ([#933](https://github.com/doublewordai/control-layer/issues/933)) ([f2f3a16](https://github.com/doublewordai/control-layer/commit/f2f3a169603849de03f60b4412ad7bd2cc925dc6))
+
+## [8.30.2](https://github.com/doublewordai/control-layer/compare/v8.30.1...v8.30.2) (2026-03-31)
+
+
+### Bug Fixes
+
+* bump fusillade 14.2.0 ([#931](https://github.com/doublewordai/control-layer/issues/931)) ([81d7b6b](https://github.com/doublewordai/control-layer/commit/81d7b6b7edde045f7530ce0800fb4b41cab70d56))
+
+## [8.30.1](https://github.com/doublewordai/control-layer/compare/v8.30.0...v8.30.1) (2026-03-30)
+
+
+### Bug Fixes
+
+* bump fusillade 14.1.0 ([#929](https://github.com/doublewordai/control-layer/issues/929)) ([9273a82](https://github.com/doublewordai/control-layer/commit/9273a82965c7ffd67ad235a7735c0d7b51102ca2))
+* support fusillade 14.0.1 file stream handling ([#927](https://github.com/doublewordai/control-layer/issues/927)) ([17c05cd](https://github.com/doublewordai/control-layer/commit/17c05cd756372c9b9b8b22d8da6121f7f9cf5d7e))
+
+## [8.30.0](https://github.com/doublewordai/control-layer/compare/v8.29.0...v8.30.0) (2026-03-27)
+
+
+### Features
+
+* Add underway as job handler, and move batch creation to it ([#914](https://github.com/doublewordai/control-layer/issues/914)) ([bb90e58](https://github.com/doublewordai/control-layer/commit/bb90e58cebd961c236073148ca3d615364e9b11e))
+* fusillade fair usage ([#923](https://github.com/doublewordai/control-layer/issues/923)) ([26c3da7](https://github.com/doublewordai/control-layer/commit/26c3da70b5037f84cf592c4e9b9c0cb08cd46dc9))
+
+## [8.29.0](https://github.com/doublewordai/control-layer/compare/v8.28.1...v8.29.0) (2026-03-26)
+
+
+### Features
+
+* org notification settings in api handlers ([#921](https://github.com/doublewordai/control-layer/issues/921)) ([05d2051](https://github.com/doublewordai/control-layer/commit/05d2051004386a569cbc7676a05f7869aff65d6e))
+
+## [8.28.1](https://github.com/doublewordai/control-layer/compare/v8.28.0...v8.28.1) (2026-03-25)
+
+
+### Bug Fixes
+
+* batch streaming ([#909](https://github.com/doublewordai/control-layer/issues/909)) ([3c6ce8d](https://github.com/doublewordai/control-layer/commit/3c6ce8db9a5bad3c95f2bf2874aeb4f02881396b))
+
+## [8.28.0](https://github.com/doublewordai/control-layer/compare/v8.27.1...v8.28.0) (2026-03-24)
+
+
+### Features
+
+* platform webhooks extension ([#902](https://github.com/doublewordai/control-layer/issues/902)) ([1a8a0cf](https://github.com/doublewordai/control-layer/commit/1a8a0cf42725dc06a97b9220fe89757c0e4c4efc))
+
+
+### Bug Fixes
+
+* enrich 402 when balance &lt;= 0 ([#859](https://github.com/doublewordai/control-layer/issues/859)) ([3ed3703](https://github.com/doublewordai/control-layer/commit/3ed37030d8c65607e045da4d5f8efeefe4db19de))
+* error realtime usage ([#913](https://github.com/doublewordai/control-layer/issues/913)) ([6ffa10d](https://github.com/doublewordai/control-layer/commit/6ffa10ddd16038d1216dfbd5a4e8e1d2690b6de0))
+
+## [8.27.1](https://github.com/doublewordai/control-layer/compare/v8.27.0...v8.27.1) (2026-03-20)
+
+
+### Bug Fixes
+
+* show realtime data in usage reports ([#904](https://github.com/doublewordai/control-layer/issues/904)) ([56f3ae9](https://github.com/doublewordai/control-layer/commit/56f3ae9f48099fd6f1545d401c548dc818f2fc8e))
+
+## [8.27.0](https://github.com/doublewordai/control-layer/compare/v8.26.0...v8.27.0) (2026-03-19)
+
+
+### Features
+
+* simplify cli callback ([#906](https://github.com/doublewordai/control-layer/issues/906)) ([dd8ad43](https://github.com/doublewordai/control-layer/commit/dd8ad43f0f015cf914e7aedd4098254d2ad2378f))
+
+## [8.26.0](https://github.com/doublewordai/control-layer/compare/v8.25.0...v8.26.0) (2026-03-19)
+
+
+### Features
+
+* move cli callback endpoint ([#903](https://github.com/doublewordai/control-layer/issues/903)) ([e89ff16](https://github.com/doublewordai/control-layer/commit/e89ff16dc1789579e583083890262526de9d33c0))
+
+## [8.25.0](https://github.com/doublewordai/control-layer/compare/v8.24.0...v8.25.0) (2026-03-19)
+
+
+### Features
+
+* Add CLI login callback endpoint for browser-based authentication ([#897](https://github.com/doublewordai/control-layer/issues/897)) ([cc07cc1](https://github.com/doublewordai/control-layer/commit/cc07cc135906ad93f23e78f06ffb2f964200907d))
+
+
+### Bug Fixes
+
+* bump onwards ([#901](https://github.com/doublewordai/control-layer/issues/901)) ([b561664](https://github.com/doublewordai/control-layer/commit/b561664757973302d569d698fa11a758cb87a56d))
+
+## [8.24.0](https://github.com/doublewordai/control-layer/compare/v8.23.0...v8.24.0) (2026-03-19)
+
+
+### Features
+
+* Enable requests to be streamed for specific endpoints ([#877](https://github.com/doublewordai/control-layer/issues/877)) ([93dbb75](https://github.com/doublewordai/control-layer/commit/93dbb759c6b792842d8748e01ad47e03e5f81032))
+
+## [8.23.0](https://github.com/doublewordai/control-layer/compare/v8.22.3...v8.23.0) (2026-03-18)
+
+
+### Features
+
+* member_id in create key for PMs + attribute PM keys to PM when not specified ([#890](https://github.com/doublewordai/control-layer/issues/890)) ([6b543c2](https://github.com/doublewordai/control-layer/commit/6b543c2a123bb7ece7d4c9aff399ed7625dd3463))
+* removed mailto and added create organization request to support ([#891](https://github.com/doublewordai/control-layer/issues/891)) ([9d82115](https://github.com/doublewordai/control-layer/commit/9d8211508b9041cd2cc8adf18327663ff9963f5b))
+
+
+### Bug Fixes
+
+* pass the api key to create batch, for which it should use for all of its requests ([#885](https://github.com/doublewordai/control-layer/issues/885)) ([35e04b7](https://github.com/doublewordai/control-layer/commit/35e04b77b6a2b5ba6c1950ab7b70d90701278d7d))
+
+## [8.22.3](https://github.com/doublewordai/control-layer/compare/v8.22.2...v8.22.3) (2026-03-16)
+
+
+### Bug Fixes
+
+* bump onwards ([#892](https://github.com/doublewordai/control-layer/issues/892)) ([861ca70](https://github.com/doublewordai/control-layer/commit/861ca70a1dda9076cf8d1025073717f6685c9c92))
+
+## [8.22.2](https://github.com/doublewordai/control-layer/compare/v8.22.1...v8.22.2) (2026-03-16)
+
+
+### Bug Fixes
+
+* **dwctl:** pick up onwards 0.21.0 opt-in server-side tool calling ([#888](https://github.com/doublewordai/control-layer/issues/888)) ([49494d3](https://github.com/doublewordai/control-layer/commit/49494d338166f562f528f6b59465dab71d46db69))
+
+## [8.22.1](https://github.com/doublewordai/control-layer/compare/v8.22.0...v8.22.1) (2026-03-16)
+
+
+### Bug Fixes
+
+* orgs need batch permissions so we can make batches as an org via the api ([#872](https://github.com/doublewordai/control-layer/issues/872)) ([efc8ae0](https://github.com/doublewordai/control-layer/commit/efc8ae0d429e20a67dd9d2f8aa6a1f2f94bd6e47))
+
+## [8.22.0](https://github.com/doublewordai/control-layer/compare/v8.21.0...v8.22.0) (2026-03-16)
+
+
+### Features
+
+* **dwctl:** server-side tool calling backend ([#878](https://github.com/doublewordai/control-layer/issues/878)) ([1ff4c56](https://github.com/doublewordai/control-layer/commit/1ff4c5665ff6000f73b54d76581038829de44458))
+
+## [8.21.0](https://github.com/doublewordai/control-layer/compare/v8.20.0...v8.21.0) (2026-03-16)
+
+
+### Features
+
+* server side active first sorting ([#864](https://github.com/doublewordai/control-layer/issues/864)) ([5b6dfd7](https://github.com/doublewordai/control-layer/commit/5b6dfd75562cd3ee066ec23d84dbc625c8753f31))
+
+## [8.20.0](https://github.com/doublewordai/control-layer/compare/v8.19.2...v8.20.0) (2026-03-15)
+
+
+### Features
+
+* bill based on completion time ([#876](https://github.com/doublewordai/control-layer/issues/876)) ([88e923d](https://github.com/doublewordai/control-layer/commit/88e923dc7af2238f61b3f58dcb42c4ec147bacb4))
+
+## [8.19.2](https://github.com/doublewordai/control-layer/compare/v8.19.1...v8.19.2) (2026-03-12)
+
+
+### Bug Fixes
+
+* allow emoty string cookie domain, which is transformed to none ([#873](https://github.com/doublewordai/control-layer/issues/873)) ([599606d](https://github.com/doublewordai/control-layer/commit/599606d876026817c5ee82ab9d5729288aaaaa68))
+
+## [8.19.1](https://github.com/doublewordai/control-layer/compare/v8.19.0...v8.19.1) (2026-03-12)
+
+
+### Bug Fixes
+
+* optional domain for active org cookie ([#868](https://github.com/doublewordai/control-layer/issues/868)) ([36dd297](https://github.com/doublewordai/control-layer/commit/36dd297f346a351a339081d0ae68305775ed476e))
+
+## [8.19.0](https://github.com/doublewordai/control-layer/compare/v8.18.1...v8.19.0) (2026-03-12)
+
+
+### Features
+
+* add trace_id to http_analytics ([#865](https://github.com/doublewordai/control-layer/issues/865)) ([fb56e2f](https://github.com/doublewordai/control-layer/commit/fb56e2fe8454045578874d7feff6532c204e678b))
+* org-scoped batch/file filtering with metadata enrichment ([#839](https://github.com/doublewordai/control-layer/issues/839)) ([000fcef](https://github.com/doublewordai/control-layer/commit/000fcef23d353c29122722d0a99a1d51d46f17bf))
+
+
+### Bug Fixes
+
+* Split timeouts ([#833](https://github.com/doublewordai/control-layer/issues/833)) ([7b5d78f](https://github.com/doublewordai/control-layer/commit/7b5d78f5e5c752c2fd92d89cfe9c719a3570b41e))
+
+## [8.18.1](https://github.com/doublewordai/control-layer/compare/v8.18.0...v8.18.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* check recent last_login + store onboarded in browser ([#860](https://github.com/doublewordai/control-layer/issues/860)) ([af6d8d6](https://github.com/doublewordai/control-layer/commit/af6d8d6bea9cd96d2297929123807d650b6251b6))
+
+## [8.18.0](https://github.com/doublewordai/control-layer/compare/v8.17.1...v8.18.0) (2026-03-11)
+
+
+### Features
+
+* allow email reuse in orgs with updated unique indx on user emails ([#853](https://github.com/doublewordai/control-layer/issues/853)) ([f4ca358](https://github.com/doublewordai/control-layer/commit/f4ca358e7a2770fe27e7f1be960f82925b9e1949))
+* migration to allow org members to have the same api key name ([#857](https://github.com/doublewordai/control-layer/issues/857)) ([09b6001](https://github.com/doublewordai/control-layer/commit/09b600185dd2034189872f637b935154a304be8e))
+* use last_login column to detect first login and redirect onboarding ([#835](https://github.com/doublewordai/control-layer/issues/835)) ([45f5138](https://github.com/doublewordai/control-layer/commit/45f5138b4056abe4e357404cd19242dc498c0900))
+
+
+### Bug Fixes
+
+* make get_pending_request_counts count processing and claimed too ([#836](https://github.com/doublewordai/control-layer/issues/836)) ([ae6fbda](https://github.com/doublewordai/control-layer/commit/ae6fbdaccba01ac893abfc5baf8f4d8076be0ddc))
+
+## [8.17.1](https://github.com/doublewordai/control-layer/compare/v8.17.0...v8.17.1) (2026-03-11)
+
+
+### Bug Fixes
+
+* validate org balance at batch creation when in org context ([#848](https://github.com/doublewordai/control-layer/issues/848)) ([97884f9](https://github.com/doublewordai/control-layer/commit/97884f945349da75b09bcb26d66a746b3f9b4ebc))
+
+## [8.17.0](https://github.com/doublewordai/control-layer/compare/v8.16.4...v8.17.0) (2026-03-11)
+
+
+### Features
+
+* tracing enrichment — span prefixes, dep bumps, stack size fix ([#842](https://github.com/doublewordai/control-layer/issues/842)) ([1b19a32](https://github.com/doublewordai/control-layer/commit/1b19a32a586c9a34e22b20253941eb2d7beff9f3))
+
+## [8.16.4](https://github.com/doublewordai/control-layer/compare/v8.16.3...v8.16.4) (2026-03-11)
+
+
+### Bug Fixes
+
+* bump fusillade to 8.1.1 for claim query orphaned batch fix ([#846](https://github.com/doublewordai/control-layer/issues/846)) ([92976ef](https://github.com/doublewordai/control-layer/commit/92976ef00a05845ae76bd906c96b385271649be8))
+
+## [8.16.3](https://github.com/doublewordai/control-layer/compare/v8.16.2...v8.16.3) (2026-03-11)
+
+
+### Bug Fixes
+
+* trigger release for fusillade 8.1.0 claim performance fix ([#844](https://github.com/doublewordai/control-layer/issues/844)) ([b04a194](https://github.com/doublewordai/control-layer/commit/b04a19406c0af84f8080367da7829623b279b785))
+
+## [8.16.2](https://github.com/doublewordai/control-layer/compare/v8.16.1...v8.16.2) (2026-03-11)
+
+
+### Bug Fixes
+
+* populate all deployed models in daemon capacity limits ([#837](https://github.com/doublewordai/control-layer/issues/837)) ([b2a0f87](https://github.com/doublewordai/control-layer/commit/b2a0f87d8b5ccb58c73f4bafae4438141ecaef39))
+
+## [8.16.1](https://github.com/doublewordai/control-layer/compare/v8.16.0...v8.16.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* allow users to trigger a batch within their org ([#831](https://github.com/doublewordai/control-layer/issues/831)) ([974534b](https://github.com/doublewordai/control-layer/commit/974534b2635037e779ba773f18ab1aad46a4b6fd))
+
+## [8.16.0](https://github.com/doublewordai/control-layer/compare/v8.15.6...v8.16.0) (2026-03-10)
+
+
+### Features
+
+* auto top-up monthly spending limit ([#815](https://github.com/doublewordai/control-layer/issues/815)) ([6a0ab3a](https://github.com/doublewordai/control-layer/commit/6a0ab3a9163f8d768acdd5c2e2a39cc0a2a0daac))
+
+
+### Bug Fixes
+
+* bump onwards to 0.18.6 — preserve error code in strict mode ([#830](https://github.com/doublewordai/control-layer/issues/830)) ([2c9e2b4](https://github.com/doublewordai/control-layer/commit/2c9e2b454d6f4fa2dfc5896f899fc4768809e468))
+
+## [8.15.6](https://github.com/doublewordai/control-layer/compare/v8.15.5...v8.15.6) (2026-03-10)
+
+
+### Bug Fixes
+
+* warn when composite model has no enabled components (503) ([#827](https://github.com/doublewordai/control-layer/issues/827)) ([1253166](https://github.com/doublewordai/control-layer/commit/1253166aa34f410576e97d69bd2a5439ceb23953))
+
+## [8.15.5](https://github.com/doublewordai/control-layer/compare/v8.15.4...v8.15.5) (2026-03-09)
+
+
+### Bug Fixes
+
+* keep composite models in routing table when all components disabled ([#823](https://github.com/doublewordai/control-layer/issues/823)) ([f242540](https://github.com/doublewordai/control-layer/commit/f2425409d21617a9d713fddb3a023fb78031e0b2))
+
+## [8.15.4](https://github.com/doublewordai/control-layer/compare/v8.15.3...v8.15.4) (2026-03-09)
+
+
+### Bug Fixes
+
+* bump onwards to 0.18.4 ([#821](https://github.com/doublewordai/control-layer/issues/821)) ([a4aa262](https://github.com/doublewordai/control-layer/commit/a4aa262bc80b21d7ab116129932fbfdb793e10f1))
+
+## [8.15.3](https://github.com/doublewordai/control-layer/compare/v8.15.2...v8.15.3) (2026-03-09)
+
+
+### Bug Fixes
+
+* disambiguate scaled-down backend errors from upstream failures ([#819](https://github.com/doublewordai/control-layer/issues/819)) ([d9dc31f](https://github.com/doublewordai/control-layer/commit/d9dc31f10a1d1b44c8957a8021dde6cbb6986571))
+
+## [8.15.2](https://github.com/doublewordai/control-layer/compare/v8.15.1...v8.15.2) (2026-03-08)
+
+
+### Bug Fixes
+
+* validate endpoint-to-model-type matching in batch file uploads ([#813](https://github.com/doublewordai/control-layer/issues/813)) ([817cc03](https://github.com/doublewordai/control-layer/commit/817cc032cbd8ae1964181d53bc1ee6ad7016d42c))
+
+## [8.15.1](https://github.com/doublewordai/control-layer/compare/v8.15.0...v8.15.1) (2026-03-06)
+
+
+### Bug Fixes
+
+* cookie sync + file owner balance check ([#810](https://github.com/doublewordai/control-layer/issues/810)) ([da4a88e](https://github.com/doublewordai/control-layer/commit/da4a88e204cca9cc03f5ff01b819857694c160c4))
+
+## [8.15.0](https://github.com/doublewordai/control-layer/compare/v8.14.0...v8.15.0) (2026-03-06)
+
+
+### Features
+
+* auto top-up for credit balances ([#805](https://github.com/doublewordai/control-layer/issues/805)) ([957a1d5](https://github.com/doublewordai/control-layer/commit/957a1d53e6d3d53873e4e8db8270833846534bbd))
+
+## [8.14.0](https://github.com/doublewordai/control-layer/compare/v8.13.0...v8.14.0) (2026-03-06)
+
+
+### Features
+
+* add server-side filtering, sorting, and facets for models API ([#804](https://github.com/doublewordai/control-layer/issues/804)) ([a716b95](https://github.com/doublewordai/control-layer/commit/a716b95a62de2c60ec2d51743964f76e8b90e9cb))
+* migration and initial organisation backend infrastructure ([#797](https://github.com/doublewordai/control-layer/issues/797)) ([df159d9](https://github.com/doublewordai/control-layer/commit/df159d9d740992250b0e8532145686a68d6e5264))
+* organisation invites + views ([#801](https://github.com/doublewordai/control-layer/issues/801)) ([5ed7561](https://github.com/doublewordai/control-layer/commit/5ed7561c7f004eab533887bebc353cda39f4597b))
+
+## [8.13.0](https://github.com/doublewordai/control-layer/compare/v8.12.0...v8.13.0) (2026-03-04)
+
+
+### Features
+
+* support legacy /v1/completions endpoint ([#803](https://github.com/doublewordai/control-layer/issues/803)) ([78e1712](https://github.com/doublewordai/control-layer/commit/78e1712c20e5101589cd7f6d6563c75142ea2e03))
+
+
+### Bug Fixes
+
+* reject batch creation when account balance is negative ([#799](https://github.com/doublewordai/control-layer/issues/799)) ([64fa3f0](https://github.com/doublewordai/control-layer/commit/64fa3f0e7a8c6735464c42cf9da9166a1de5bbaf))
+
+## [8.12.0](https://github.com/doublewordai/control-layer/compare/v8.11.0...v8.12.0) (2026-03-03)
+
+
+### Features
+
+* Notify on low balance ([#786](https://github.com/doublewordai/control-layer/issues/786)) ([f77e436](https://github.com/doublewordai/control-layer/commit/f77e43694fd907238834630e5cfa28ab6083d68d))
+
+## [8.11.0](https://github.com/doublewordai/control-layer/compare/v8.10.2...v8.11.0) (2026-03-03)
+
+
+### Features
+
+* add model catalog metadata (JSONB) ([#790](https://github.com/doublewordai/control-layer/issues/790)) ([8a7c2f3](https://github.com/doublewordai/control-layer/commit/8a7c2f3b9c53f5af245af6831bd431b01e9b14d4))
+
+
+### Bug Fixes
+
+* always run batch completion poller for finalization ([#788](https://github.com/doublewordai/control-layer/issues/788)) ([1129bf5](https://github.com/doublewordai/control-layer/commit/1129bf56077c5073a441dff88fd139fd8053424e))
+* give sample files to oauth users ([#782](https://github.com/doublewordai/control-layer/issues/782)) ([fcbc342](https://github.com/doublewordai/control-layer/commit/fcbc342f57bb1a3ad74e5139ab69887ffca5b8d1))
+* set system API key purpose to platform for admin API access ([#778](https://github.com/doublewordai/control-layer/issues/778)) ([acf36c6](https://github.com/doublewordai/control-layer/commit/acf36c6ef9224b957f348d73336035df1d83df22))
+
+## [8.10.2](https://github.com/doublewordai/control-layer/compare/v8.10.1...v8.10.2) (2026-02-27)
+
+
+### Bug Fixes
+
+* bump onwards to 0.18.1 ([#780](https://github.com/doublewordai/control-layer/issues/780)) ([e06f05c](https://github.com/doublewordai/control-layer/commit/e06f05cae038b197665e15bead5ce627fde45dfd))
+
+## [8.10.1](https://github.com/doublewordai/control-layer/compare/v8.10.0...v8.10.1) (2026-02-26)
+
+
+### Bug Fixes
+
+* dont mark as finalising if the batch is marked failed ([#775](https://github.com/doublewordai/control-layer/issues/775)) ([1beb646](https://github.com/doublewordai/control-layer/commit/1beb646096d9e3324b5f6c284cf4d6e7a670d5f3))
+
+## [8.10.0](https://github.com/doublewordai/control-layer/compare/v8.9.0...v8.10.0) (2026-02-25)
+
+
+### Features
+
+* **dashboard:** use searchable combobox for redirect target ([#770](https://github.com/doublewordai/control-layer/issues/770)) ([0b3abb9](https://github.com/doublewordai/control-layer/commit/0b3abb9a1431e0525d6dd6e81936bdfc36dd9b18))
+
+
+### Bug Fixes
+
+* allow decimal throughput input ([#773](https://github.com/doublewordai/control-layer/issues/773)) ([109ddb9](https://github.com/doublewordai/control-layer/commit/109ddb9cedc209ea88e6c38ec80a1c87dc5eb7e4))
+* Bump onwards 0.18.0 ([#774](https://github.com/doublewordai/control-layer/issues/774)) ([1894bdb](https://github.com/doublewordai/control-layer/commit/1894bdbcb55fa44a36d3241fcd32d344f69da130))
+
+## [8.9.0](https://github.com/doublewordai/control-layer/compare/v8.8.1...v8.9.0) (2026-02-24)
+
+
+### Features
+
+* User usage dashboard ([#729](https://github.com/doublewordai/control-layer/issues/729)) ([34ca712](https://github.com/doublewordai/control-layer/commit/34ca712fdf750cc529bc9ede9842af0abca276cf))
+
+
+### Bug Fixes
+
+* Logging cleanup ([#764](https://github.com/doublewordai/control-layer/issues/764)) ([3a44a05](https://github.com/doublewordai/control-layer/commit/3a44a057354a5ef2e037d03158bd524ec35d75b1))
+
+## [8.8.1](https://github.com/doublewordai/control-layer/compare/v8.8.0...v8.8.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* align strict mode mount point with non-strict mode ([#767](https://github.com/doublewordai/control-layer/issues/767)) ([c8d8b6a](https://github.com/doublewordai/control-layer/commit/c8d8b6aa0db93636e778e33bf5168eba9ddef9eb))
+
+## [8.8.0](https://github.com/doublewordai/control-layer/compare/v8.7.1...v8.8.0) (2026-02-24)
+
+
+### Features
+
+* **dashboard:** add traffic routing rules and batch window UI ([#763](https://github.com/doublewordai/control-layer/issues/763)) ([adcfc96](https://github.com/doublewordai/control-layer/commit/adcfc960e43eacbc079cc366b8efafbd1be0a908))
+* **deployments:** filter batch tariffs by allowed completion windows ([#759](https://github.com/doublewordai/control-layer/issues/759)) ([3190e81](https://github.com/doublewordai/control-layer/commit/3190e81f90f274576cd13200564324c7eeb9fe01))
+* per completion window, acceptance relaxation factors ([#742](https://github.com/doublewordai/control-layer/issues/742)) ([15e5021](https://github.com/doublewordai/control-layer/commit/15e5021aa1ae08d923438c0623f953ebc667dc9f))
+
+
+### Bug Fixes
+
+* use fallback serialisation to extract model name where possible if deserialisation into standard openai type fails. ([#757](https://github.com/doublewordai/control-layer/issues/757)) ([e535e73](https://github.com/doublewordai/control-layer/commit/e535e732c1e7a784cae69996046e21b57846664e))
+
+## [8.7.1](https://github.com/doublewordai/control-layer/compare/v8.7.0...v8.7.1) (2026-02-24)
+
+
+### Bug Fixes
+
+* if statement in release ([#760](https://github.com/doublewordai/control-layer/issues/760)) ([00b5f16](https://github.com/doublewordai/control-layer/commit/00b5f163d0970652757589681bfd904f224057eb))
+
+## [8.7.0](https://github.com/doublewordai/control-layer/compare/v8.6.0...v8.7.0) (2026-02-24)
+
+
+### Features
+
+* add trusted provider flag for strict mode response sanitization ([#724](https://github.com/doublewordai/control-layer/issues/724)) ([1fb3703](https://github.com/doublewordai/control-layer/commit/1fb3703139d587220154ab56e5e237173a31eb12))
+* **billing:** add token usage extraction for OpenAI Responses API ([#753](https://github.com/doublewordai/control-layer/issues/753)) ([2258d24](https://github.com/doublewordai/control-layer/commit/2258d24b98efb63f1b9876a58a6affa0e4dc6889))
+* edit throughput in UI ([#722](https://github.com/doublewordai/control-layer/issues/722)) ([60fd5ec](https://github.com/doublewordai/control-layer/commit/60fd5ec498db4698f7a15b2f2bc5291e8c404862))
+
+## [8.6.0](https://github.com/doublewordai/control-layer/compare/v8.5.0...v8.6.0) (2026-02-23)
+
+
+### Features
+
+* per-model traffic routing rules and batch window control ([#743](https://github.com/doublewordai/control-layer/issues/743)) ([7163e75](https://github.com/doublewordai/control-layer/commit/7163e751a7d366929fe57e8f4a4692519c3c7c71))
+
+
+### Bug Fixes
+
+* **dev:** extra commas in just check ([#750](https://github.com/doublewordai/control-layer/issues/750)) ([12fdf56](https://github.com/doublewordai/control-layer/commit/12fdf56d56eb0108b64e02c39af7f220e79c403a))
+
+## [8.5.0](https://github.com/doublewordai/control-layer/compare/v8.4.1...v8.5.0) (2026-02-23)
+
+
+### Features
+
+* race condition guard on batch creation ([#723](https://github.com/doublewordai/control-layer/issues/723)) ([34d5340](https://github.com/doublewordai/control-layer/commit/34d5340e2c5afaed63df3c7d80911f7d0050ffdf))
+
+## [8.4.1](https://github.com/doublewordai/control-layer/compare/v8.4.0...v8.4.1) (2026-02-20)
+
+
+### Bug Fixes
+
+* Parameterise email templates to repair crate publishing ([#719](https://github.com/doublewordai/control-layer/issues/719)) ([4939b12](https://github.com/doublewordai/control-layer/commit/4939b12d0d68e740ff5c646d0ba1c913629c57c0))
+
+## [8.4.0](https://github.com/doublewordai/control-layer/compare/v8.3.0...v8.4.0) (2026-02-20)
+
+
+### Features
+
+* **playground:** stream reasoning tokens into collapsible thinking block ([#744](https://github.com/doublewordai/control-layer/issues/744)) ([943b9b2](https://github.com/doublewordai/control-layer/commit/943b9b2b6fdc2c1be41d095b6a658de6977d4b10))
+
+## [8.3.0](https://github.com/doublewordai/control-layer/compare/v8.2.0...v8.3.0) (2026-02-19)
+
+
+### Features
+
+* UI tweaks got merged onto a lost branch ([#740](https://github.com/doublewordai/control-layer/issues/740)) ([1c7445b](https://github.com/doublewordai/control-layer/commit/1c7445be50cddf23bc5ee7fb9950944e4f9bc1e3))
+
+## [8.2.0](https://github.com/doublewordai/control-layer/compare/v8.1.0...v8.2.0) (2026-02-19)
+
+
+### Features
+
+* persist models page filters across navigations ([#733](https://github.com/doublewordai/control-layer/issues/733)) ([dd7cc9d](https://github.com/doublewordai/control-layer/commit/dd7cc9df24dbb5cfaa744f770767c407e1711e12))
+
+## [8.1.0](https://github.com/doublewordai/control-layer/compare/v8.0.1...v8.1.0) (2026-02-19)
+
+
+### Features
+
+* make demo mode data more realistic ([#731](https://github.com/doublewordai/control-layer/issues/731)) ([17aa9bf](https://github.com/doublewordai/control-layer/commit/17aa9bf874b1c5251fc6e164d60f9a351fcfc01d))
+
+
+### Bug Fixes
+
+* advance to step 2 when manually configuring models in edit endpoint modal ([#728](https://github.com/doublewordai/control-layer/issues/728)) ([fdcf360](https://github.com/doublewordai/control-layer/commit/fdcf36051948ea61b478d5ec741824a23b461d90))
+* omit Secure attribute from cookies when cookie_secure is false ([#730](https://github.com/doublewordai/control-layer/issues/730)) ([e6f936e](https://github.com/doublewordai/control-layer/commit/e6f936ee0ccd2e62edcfca636668bd85d0cf4631))
+
+## [8.0.1](https://github.com/doublewordai/control-layer/compare/v8.0.0...v8.0.1) (2026-02-18)
+
+
+### Bug Fixes
+
+* bump onwards to 0.15.1 ([#726](https://github.com/doublewordai/control-layer/issues/726)) ([b567f15](https://github.com/doublewordai/control-layer/commit/b567f1512ebc9ecdfcb719f7f4ff80ca4c0829bc))
+
+## [8.0.0](https://github.com/doublewordai/control-layer/compare/v7.5.1...v8.0.0) (2026-02-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711))
+
+### Features
+
+* add OpenAPI docs for Responses API ([#713](https://github.com/doublewordai/control-layer/issues/713)) ([ec3a49b](https://github.com/doublewordai/control-layer/commit/ec3a49ba2509bf2aa9802916563e09693f70d8df))
+* move from SLA to Priority ([#711](https://github.com/doublewordai/control-layer/issues/711)) ([1ee7f63](https://github.com/doublewordai/control-layer/commit/1ee7f63bfdcc88111b3c7f80919eb72bf3e4fe6d))
+
+## [7.5.1](https://github.com/doublewordai/control-layer/compare/v7.5.0...v7.5.1) (2026-02-17)
+
+
+### Bug Fixes
+
+* bump onwards to 0.14.0 for TCP keepalive ([#720](https://github.com/doublewordai/control-layer/issues/720)) ([54f4d6c](https://github.com/doublewordai/control-layer/commit/54f4d6c35fa853cb0fc86080599fd0d4dbb5b01c))
+* escalation and finalization management ([#715](https://github.com/doublewordai/control-layer/issues/715)) ([337810f](https://github.com/doublewordai/control-layer/commit/337810fd61c6230f9ab2e09a6f1395ef1b325533))
+* reenable tracing by adding tls support for reqwest 12 ([#718](https://github.com/doublewordai/control-layer/issues/718)) ([cade847](https://github.com/doublewordai/control-layer/commit/cade847530033d6b5204708ff8e66b9800e66bea))
+
+## [7.5.0](https://github.com/doublewordai/control-layer/compare/v7.4.1...v7.5.0) (2026-02-17)
+
+
+### Features
+
+* support with-replacement sampling for weighted random failover ([#704](https://github.com/doublewordai/control-layer/issues/704)) ([3c4fb9b](https://github.com/doublewordai/control-layer/commit/3c4fb9b97affac993e24595e337a457fe22449d0))
+
+## [7.4.1](https://github.com/doublewordai/control-layer/compare/v7.4.0...v7.4.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* allow model selection beyond combobox initial list ([#707](https://github.com/doublewordai/control-layer/issues/707)) ([48029ff](https://github.com/doublewordai/control-layer/commit/48029ff38b6f8d80eccb634f12309f3306939a42)), closes [#623](https://github.com/doublewordai/control-layer/issues/623)
+* clean up log lines + inherit trace id from fusillade ([#706](https://github.com/doublewordai/control-layer/issues/706)) ([6ff2949](https://github.com/doublewordai/control-layer/commit/6ff29496f1497aee317b1b05e90e0043515e9167))
+
+## [7.4.0](https://github.com/doublewordai/control-layer/compare/v7.3.1...v7.4.0) (2026-02-16)
+
+
+### Features
+
+* Webhooks ([#684](https://github.com/doublewordai/control-layer/issues/684)) ([60d1b4e](https://github.com/doublewordai/control-layer/commit/60d1b4ec2a5fb32cb72ebd7cc3e800cf36294733))
+
+
+### Bug Fixes
+
+* bump fusillade 5.4.2 ([#705](https://github.com/doublewordai/control-layer/issues/705)) ([f69d132](https://github.com/doublewordai/control-layer/commit/f69d1326742a6f0a31ff77e78c2545414a4e5d4e))
+* more reqwest problems with otel ([#689](https://github.com/doublewordai/control-layer/issues/689)) ([8fc1761](https://github.com/doublewordai/control-layer/commit/8fc1761c9a1edcdf15b7974779a8f91f32a5d883))
+* Stream usage transform ([#701](https://github.com/doublewordai/control-layer/issues/701)) ([770f281](https://github.com/doublewordai/control-layer/commit/770f2817a4aa729dbe836198522809893ba99160))
+
+## [7.3.1](https://github.com/doublewordai/control-layer/compare/v7.3.0...v7.3.1) (2026-02-16)
+
+
+### Bug Fixes
+
+* **batch:** support /v1/responses via configured allowlist ([#667](https://github.com/doublewordai/control-layer/issues/667)) ([233c95d](https://github.com/doublewordai/control-layer/commit/233c95dafa69b147e683f2dbe2d31d1a6bb30d40))
+* cancel shutdown token before axum graceful shutdown ([#699](https://github.com/doublewordai/control-layer/issues/699)) ([d9f56e7](https://github.com/doublewordai/control-layer/commit/d9f56e73e3e731c0598814057ff1cd0f5b4180f2))
+
+## [7.3.0](https://github.com/doublewordai/control-layer/compare/v7.2.0...v7.3.0) (2026-02-13)
+
+
+### Features
+
+* New bootstrap content ([#696](https://github.com/doublewordai/control-layer/issues/696)) ([fea21b0](https://github.com/doublewordai/control-layer/commit/fea21b00a20106d4b9573c53ab6ad48c774e399d))
+
+
+### Bug Fixes
+
+* filter stale daemons from running count in model info ([#697](https://github.com/doublewordai/control-layer/issues/697)) ([6adde1c](https://github.com/doublewordai/control-layer/commit/6adde1cb578665955ca88b6ac3c421ff44e64410))
+
+## [7.2.0](https://github.com/doublewordai/control-layer/compare/v7.1.0...v7.2.0) (2026-02-13)
+
+
+### Features
+
+* **dashboard:** show per-daemon batch concurrency in model info ([#694](https://github.com/doublewordai/control-layer/issues/694)) ([672901e](https://github.com/doublewordai/control-layer/commit/672901e14a0a125eb6e904a35149e27ef078fb75))
+
+
+### Bug Fixes
+
+* bump fusillade to 3.5.1 ([#692](https://github.com/doublewordai/control-layer/issues/692)) ([35ef5f8](https://github.com/doublewordai/control-layer/commit/35ef5f86d11230654961513e0ae494e621c4082b))
+
+## [7.1.0](https://github.com/doublewordai/control-layer/compare/v7.0.1...v7.1.0) (2026-02-13)
+
+
+### Features
+
+* add Prometheus info/gauge metrics for onwards cache state ([#686](https://github.com/doublewordai/control-layer/issues/686)) ([cf9e5ea](https://github.com/doublewordai/control-layer/commit/cf9e5eac2de82f3a498b688f685e641de65afff6))
+
+
+### Bug Fixes
+
+* add purge config to daemon config structs ([#690](https://github.com/doublewordai/control-layer/issues/690)) ([4ec8c38](https://github.com/doublewordai/control-layer/commit/4ec8c380351bdc8d573e7cad81d5576bc8bfab87))
+* stream batch results and file content to prevent OOM ([#662](https://github.com/doublewordai/control-layer/issues/662)) ([765f951](https://github.com/doublewordai/control-layer/commit/765f9511444961357e942427d2a98b3b74caaac5))
+
+## [7.0.1](https://github.com/doublewordai/control-layer/compare/v7.0.0...v7.0.1) (2026-02-12)
+
+
+### Bug Fixes
+
+* instantiate tls client as the very first thing ([#687](https://github.com/doublewordai/control-layer/issues/687)) ([895cfab](https://github.com/doublewordai/control-layer/commit/895cfab5fd939467597225336292b3b5662c2b29))
+
+## [7.0.0](https://github.com/doublewordai/control-layer/compare/v6.1.0...v7.0.0) (2026-02-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* email is now its own config, rather than a property of native_auth ([#685](https://github.com/doublewordai/control-layer/issues/685))
+* consolidate dashboard URL into single top-level config field ([#677](https://github.com/doublewordai/control-layer/issues/677))
+
+### Features
+
+* add per-request body size limit for batch file uploads ([#674](https://github.com/doublewordai/control-layer/issues/674)) ([6b91ee1](https://github.com/doublewordai/control-layer/commit/6b91ee1aeb76561c92ff0bf0fc4a66a34cc73e70))
+* add rate limiting and fallback sync for onwards notifications ([#676](https://github.com/doublewordai/control-layer/issues/676)) ([9f7431d](https://github.com/doublewordai/control-layer/commit/9f7431dd772b1fab682cbf9ba0fbc5af392beb47))
+* Consent banner ([#654](https://github.com/doublewordai/control-layer/issues/654)) ([7663d8f](https://github.com/doublewordai/control-layer/commit/7663d8f1ee123306d65eb701a5da1d68c8397ed3))
+* consolidate dashboard URL into single top-level config field ([#677](https://github.com/doublewordai/control-layer/issues/677)) ([9480826](https://github.com/doublewordai/control-layer/commit/9480826ee20d819589676b6c3d6f8101d163fe72))
+* email is now its own config, rather than a property of native_auth ([#685](https://github.com/doublewordai/control-layer/issues/685)) ([2569bd6](https://github.com/doublewordai/control-layer/commit/2569bd669e7d2bb600f9b075e4e5b3d7ad4495e0))
+* lazy-load model analytics on Models page ([#675](https://github.com/doublewordai/control-layer/issues/675)) ([728fb76](https://github.com/doublewordai/control-layer/commit/728fb769bb5a26294df734af0d62eaaec1bf1686))
+* Send email notifications to users on batch completions, optionally. Poll batches for completion rather than just calculate on query. ([#659](https://github.com/doublewordai/control-layer/issues/659)) ([00ae12b](https://github.com/doublewordai/control-layer/commit/00ae12bf9f5d6b3fa9da21d052870f1124ba979b))
+
+
+### Bug Fixes
+
+* align TraceLayer with OpenTelemetry HTTP semantic conventions ([#682](https://github.com/doublewordai/control-layer/issues/682)) ([94e61d2](https://github.com/doublewordai/control-layer/commit/94e61d25c073594bba75fd0caa0278d9b0a19917))
+* bump fusillade ([#683](https://github.com/doublewordai/control-layer/issues/683)) ([d7721fb](https://github.com/doublewordai/control-layer/commit/d7721fb16b35ee2de0b53584b9757eece1f284d7))
+* path extraction for endpoint access checks must use unstripped paths ([#660](https://github.com/doublewordai/control-layer/issues/660)) ([b796bc2](https://github.com/doublewordai/control-layer/commit/b796bc2f89274e39128afa52ee89fcaef99a8c3f))
+* Repair tracing by fixing otel package incompatability; add trace ids back to spans. ([#663](https://github.com/doublewordai/control-layer/issues/663)) ([3a45940](https://github.com/doublewordai/control-layer/commit/3a45940724a7514cf87c7f72692a036dbde2a325))
+
+## [6.1.0](https://github.com/doublewordai/control-layer/compare/v6.0.0...v6.1.0) (2026-02-09)
+
+
+### Features
+
+* batch acceptance criteria (part 1) ([#658](https://github.com/doublewordai/control-layer/issues/658)) ([61a3f93](https://github.com/doublewordai/control-layer/commit/61a3f93bf156eb34d4efd29b34b779a9efa53a39))
+
+
+### Bug Fixes
+
+* better handling of large file errors ([#669](https://github.com/doublewordai/control-layer/issues/669)) ([fe44b81](https://github.com/doublewordai/control-layer/commit/fe44b81f09c047e4ad35c2839e06b8ff62ecf905))
+* bump fusillade to 5.1.0 ([#672](https://github.com/doublewordai/control-layer/issues/672)) ([c6cda1e](https://github.com/doublewordai/control-layer/commit/c6cda1ee72e406879dfda2128c64e283a6148b42))
+* default throughput ([#665](https://github.com/doublewordai/control-layer/issues/665)) ([606a114](https://github.com/doublewordai/control-layer/commit/606a1142fec0ae17adad796fc8237fa1e6d8ca38))
+
+## [6.0.0](https://github.com/doublewordai/control-layer/compare/v5.0.3...v6.0.0) (2026-02-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* add queue monitoring endpoint for pending request counts ([#636](https://github.com/doublewordai/control-layer/issues/636))
+
+### Features
+
+* add queue monitoring endpoint for pending request counts ([#636](https://github.com/doublewordai/control-layer/issues/636)) ([54829c5](https://github.com/doublewordai/control-layer/commit/54829c544fc5fe68ddc9d5d52f6bc443e092eeb7))
+* Improve tracing interconnectedness, make labels consistent ([#642](https://github.com/doublewordai/control-layer/issues/642)) ([1a2a60f](https://github.com/doublewordai/control-layer/commit/1a2a60fd60614aa932f448041680189fe9caf87f))
+
+
+### Bug Fixes
+
+* pass escalations models into composite models query to give batch API keys access ([#657](https://github.com/doublewordai/control-layer/issues/657)) ([8cb42bf](https://github.com/doublewordai/control-layer/commit/8cb42bf97e8e4b41400eb7cfce4e849ca76b139b))
+* tracing verbosity ([#656](https://github.com/doublewordai/control-layer/issues/656)) ([9b5c95e](https://github.com/doublewordai/control-layer/commit/9b5c95e141992534411964a9d3600ad6324b15f7))
+
+
+### Performance Improvements
+
+* use cargo-chef for Docker build caching ([#632](https://github.com/doublewordai/control-layer/issues/632)) ([bc06586](https://github.com/doublewordai/control-layer/commit/bc06586321e65b87ea639da1a5ccb96fbefad3e9))
+
+## [5.0.3](https://github.com/doublewordai/control-layer/compare/v5.0.2...v5.0.3) (2026-01-30)
+
+
+### Bug Fixes
+
+* 100 pagination ([#638](https://github.com/doublewordai/control-layer/issues/638)) ([dc06510](https://github.com/doublewordai/control-layer/commit/dc06510a3ef3c2d63ba303d10b737ff3f0752dec))
+* don't query all deployments in file estimate ([#641](https://github.com/doublewordai/control-layer/issues/641)) ([ce9b2a5](https://github.com/doublewordai/control-layer/commit/ce9b2a55da4597a152380c3ecd63b02832665303))
+
+## [5.0.2](https://github.com/doublewordai/control-layer/compare/v5.0.1...v5.0.2) (2026-01-29)
+
+
+### Bug Fixes
+
+* **batches:** use fusillade sla based error filtering from dwctl handlers ([#624](https://github.com/doublewordai/control-layer/issues/624)) ([8812d06](https://github.com/doublewordai/control-layer/commit/8812d06f0ac9b069075290e6325d74802d41738e))
+
+## [5.0.1](https://github.com/doublewordai/control-layer/compare/v5.0.0...v5.0.1) (2026-01-28)
+
+
+### Bug Fixes
+
+* optimize balance threshold notifications for batch inserts ([#630](https://github.com/doublewordai/control-layer/issues/630)) ([9e39939](https://github.com/doublewordai/control-layer/commit/9e39939a321c29fdfc0d43c0331d10199dfa6d16))
+
+## [5.0.0](https://github.com/doublewordai/control-layer/compare/v4.1.0...v5.0.0) (2026-01-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627))
+
+### Features
+
+* update to fusillade 3.0.1 with route-at-claim-time escalation ([#627](https://github.com/doublewordai/control-layer/issues/627)) ([21ea357](https://github.com/doublewordai/control-layer/commit/21ea357561b88129c9436801adce1732f70e32aa))
+
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/v4.0.0...v4.1.0) (2026-01-28)
+
+
+### Features
+
+* decouple analytics from request logging with write-through batching ([#603](https://github.com/doublewordai/control-layer/issues/603)) ([1869a3a](https://github.com/doublewordai/control-layer/commit/1869a3a9b0cf7525a22ce4dc213f4127282c6e46))
+
+
+### Bug Fixes
+
+* bump fusillade ([#626](https://github.com/doublewordai/control-layer/issues/626)) ([bf8ac6b](https://github.com/doublewordai/control-layer/commit/bf8ac6bd9f001b33f7f991f39bf737f879248c2f))
+
+## [4.0.0](https://github.com/doublewordai/control-layer/compare/v3.3.1...v4.0.0) (2026-01-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* File limits configuration has been reorganized.
+
+### Features
+
+* consolidate file limits config and add max_requests_per_file ([#617](https://github.com/doublewordai/control-layer/issues/617)) ([7bd0ee3](https://github.com/doublewordai/control-layer/commit/7bd0ee304bbb2cefb02afec85f230d824f9daf3c))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#621](https://github.com/doublewordai/control-layer/issues/621)) ([52d8e8e](https://github.com/doublewordai/control-layer/commit/52d8e8ea9d5fe224c2ec9beaa5b26c91dcbd65b8))
+
+## [3.3.1](https://github.com/doublewordai/control-layer/compare/v3.3.0...v3.3.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* sync package-lock.json with package.json ([fa3c491](https://github.com/doublewordai/control-layer/commit/fa3c491a0b25227af8bc9d3efbcb9b13717b28c8))
+
+## [3.3.0](https://github.com/doublewordai/control-layer/compare/v3.2.0...v3.3.0) (2026-01-27)
+
+
+### Features
+
+* add configurable file upload concurrency limits ([#614](https://github.com/doublewordai/control-layer/issues/614)) ([67065a3](https://github.com/doublewordai/control-layer/commit/67065a36e8deb10554a3b9cf91a176f206e90496))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.563.0 ([#579](https://github.com/doublewordai/control-layer/issues/579)) ([ff714a2](https://github.com/doublewordai/control-layer/commit/ff714a23bb68d79118cd8d4b35b0576aa1948560))
+
+## [3.2.0](https://github.com/doublewordai/control-layer/compare/v3.1.2...v3.2.0) (2026-01-27)
+
+
+### Features
+
+* Bootstrap content ([#611](https://github.com/doublewordai/control-layer/issues/611)) ([377e22d](https://github.com/doublewordai/control-layer/commit/377e22ddb39194467012260030be4774439f62e3))
+* upgrade fusillade to 2.3.0 ([#613](https://github.com/doublewordai/control-layer/issues/613)) ([28862ff](https://github.com/doublewordai/control-layer/commit/28862ff27d1c2d73eb954a9687f8b3b3755f06e9))
+
+
+### Bug Fixes
+
+* don't show errors before SLA completion  ([#606](https://github.com/doublewordai/control-layer/issues/606)) ([f76fa5f](https://github.com/doublewordai/control-layer/commit/f76fa5f570c23c65a79bf39962f521bd2fb8934b))
+
+## [3.1.2](https://github.com/doublewordai/control-layer/compare/v3.1.1...v3.1.2) (2026-01-26)
+
+
+### Bug Fixes
+
+* remove cost estimate column from files table ([#609](https://github.com/doublewordai/control-layer/issues/609)) ([1b31dc8](https://github.com/doublewordai/control-layer/commit/1b31dc8db7903209a57342769c257c2e6644560b))
+
+## [3.1.1](https://github.com/doublewordai/control-layer/compare/v3.1.0...v3.1.1) (2026-01-26)
+
+
+### Performance Improvements
+
+* defer files query until files tab is active on batches page ([#607](https://github.com/doublewordai/control-layer/issues/607)) ([d060328](https://github.com/doublewordai/control-layer/commit/d060328b22bf534e3e7ca35ecd9a28c955aad347))
+
+## [3.1.0](https://github.com/doublewordai/control-layer/compare/v3.0.1...v3.1.0) (2026-01-26)
+
+
+### Features
+
+* add include=analytics to batches list endpoint ([#602](https://github.com/doublewordai/control-layer/issues/602)) ([36f5ff1](https://github.com/doublewordai/control-layer/commit/36f5ff153ce5c21beba52d73d7dee89c595218b7))
+
+## [3.0.1](https://github.com/doublewordai/control-layer/compare/v3.0.0...v3.0.1) (2026-01-26)
+
+
+### Bug Fixes
+
+* use eager connection for schema pools to respect min_connections ([#600](https://github.com/doublewordai/control-layer/issues/600)) ([ac96ba0](https://github.com/doublewordai/control-layer/commit/ac96ba05fd32b4ba4e83efa3b53a164a8673ff49))
+
+## [3.0.0](https://github.com/doublewordai/control-layer/compare/v2.9.2...v3.0.0) (2026-01-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595))
+
+### Features
+
+* add pool exhaustion error handling with 503 response ([#597](https://github.com/doublewordai/control-layer/issues/597)) ([80230ac](https://github.com/doublewordai/control-layer/commit/80230ac868b7d964a711f27bdbfc811124d2c388))
+* add runtime config for AI API base URL ([#595](https://github.com/doublewordai/control-layer/issues/595)) ([1bda2ff](https://github.com/doublewordai/control-layer/commit/1bda2ff519ee9fb4f29280fdee62df68cdfa4f3b))
+* decouple analytics/billing from request logging ([#596](https://github.com/doublewordai/control-layer/issues/596)) ([7846dac](https://github.com/doublewordai/control-layer/commit/7846dac137088ab51aa32a181c3dd7d3fe65e19e))
+
+
+### Bug Fixes
+
+* remove super-slow log statement in transaction writing ([#599](https://github.com/doublewordai/control-layer/issues/599)) ([443d0f4](https://github.com/doublewordai/control-layer/commit/443d0f46071b2092ea5c8d2875441f0a4defa2c5))
+
+## [2.9.2](https://github.com/doublewordai/control-layer/compare/v2.9.1...v2.9.2) (2026-01-24)
+
+
+### Bug Fixes
+
+* use get file from primary pool to avoid any internal lag and errors ([#591](https://github.com/doublewordai/control-layer/issues/591)) ([cfa56ef](https://github.com/doublewordai/control-layer/commit/cfa56ef9d8136304cff5205a5c4644dac2961009))
+
+## [2.9.1](https://github.com/doublewordai/control-layer/compare/v2.9.0...v2.9.1) (2026-01-23)
+
+
+### Bug Fixes
+
+* write pool for get file right after creation, due to tx race conditions ([#588](https://github.com/doublewordai/control-layer/issues/588)) ([3a2b35f](https://github.com/doublewordai/control-layer/commit/3a2b35f4e94f1a77cbf310150d6ac0c24ab02723))
+
+## [2.9.0](https://github.com/doublewordai/control-layer/compare/v2.8.0...v2.9.0) (2026-01-23)
+
+
+### Features
+
+* add model filtering by group ([#586](https://github.com/doublewordai/control-layer/issues/586)) ([0be0ef3](https://github.com/doublewordai/control-layer/commit/0be0ef336ef0bc5019cbc66fbcf8b92f2ce7b28e))
+
+## [2.8.0](https://github.com/doublewordai/control-layer/compare/v2.7.2...v2.8.0) (2026-01-23)
+
+
+### Features
+
+* batched inserts in fusillade ([#583](https://github.com/doublewordai/control-layer/issues/583)) ([98bc430](https://github.com/doublewordai/control-layer/commit/98bc430855aada8351226203a2ab11c935868d41))
+* speed up tests and simplify database handling, also add read and write pool for outlet ([#580](https://github.com/doublewordai/control-layer/issues/580)) ([51f25af](https://github.com/doublewordai/control-layer/commit/51f25aff0d14575c60867b67582eade80e902e9b))
+
+## [2.7.2](https://github.com/doublewordai/control-layer/compare/v2.7.1...v2.7.2) (2026-01-22)
+
+
+### Bug Fixes
+
+* handle search path at connection time rather then after ([aa9c796](https://github.com/doublewordai/control-layer/commit/aa9c79648fc5083ee56dacacb679b615dfc059b5))
+* make test go zoom, remove sleep behavior in as many unit tests as possible ([#575](https://github.com/doublewordai/control-layer/issues/575)) ([d0adb91](https://github.com/doublewordai/control-layer/commit/d0adb91d8b97d359d50eca1e328aac80f28c20f5))
+
+## [2.7.1](https://github.com/doublewordai/control-layer/compare/v2.7.0...v2.7.1) (2026-01-21)
+
+
+### Bug Fixes
+
+* revert onwards sync to use main pool due to listen notify ([032b58c](https://github.com/doublewordai/control-layer/commit/032b58cab7afc1ebe65b64e4026722a58aeb54bf))
+
+## [2.7.0](https://github.com/doublewordai/control-layer/compare/v2.6.0...v2.7.0) (2026-01-21)
+
+
+### Features
+
+* implement read and write connections across handlers and tests ([#569](https://github.com/doublewordai/control-layer/issues/569)) ([405f33d](https://github.com/doublewordai/control-layer/commit/405f33df0c1343979be41e566addb85b7b6710cb))
+
+## [2.6.0](https://github.com/doublewordai/control-layer/compare/v2.5.2...v2.6.0) (2026-01-21)
+
+
+### Features
+
+* add is_internal, batch_metadata_request_origin columns and remove denormalized PII ([#567](https://github.com/doublewordai/control-layer/issues/567)) ([566824f](https://github.com/doublewordai/control-layer/commit/566824f30054d98621853cdf654d13694f9ef45b))
+
+
+### Bug Fixes
+
+* better column name and removed unnecessary email join ([#570](https://github.com/doublewordai/control-layer/issues/570)) ([fb8c1e2](https://github.com/doublewordai/control-layer/commit/fb8c1e24b64bb81143104c8a8f5af63bec5c2784))
+
+## [2.5.2](https://github.com/doublewordai/control-layer/compare/v2.5.1...v2.5.2) (2026-01-21)
+
+
+### Bug Fixes
+
+* add top level replica url to help parsing ([#565](https://github.com/doublewordai/control-layer/issues/565)) ([90882a8](https://github.com/doublewordai/control-layer/commit/90882a8206732903e137337e3bbdded7f39588d5))
+
+## [2.5.1](https://github.com/doublewordai/control-layer/compare/v2.5.0...v2.5.1) (2026-01-20)
+
+
+### Bug Fixes
+
+* added file upload UX parity to create batch modal ([#563](https://github.com/doublewordai/control-layer/issues/563)) ([c9fc647](https://github.com/doublewordai/control-layer/commit/c9fc64761e14c9f2c50600a6a663ee883229aee7))
+
+## [2.5.0](https://github.com/doublewordai/control-layer/compare/v2.4.2...v2.5.0) (2026-01-20)
+
+
+### Features
+
+* add replicas to schema database mode and optional parameters to set both replicas independently ([#561](https://github.com/doublewordai/control-layer/issues/561)) ([0cefcfc](https://github.com/doublewordai/control-layer/commit/0cefcfcb130a5af718baa0a02c856b3f2bd34423))
+
+## [2.4.2](https://github.com/doublewordai/control-layer/compare/v2.4.1...v2.4.2) (2026-01-20)
+
+
+### Bug Fixes
+
+* UX bug responses still showing error ([#557](https://github.com/doublewordai/control-layer/issues/557)) ([a61b6fc](https://github.com/doublewordai/control-layer/commit/a61b6fc23c449ff923a7e46959f2fa290cfd0d07))
+
+## [2.4.1](https://github.com/doublewordai/control-layer/compare/v2.4.0...v2.4.1) (2026-01-19)
+
+
+### Bug Fixes
+
+* bump fusillade ([#555](https://github.com/doublewordai/control-layer/issues/555)) ([aa0fbfb](https://github.com/doublewordai/control-layer/commit/aa0fbfb4ade75eb6c27f81e2a9b05dbf6bae0a10))
+
+## [2.4.0](https://github.com/doublewordai/control-layer/compare/v2.3.0...v2.4.0) (2026-01-19)
+
+
+### Features
+
+* remove unique filename constraint on files ([#548](https://github.com/doublewordai/control-layer/issues/548)) ([2a47665](https://github.com/doublewordai/control-layer/commit/2a476658f4521802ecead5bff89bef82cf7eb72c))
+
+
+### Bug Fixes
+
+* check we'll be able to serialize custom ids at inference time ([#549](https://github.com/doublewordai/control-layer/issues/549)) ([2ba2beb](https://github.com/doublewordai/control-layer/commit/2ba2bebea075ec44c7ae48ab5874ed941324c689))
+
+## [2.3.0](https://github.com/doublewordai/control-layer/compare/v2.2.0...v2.3.0) (2026-01-19)
+
+
+### Features
+
+* **batches:** show batch creator in platform manager UI ([#541](https://github.com/doublewordai/control-layer/issues/541)) ([bf46658](https://github.com/doublewordai/control-layer/commit/bf46658af06bb502d9f359b24aca150352d67d5d))
+
+## [2.2.0](https://github.com/doublewordai/control-layer/compare/v2.1.1...v2.2.0) (2026-01-16)
+
+
+### Features
+
+* add sanitization response option in for models ([#542](https://github.com/doublewordai/control-layer/issues/542)) ([77e71f1](https://github.com/doublewordai/control-layer/commit/77e71f13a9519524c53a4f70448aafc011daee9c))
+
+## [2.1.1](https://github.com/doublewordai/control-layer/compare/v2.1.0...v2.1.1) (2026-01-16)
+
+
+### Bug Fixes
+
+* use exact alias match for tariff lookup ([#544](https://github.com/doublewordai/control-layer/issues/544)) ([5a568de](https://github.com/doublewordai/control-layer/commit/5a568deab85422b1f587de51e013e593060ccd96))
+
+## [2.1.0](https://github.com/doublewordai/control-layer/compare/v2.0.0...v2.1.0) (2026-01-15)
+
+
+### Features
+
+* trigger deployment on release ([#538](https://github.com/doublewordai/control-layer/issues/538)) ([0a43fe5](https://github.com/doublewordai/control-layer/commit/0a43fe5332b08725fe8f7e8d85d8d95aa33b71ee))
+
+
+### Bug Fixes
+
+* **dashboard:** pass is_composite filter to models API ([#536](https://github.com/doublewordai/control-layer/issues/536)) ([1ae2181](https://github.com/doublewordai/control-layer/commit/1ae2181be23913cc1710dcd03ad91d4801ec069c))
+
+## [2.0.0](https://github.com/doublewordai/control-layer/compare/v1.3.0...v2.0.0) (2026-01-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* This release includes composite/virtual models which changes the API surface for model management.
+
+### Features
+
+* update Cargo.lock for composite models release ([27da89b](https://github.com/doublewordai/control-layer/commit/27da89b2389cba71f140369d7bcd062c0263c2b0))
+
+
+### Bug Fixes
+
+* hide virtual model information from non-platform managers ([#534](https://github.com/doublewordai/control-layer/issues/534)) ([281ba66](https://github.com/doublewordai/control-layer/commit/281ba66f1a1e48b6cccfbae31925779f21996369))
+
+## [1.3.0](https://github.com/doublewordai/control-layer/compare/v1.2.0...v1.3.0) (2026-01-15)
+
+
+### Features
+
+* Batch request origin in metadata and displayed in transactions history ([#530](https://github.com/doublewordai/control-layer/issues/530)) ([d8ad5a3](https://github.com/doublewordai/control-layer/commit/d8ad5a302c75ce5b110f65b63b772924724f8e51))
+
+## [1.2.0](https://github.com/doublewordai/control-layer/compare/v1.1.2...v1.2.0) (2026-01-15)
+
+
+### Features
+
+* add composite models for weighted provider load balancing ([#532](https://github.com/doublewordai/control-layer/issues/532)) ([93cfbca](https://github.com/doublewordai/control-layer/commit/93cfbca9de7f2dc0d9817330370f3e21125a5130))
+* Transaction types ([#518](https://github.com/doublewordai/control-layer/issues/518)) ([c9ddf14](https://github.com/doublewordai/control-layer/commit/c9ddf14912b168e06f5821f57ebf01cd6a849be4))
+
+
+### Bug Fixes
+
+* sum_recent_transactions_grouped includes batch_aggregates ([#531](https://github.com/doublewordai/control-layer/issues/531)) ([4a50c31](https://github.com/doublewordai/control-layer/commit/4a50c31fada2387724c88cc04326d917fb743d79))
+
+## [1.1.2](https://github.com/doublewordai/control-layer/compare/v1.1.1...v1.1.2) (2026-01-14)
+
+
+### Bug Fixes
+
+* Billing portal support ([#526](https://github.com/doublewordai/control-layer/issues/526)) ([821845d](https://github.com/doublewordai/control-layer/commit/821845d39e76fb75bafb4d2eec29c0c9083e5979))
+
+## [1.1.1](https://github.com/doublewordai/control-layer/compare/v1.1.0...v1.1.1) (2026-01-14)
+
+
+### Bug Fixes
+
+* icons ([#522](https://github.com/doublewordai/control-layer/issues/522)) ([2ec4914](https://github.com/doublewordai/control-layer/commit/2ec491454c2aa3242692175a3cf26d2aa6b4b1ef))
+* weird stripe api restraint ([#523](https://github.com/doublewordai/control-layer/issues/523)) ([cbe7b3f](https://github.com/doublewordai/control-layer/commit/cbe7b3f06e8a0c87d05f9221eb2f7e4282f2b61e))
+
+## [1.1.0](https://github.com/doublewordai/control-layer/compare/v1.0.0...v1.1.0) (2026-01-14)
+
+
+### Features
+
+* show both slas on model summaries ([#517](https://github.com/doublewordai/control-layer/issues/517)) ([908688c](https://github.com/doublewordai/control-layer/commit/908688c45435d7df3e5595141c94f0d86e00dbc6))
+
+
+### Bug Fixes
+
+* return to details and result count links ([#514](https://github.com/doublewordai/control-layer/issues/514)) ([e315fee](https://github.com/doublewordai/control-layer/commit/e315fee4b79f6d179065f9571df03cdd6ef7e1d9))
+
+## [1.0.0](https://github.com/doublewordai/control-layer/compare/v0.29.0...v1.0.0) (2026-01-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* move to fusillade 1.0.0 and move to model escalations [#513](https://github.com/doublewordai/control-layer/issues/513)
+
+### Features
+
+* move to fusillade 1.0.0 and move to model escalations [[#513](https://github.com/doublewordai/control-layer/issues/513)](https://github.com/doublewordai/control-layer/issues/513) ([61ac5e3](https://github.com/doublewordai/control-layer/commit/61ac5e35835f108a28873bc04f728a9e605cad2e))
+
+
+### Bug Fixes
+
+* move to fusillade 1.0.0 and move to model escalations ([#513](https://github.com/doublewordai/control-layer/issues/513)) ([a01e218](https://github.com/doublewordai/control-layer/commit/a01e21814113f0af6fe85822881a8e69d9b6777c))
+
+## [0.29.0](https://github.com/doublewordai/control-layer/compare/v0.28.3...v0.29.0) (2026-01-12)
+
+
+### Features
+
+* Batch request results view ([#484](https://github.com/doublewordai/control-layer/issues/484)) ([05fcf6f](https://github.com/doublewordai/control-layer/commit/05fcf6f17a92d8c62ba82d98294e50fc27ddfd49))
+
+
+### Bug Fixes
+
+* fixed progress bar round down for batch details page also ([#507](https://github.com/doublewordai/control-layer/issues/507)) ([da1dd84](https://github.com/doublewordai/control-layer/commit/da1dd845637af2fc783a10d41c35689ff715012d))
+
+## [0.28.3](https://github.com/doublewordai/control-layer/compare/v0.28.2...v0.28.3) (2026-01-12)
+
+
+### Bug Fixes
+
+* need to expose certain custom headers when using cors (blocked by bro… ([#505](https://github.com/doublewordai/control-layer/issues/505)) ([dfd7694](https://github.com/doublewordai/control-layer/commit/dfd76942ff5cc3163c2ceec4ce28b3ea9d86396d))
+
+## [0.28.2](https://github.com/doublewordai/control-layer/compare/v0.28.1...v0.28.2) (2026-01-09)
+
+
+### Bug Fixes
+
+* in processign state, the progress bar pulses, now less aggrressively ([#497](https://github.com/doublewordai/control-layer/issues/497)) ([d87f24a](https://github.com/doublewordai/control-layer/commit/d87f24a84e5f80802be892264dd8d75b9a71744c))
+
+## [0.28.1](https://github.com/doublewordai/control-layer/compare/v0.28.0...v0.28.1) (2026-01-09)
+
+
+### Bug Fixes
+
+* regenerated sqlx queries ([#495](https://github.com/doublewordai/control-layer/issues/495)) ([1c1f111](https://github.com/doublewordai/control-layer/commit/1c1f111af309cc77a736dc724afb5a12470019a8))
+* various search and UI fixes ([#494](https://github.com/doublewordai/control-layer/issues/494)) ([dc99ef2](https://github.com/doublewordai/control-layer/commit/dc99ef28aa0b319616f227b8a18dd4db1f3c5cac))
+
+## [0.28.0](https://github.com/doublewordai/control-layer/compare/v0.27.1...v0.28.0) (2026-01-09)
+
+
+### Features
+
+* sample file generators ([#468](https://github.com/doublewordai/control-layer/issues/468)) ([0c375c2](https://github.com/doublewordai/control-layer/commit/0c375c237230da8d5859595356d32610bd566672))
+
+
+### Bug Fixes
+
+* make transaction time filtering server side ([#490](https://github.com/doublewordai/control-layer/issues/490)) ([6e5928e](https://github.com/doublewordai/control-layer/commit/6e5928e8c6b13d067b0de8b0554e882d778893fe))
+* removed references to expiry of files, and some UI warnings for large… ([#491](https://github.com/doublewordai/control-layer/issues/491)) ([5ff255d](https://github.com/doublewordai/control-layer/commit/5ff255d45c9169f303ec2d59d28586de67deab21))
+
+## [0.27.1](https://github.com/doublewordai/control-layer/compare/v0.27.0...v0.27.1) (2026-01-09)
+
+
+### Bug Fixes
+
+* add histogram buckets for fusillade_retry_attempts_on_success ([#488](https://github.com/doublewordai/control-layer/issues/488)) ([2ac41f2](https://github.com/doublewordai/control-layer/commit/2ac41f2b4940eebee5df0cfa36f29f4f898fcccc))
+
+## [0.27.0](https://github.com/doublewordai/control-layer/compare/v0.26.0...v0.27.0) (2026-01-09)
+
+
+### Features
+
+* add request_origin and batch_sla labels to gen_ai metrics and http_analytics ([#486](https://github.com/doublewordai/control-layer/issues/486)) ([e49b29e](https://github.com/doublewordai/control-layer/commit/e49b29e8feeac392f7eb37c79d83f79c51b76eb9))
+
+
+### Bug Fixes
+
+* change the ordering of prometheus initialization and background … ([#485](https://github.com/doublewordai/control-layer/issues/485)) ([d3520e1](https://github.com/doublewordai/control-layer/commit/d3520e1a0b4221bd536c06bf92735861dcddb787))
+* Jansix UI fixes 2 ([#481](https://github.com/doublewordai/control-layer/issues/481)) ([ee8290c](https://github.com/doublewordai/control-layer/commit/ee8290cd532395e7706e9e829a7cbd4bcce09e6b))
+
+## [0.26.0](https://github.com/doublewordai/control-layer/compare/v0.25.0...v0.26.0) (2026-01-08)
+
+
+### Features
+
+* improve batch modal UX with filename editing and copy updates ([#478](https://github.com/doublewordai/control-layer/issues/478)) ([a9af15d](https://github.com/doublewordai/control-layer/commit/a9af15dacc68bded996a739f81fdd794fc02e0e3))
+
+
+### Bug Fixes
+
+* round down in progress % ([#482](https://github.com/doublewordai/control-layer/issues/482)) ([ca42d89](https://github.com/doublewordai/control-layer/commit/ca42d8958e1cdad1a5adcc6bc9f45a9715950414))
+* test sla e2e ([#479](https://github.com/doublewordai/control-layer/issues/479)) ([c685cd0](https://github.com/doublewordai/control-layer/commit/c685cd095cf8b7455699b4af7e4e848922999d35))
+
+## [0.25.0](https://github.com/doublewordai/control-layer/compare/v0.24.3...v0.25.0) (2026-01-08)
+
+
+### Features
+
+* add progress bar for file uploads ([#477](https://github.com/doublewordai/control-layer/issues/477)) ([296a06a](https://github.com/doublewordai/control-layer/commit/296a06a747e94b28f1538c371b2b9dd52587a80c))
+
+
+### Bug Fixes
+
+* refresh API keys table and make HTML title configurable ([#469](https://github.com/doublewordai/control-layer/issues/469)) ([b7c4538](https://github.com/doublewordai/control-layer/commit/b7c4538ace9e7af6cb9f3197a5367b8fb5a277b2))
+
+## [0.24.3](https://github.com/doublewordai/control-layer/compare/v0.24.2...v0.24.3) (2026-01-08)
+
+
+### Bug Fixes
+
+* when sending api requests cross origin, need to send credentials ([#474](https://github.com/doublewordai/control-layer/issues/474)) ([d6d2c3c](https://github.com/doublewordai/control-layer/commit/d6d2c3c83fbfab860c60b54b9d716f6e8426fd4c))
+
+## [0.24.2](https://github.com/doublewordai/control-layer/compare/v0.24.1...v0.24.2) (2026-01-07)
+
+
+### Bug Fixes
+
+* when rerouting to api endpoint, strip /ai prefix to not double up ([727fe8b](https://github.com/doublewordai/control-layer/commit/727fe8bc88df503b873598c5eead61feeb56a484))
+
+## [0.24.1](https://github.com/doublewordai/control-layer/compare/v0.24.0...v0.24.1) (2026-01-07)
+
+
+### Bug Fixes
+
+* configurable cross-origin for files and batches endpoints ([4717166](https://github.com/doublewordai/control-layer/commit/471716687d67a4a1045cf95c47ddffcff11715cf))
+
+## [0.24.0](https://github.com/doublewordai/control-layer/compare/v0.23.0...v0.24.0) (2026-01-07)
+
+
+### Features
+
+* batch aggregation optimization for transactions endpoint ([#465](https://github.com/doublewordai/control-layer/issues/465)) ([d567568](https://github.com/doublewordai/control-layer/commit/d5675681083b5d8f76a8d16da26d7dbe1b8af89d))
+
+
+### Bug Fixes
+
+* Jansix testing fe fixes ([#464](https://github.com/doublewordai/control-layer/issues/464)) ([4492b47](https://github.com/doublewordai/control-layer/commit/4492b4748b9570c158d9e6318251bd2e7c14ce3f))
+
+## [0.23.0](https://github.com/doublewordai/control-layer/compare/v0.22.0...v0.23.0) (2026-01-07)
+
+
+### Features
+
+* add tracing instrumentation to request serialization flow ([#459](https://github.com/doublewordai/control-layer/issues/459)) ([f8cd68a](https://github.com/doublewordai/control-layer/commit/f8cd68a9ba92b2698b3a6150d6e88d5bc308464b))
+* make pool metrics sample interval configurable ([#457](https://github.com/doublewordai/control-layer/issues/457)) ([1bd23c7](https://github.com/doublewordai/control-layer/commit/1bd23c7741f06e9ce422b6d3b4629aca81db2336))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate fusillade to 0.13.0 ([#462](https://github.com/doublewordai/control-layer/issues/462)) ([b6682dd](https://github.com/doublewordai/control-layer/commit/b6682dd38855660cf5c633061994e595f6e804ae))
+
+## [0.22.0](https://github.com/doublewordai/control-layer/compare/v0.21.1...v0.22.0) (2026-01-07)
+
+
+### Features
+
+* add analytics processing lag metric ([#449](https://github.com/doublewordai/control-layer/issues/449)) ([6afa7e8](https://github.com/doublewordai/control-layer/commit/6afa7e8bdb75e170cc78e583d9441703c70525b2))
+* cache sync & pool metrics ([#454](https://github.com/doublewordai/control-layer/issues/454)) ([8929ec9](https://github.com/doublewordai/control-layer/commit/8929ec965ff5a0b19de80a2fa01bd582a56aa2f2))
+
+
+### Bug Fixes
+
+* check by externalID for auth_source ([#446](https://github.com/doublewordai/control-layer/issues/446)) ([bf51e28](https://github.com/doublewordai/control-layer/commit/bf51e2893392d24ff32f09c51c5a5285b4772e5a))
+* use COALESCE for checkpoint seq comparison to enable index usage ([#448](https://github.com/doublewordai/control-layer/issues/448)) ([48dcfd5](https://github.com/doublewordai/control-layer/commit/48dcfd504207a6dfb83ff1a4c8123266062ef6bc))
+
+
+### Performance Improvements
+
+* add expression index for http_analytics id::text joins ([#450](https://github.com/doublewordai/control-layer/issues/450)) ([a31f26b](https://github.com/doublewordai/control-layer/commit/a31f26bcc64d045dfb24f37d92e1461b428d53ed))
+
+## [0.21.1](https://github.com/doublewordai/control-layer/compare/v0.21.0...v0.21.1) (2026-01-06)
+
+
+### Bug Fixes
+
+* compute balance on read instead of on write ([#445](https://github.com/doublewordai/control-layer/issues/445)) ([839373c](https://github.com/doublewordai/control-layer/commit/839373cbc1cfcd9460769649526ad045eabcdb7c))
+* Prettier auth source ([#443](https://github.com/doublewordai/control-layer/issues/443)) ([e021696](https://github.com/doublewordai/control-layer/commit/e02169679ec3c1de3863e1acbb263a7d17fade58))
+
+## [0.21.0](https://github.com/doublewordai/control-layer/compare/v0.20.0...v0.21.0) (2026-01-06)
+
+
+### Features
+
+* add --validate flag and strict config parsing ([#441](https://github.com/doublewordai/control-layer/issues/441)) ([48cc236](https://github.com/doublewordai/control-layer/commit/48cc2366be15d2a9e3caef54ce5fb234257dcf52))
+
+## [0.20.0](https://github.com/doublewordai/control-layer/compare/v0.19.1...v0.20.0) (2026-01-06)
+
+
+### Features
+
+* support separate databases for fusillade/outlet with optional read replicas ([#433](https://github.com/doublewordai/control-layer/issues/433)) ([8c24cd0](https://github.com/doublewordai/control-layer/commit/8c24cd0d72927cc95b3dc91df5452f5a82a7a4bd))
+
+
+### Bug Fixes
+
+* **deps:** update rust crate axum-prometheus to 0.10 ([#436](https://github.com/doublewordai/control-layer/issues/436)) ([6472ebf](https://github.com/doublewordai/control-layer/commit/6472ebfdc5e16986e64e32009c465dde9dff5877))
+
+## [0.19.1](https://github.com/doublewordai/control-layer/compare/v0.19.0...v0.19.1) (2025-12-24)
+
+
+### Bug Fixes
+
+* allow early upload in batch model for cost estimates ([#425](https://github.com/doublewordai/control-layer/issues/425)) ([24bb933](https://github.com/doublewordai/control-layer/commit/24bb9334d42336e055d9015db7bc2fc4e51dcf7b))
+* hide view reuest analytics button from users without RequestViewer role ([#427](https://github.com/doublewordai/control-layer/issues/427)) ([c0469f0](https://github.com/doublewordai/control-layer/commit/c0469f0b5d83b603be0c139129431b3873595756))
+
+## [0.19.0](https://github.com/doublewordai/control-layer/compare/v0.18.3...v0.19.0) (2025-12-22)
+
+
+### Features
+
+* allow intake of multiple SLAs ([#390](https://github.com/doublewordai/control-layer/issues/390)) ([dbe0a47](https://github.com/doublewordai/control-layer/commit/dbe0a47d173dc88bea1db43beab82d2577506802))
+* Migrate analytics to http analytics table ([#416](https://github.com/doublewordai/control-layer/issues/416)) ([c5d1253](https://github.com/doublewordai/control-layer/commit/c5d12532ba18a39ab4cb288ff7ff501ce2f5b9ed))
+
+## [0.18.3](https://github.com/doublewordai/control-layer/compare/v0.18.2...v0.18.3) (2025-12-22)
+
+
+### Bug Fixes
+
+* tidy up openapi docs ([#420](https://github.com/doublewordai/control-layer/issues/420)) ([609adf4](https://github.com/doublewordai/control-layer/commit/609adf4c725abcbfa9849d29ac8532e4e6a6fb81))
+
+## [0.18.2](https://github.com/doublewordai/control-layer/compare/v0.18.1...v0.18.2) (2025-12-22)
+
+
+### Bug Fixes
+
+* response headers for incomplete output files didnt match the docs ([#406](https://github.com/doublewordai/control-layer/issues/406)) ([e8ea0d1](https://github.com/doublewordai/control-layer/commit/e8ea0d1f07b5326819a2fbf6a3ae1f538d9bf7cc))
+
+## [0.18.1](https://github.com/doublewordai/control-layer/compare/v0.18.0...v0.18.1) (2025-12-20)
+
+
+### Bug Fixes
+
+* fusillade 0.11.1 ([#413](https://github.com/doublewordai/control-layer/issues/413)) ([fbc68e4](https://github.com/doublewordai/control-layer/commit/fbc68e4aafa4b9ae128d1114e584e158014b1804))
+
+## [0.18.0](https://github.com/doublewordai/control-layer/compare/v0.17.4...v0.18.0) (2025-12-20)
+
+
+### Features
+
+* expose sla config ([#407](https://github.com/doublewordai/control-layer/issues/407)) ([bda10de](https://github.com/doublewordai/control-layer/commit/bda10de899719cbfb922494ef5e195144de97fb0))
+* server-side search and filtering for users, groups, models, batches and files ([#404](https://github.com/doublewordai/control-layer/issues/404)) ([ab065a6](https://github.com/doublewordai/control-layer/commit/ab065a67472d17c1ccd84b3bbc483c18e9f24d88))
+
+
+### Bug Fixes
+
+* **deps:** update dependency lucide-react to ^0.562.0 ([#398](https://github.com/doublewordai/control-layer/issues/398)) ([105cf52](https://github.com/doublewordai/control-layer/commit/105cf5214c01e9d8bf65312c594528c154b5ae74))
+* jsonl sanitization ([#405](https://github.com/doublewordai/control-layer/issues/405)) ([2dc9fef](https://github.com/doublewordai/control-layer/commit/2dc9fef72b2cd395fad5eeee5109211dc819d35b))
+* make region + organization optional, remove endpoint filter or standard users ([#409](https://github.com/doublewordai/control-layer/issues/409)) ([496e7ea](https://github.com/doublewordai/control-layer/commit/496e7ea558457d7784d32492d6b31a78176eb297))
+* read api key in via env var ([#408](https://github.com/doublewordai/control-layer/issues/408)) ([c13200a](https://github.com/doublewordai/control-layer/commit/c13200a120083841af4a07783fd6536c947ed986))
+* Uptime and simplification for standard users ([#412](https://github.com/doublewordai/control-layer/issues/412)) ([18028e0](https://github.com/doublewordai/control-layer/commit/18028e098fccd2dac4c50125f108fda40f5e589f))
+
+## [0.17.4](https://github.com/doublewordai/control-layer/compare/v0.17.3...v0.17.4) (2025-12-18)
+
+
+### Bug Fixes
+
+* add more permissive cors ([#400](https://github.com/doublewordai/control-layer/issues/400)) ([29003fc](https://github.com/doublewordai/control-layer/commit/29003fcc9a9319f323d655bd03cdc7b846036443))
+
+## [0.17.3](https://github.com/doublewordai/control-layer/compare/v0.17.2...v0.17.3) (2025-12-18)
+
+
+### Features
+
+* delete batches and fix file cascade ([#396](https://github.com/doublewordai/control-layer/issues/396)) ([86b64b2](https://github.com/doublewordai/control-layer/commit/86b64b2bc088be48fe340e0d2d07efc47a2c819e))
+
+## [0.17.2](https://github.com/doublewordai/control-layer/compare/v0.17.1...v0.17.2) (2025-12-17)
+
+
+### Bug Fixes
+
+* fusillade 0.8.2 ([#393](https://github.com/doublewordai/control-layer/issues/393)) ([3e5b9b1](https://github.com/doublewordai/control-layer/commit/3e5b9b11b52696a6ac4d71b81237452880f0e101))
+
+## [0.17.1](https://github.com/doublewordai/control-layer/compare/v0.17.0...v0.17.1) (2025-12-17)
+
+
+### Bug Fixes
+
+* Api batch docs ([#389](https://github.com/doublewordai/control-layer/issues/389)) ([1b99045](https://github.com/doublewordai/control-layer/commit/1b990456f3a64e57cc28ad2b0afc48155a6a07b3))
+
+## [0.17.0](https://github.com/doublewordai/control-layer/compare/v0.16.0...v0.17.0) (2025-12-17)
+
+
+### Features
+
+* dynamic Model description in model cards layout ([#368](https://github.com/doublewordai/control-layer/issues/368)) ([38adce4](https://github.com/doublewordai/control-layer/commit/38adce40b4b74e6e99ffd14e0a4f36bccbfbc28e))
+
+
+### Bug Fixes
+
+* clean up model card desc and add read more text ([#378](https://github.com/doublewordai/control-layer/issues/378)) ([7d08b3c](https://github.com/doublewordai/control-layer/commit/7d08b3c67e932fa20e9481b3ad9b38e580bdbc10))
+* empty ([#384](https://github.com/doublewordai/control-layer/issues/384)) ([92dcda6](https://github.com/doublewordai/control-layer/commit/92dcda6dc65521954e824c2fad563957a88b5e1f))
+* release please dashboard 3 ([#385](https://github.com/doublewordai/control-layer/issues/385)) ([1a83d70](https://github.com/doublewordai/control-layer/commit/1a83d701ee6a9ba6f1fbaafd0f85ea8a1661b8be))
+* release please simple ([#387](https://github.com/doublewordai/control-layer/issues/387)) ([d52ea3c](https://github.com/doublewordai/control-layer/commit/d52ea3c6bd2d4c3ef116f0a3e9f7f9c485672a2e))
+* release-please includes dashboard ([#381](https://github.com/doublewordai/control-layer/issues/381)) ([67e6f8f](https://github.com/doublewordai/control-layer/commit/67e6f8f4bf65bc343ca6257085b8646c77d184e3))
+* sqlx queries ([#377](https://github.com/doublewordai/control-layer/issues/377)) ([2f0481d](https://github.com/doublewordai/control-layer/commit/2f0481d473dec09714f03ccdd8820cf8fd2f852c))

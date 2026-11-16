@@ -1,0 +1,888 @@
+
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::http::HttpResponse;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LeakConfig {
+    pub leak_enabled: bool,
+    pub leak_interval_seconds: NonZeroU32,
+    pub model_leak_interval_seconds: HashMap<String, NonZeroU32>,
+}
+
+impl Default for LeakConfig {
+    fn default() -> Self {
+        Self {
+            leak_enabled: true,
+            leak_interval_seconds: NonZeroU32::new(60).unwrap(),
+            model_leak_interval_seconds: HashMap::new(),
+        }
+    }
+}
+
+impl LeakConfig {
+    pub(crate) fn interval(&self, model: &str) -> Duration {
+        let seconds = self
+            .model_leak_interval_seconds
+            .get(model)
+            .unwrap_or(&self.leak_interval_seconds);
+        Duration::from_secs(u64::from(seconds.get()))
+    }
+}
+
+pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
+
+pub fn default_should_retry(response: &HttpResponse) -> bool {
+    response.status >= 500
+        || response.status == 429
+        || response.status == 408
+        || response.status == 404
+}
+
+fn default_should_retry_fn() -> ShouldRetryFn {
+    Arc::new(default_should_retry)
+}
+
+fn default_additional_retryable_statuses() -> Vec<u16> {
+    vec![499]
+}
+
+fn default_model_escalations() -> Arc<dashmap::DashMap<String, ModelEscalationConfig>> {
+    Arc::new(dashmap::DashMap::new())
+}
+
+fn default_model_concurrency_limits() -> Arc<dashmap::DashMap<String, usize>> {
+    Arc::new(dashmap::DashMap::new())
+}
+
+fn serialize_model_concurrency_limits<S>(
+    limits: &Arc<dashmap::DashMap<String, usize>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+
+    let limits: HashMap<String, usize> = limits
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
+    limits.serialize(serializer)
+}
+
+fn deserialize_model_concurrency_limits<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Arc<dashmap::DashMap<String, usize>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    let limits = HashMap::<String, usize>::deserialize(deserializer)?;
+    let map = dashmap::DashMap::new();
+    for (model, limit) in limits {
+        map.insert(model, limit);
+    }
+    Ok(Arc::new(map))
+}
+
+fn default_escalation_threshold_seconds() -> i64 {
+    900
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelEscalationConfig {
+    pub escalation_model: String,
+    #[serde(default = "default_escalation_threshold_seconds")]
+    pub escalation_threshold_seconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    #[default]
+    Both,
+    RequestOnly,
+    BatchOnly,
+}
+
+impl DaemonMode {
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            DaemonMode::Both => "both",
+            DaemonMode::RequestOnly => "request_only",
+            DaemonMode::BatchOnly => "batch_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionMaintenanceConfig {
+    policy: crate::RetentionPolicy,
+    batchless_archive_sweep_enabled: bool,
+    batchless_archive_backfill_enabled: bool,
+    batchless_archive_groups_per_tick: i64,
+    batchless_archive_bytes_per_tick: i64,
+    batchless_archive_backfill_concurrency: usize,
+    retained_response_partitions_days_ahead: i32,
+    retained_response_retirement_enabled: bool,
+    batch_archive_retirement_enabled: bool,
+    template_retirement_enabled: bool,
+    content_retention_days: Option<u32>,
+}
+
+impl Default for RetentionMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            policy: crate::RetentionPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: 4,
+            batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
+            batchless_archive_backfill_concurrency: 1,
+            retained_response_partitions_days_ahead: 7,
+            retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            template_retirement_enabled: false,
+            content_retention_days: None,
+        }
+    }
+}
+
+impl RetentionMaintenanceConfig {
+    pub fn new(policy: crate::RetentionPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_batchless_archive_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_sweep_enabled = enabled;
+        self
+    }
+
+    pub fn with_batchless_archive_backfill_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_backfill_enabled = enabled;
+        self
+    }
+
+    pub fn with_batchless_archive_limits(mut self, max_groups: i64, max_bytes: i64) -> Self {
+        self.batchless_archive_groups_per_tick = max_groups;
+        self.batchless_archive_bytes_per_tick = max_bytes;
+        self
+    }
+
+    pub fn with_batchless_archive_backfill_concurrency(mut self, concurrency: usize) -> Self {
+        self.batchless_archive_backfill_concurrency = concurrency;
+        self
+    }
+
+    pub fn with_retained_response_partitions_days_ahead(mut self, days_ahead: i32) -> Self {
+        self.retained_response_partitions_days_ahead = days_ahead;
+        self
+    }
+
+    pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.retained_response_retirement_enabled = enabled;
+        self
+    }
+
+    pub fn with_batch_archive_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.batch_archive_retirement_enabled = enabled;
+        self
+    }
+
+    pub fn with_content_retention_days(mut self, days: Option<u32>) -> Self {
+        self.content_retention_days = days;
+        self
+    }
+
+    pub fn policy(&self) -> &crate::RetentionPolicy {
+        &self.policy
+    }
+
+    pub fn batchless_archive_sweep_enabled(&self) -> bool {
+        self.batchless_archive_sweep_enabled
+    }
+
+    pub fn batchless_archive_backfill_enabled(&self) -> bool {
+        self.batchless_archive_backfill_enabled
+    }
+
+    pub fn batchless_archive_groups_per_tick(&self) -> i64 {
+        self.batchless_archive_groups_per_tick
+    }
+
+    pub fn batchless_archive_bytes_per_tick(&self) -> i64 {
+        self.batchless_archive_bytes_per_tick
+    }
+
+    pub fn batchless_archive_backfill_concurrency(&self) -> usize {
+        self.batchless_archive_backfill_concurrency
+    }
+
+    pub fn retained_response_partitions_days_ahead(&self) -> i32 {
+        self.retained_response_partitions_days_ahead
+    }
+
+    pub fn retained_response_retirement_enabled(&self) -> bool {
+        self.retained_response_retirement_enabled
+    }
+
+    pub fn batch_archive_retirement_enabled(&self) -> bool {
+        self.batch_archive_retirement_enabled
+    }
+
+    pub fn with_template_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.template_retirement_enabled = enabled;
+        self
+    }
+
+    pub fn template_retirement_enabled(&self) -> bool {
+        self.template_retirement_enabled
+    }
+
+    pub fn content_retention_days(&self) -> Option<u32> {
+        self.content_retention_days
+    }
+
+    pub fn retry_age_limit(&self) -> Option<chrono::Duration> {
+        (self.batch_archive_retirement_enabled || self.template_retirement_enabled)
+            .then_some(self.content_retention_days)
+            .flatten()
+            .map(|days| chrono::Duration::days(days.into()))
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub mode: DaemonMode,
+    pub claim_batch_size: usize,
+    #[serde(
+        default = "default_model_concurrency_limits",
+        serialize_with = "serialize_model_concurrency_limits",
+        deserialize_with = "deserialize_model_concurrency_limits"
+    )]
+    pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
+    #[serde(skip, default = "default_model_escalations")]
+    pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
+    #[serde(default)]
+    pub inject_deadline_priority: bool,
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
+    pub claim_interval_ms: u64,
+    #[serde(default = "default_batch_claim_size")]
+    pub batch_claim_size: usize,
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+    #[serde(default = "default_batch_claim_interval_ms")]
+    pub batch_claim_interval_ms: u64,
+    #[serde(default = "default_claim_loop_max_consecutive_failures")]
+    pub claim_loop_max_consecutive_failures: u32,
+    #[serde(default = "default_claim_query_timeout_ms")]
+    pub claim_query_timeout_ms: u64,
+    #[serde(default = "default_max_concurrent_state_writes")]
+    pub max_concurrent_state_writes: usize,
+    pub max_retries: Option<u32>,
+    pub stop_before_deadline_ms: Option<i64>,
+    pub backoff_ms: u64,
+    pub backoff_factor: u64,
+    pub max_backoff_ms: u64,
+    #[serde(default = "default_upload_stall_timeout_ms")]
+    pub upload_stall_timeout_ms: u64,
+    #[serde(default = "default_upload_chunk_bytes")]
+    pub upload_chunk_bytes: usize,
+    #[serde(default = "default_upload_stall_poll_ms")]
+    pub upload_stall_poll_ms: u64,
+    pub first_chunk_timeout_ms: u64,
+    pub chunk_timeout_ms: u64,
+    pub body_timeout_ms: u64,
+    pub status_log_interval_ms: Option<u64>,
+    pub heartbeat_interval_ms: u64,
+    #[serde(skip, default = "default_should_retry_fn")]
+    pub should_retry: ShouldRetryFn,
+    #[serde(default = "default_additional_retryable_statuses")]
+    pub additional_retryable_statuses: Vec<u16>,
+    pub claim_timeout_ms: u64,
+    pub processing_timeout_ms: u64,
+    #[serde(default = "default_pending_request_counts_timeout_ms")]
+    pub pending_request_counts_timeout_ms: u64,
+    pub stale_daemon_threshold_ms: u64,
+    pub unclaim_batch_size: usize,
+    pub cancellation_poll_interval_ms: u64,
+    #[serde(default = "default_batch_metadata_fields")]
+    pub batch_metadata_fields: Vec<String>,
+    pub purge_interval_ms: u64,
+    pub purge_batch_size: i64,
+    pub purge_throttle_ms: u64,
+    #[serde(default)]
+    pub batch_archive_sweep_enabled: bool,
+    #[serde(default = "default_archive_sweep_interval_ms")]
+    pub batch_archive_sweep_interval_ms: u64,
+    #[serde(default = "default_archive_moves_per_tick")]
+    pub batch_archive_sweep_moves_per_tick: i64,
+    #[serde(default)]
+    pub batch_archive_sweep_dwell_secs: f64,
+    #[serde(default = "default_archive_cancel_grace_secs")]
+    pub batch_archive_cancel_grace_secs: f64,
+    #[serde(default)]
+    pub batch_archive_backfill_enabled: bool,
+    #[serde(default = "default_archive_backfill_interval_ms")]
+    pub batch_archive_backfill_interval_ms: u64,
+    #[serde(default = "default_archive_moves_per_tick")]
+    pub batch_archive_backfill_moves_per_tick: i64,
+    #[serde(default = "default_archive_backfill_concurrency")]
+    pub batch_archive_backfill_concurrency: usize,
+    #[serde(default = "default_archive_partitions_weeks_ahead")]
+    pub batch_archive_partitions_weeks_ahead: i32,
+    #[serde(default = "default_batch_finalizer_enabled")]
+    pub batch_finalizer_enabled: bool,
+    #[serde(default = "default_batch_finalizer_interval_ms")]
+    pub batch_finalizer_interval_ms: u64,
+    #[serde(default = "default_batch_finalizer_cancelled_grace_secs")]
+    pub batch_finalizer_cancelled_grace_secs: f64,
+    #[serde(default = "default_batch_finalizer_cancelled_per_tick")]
+    pub batch_finalizer_cancelled_per_tick: i64,
+    pub throughput_log_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub urgency_weight: f64,
+    #[serde(default = "default_service_tier_completion_windows_ms")]
+    pub service_tier_completion_windows_ms: HashMap<String, u64>,
+    #[serde(default = "default_completion_window_ms")]
+    pub default_completion_window_ms: u64,
+    #[serde(default = "default_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+    #[serde(default = "default_leaks_per_window")]
+    pub leaks_per_window: f64,
+    #[serde(default = "default_model_filters_keep_per_model")]
+    pub model_filters_keep_per_model: i64,
+    #[serde(default = "default_model_filters_retention_ms")]
+    pub model_filters_retention_ms: u64,
+}
+
+fn default_batch_metadata_fields() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "endpoint".to_string(),
+        "created_at".to_string(),
+        "completion_window".to_string(),
+    ]
+}
+
+fn default_service_tier_completion_windows_ms() -> HashMap<String, u64> {
+    HashMap::from([("flex".to_string(), 3_600_000)])
+}
+
+fn default_completion_window_ms() -> u64 {
+    86_400_000
+}
+
+fn default_pending_request_counts_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_batch_claim_size() -> usize {
+    0
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_batch_claim_interval_ms() -> u64 {
+    0
+}
+
+fn default_claim_loop_max_consecutive_failures() -> u32 {
+    10
+}
+
+fn default_claim_query_timeout_ms() -> u64 {
+    180_000
+}
+
+fn default_max_concurrent_state_writes() -> usize {
+    64
+}
+
+fn default_upload_stall_timeout_ms() -> u64 {
+    crate::http::DEFAULT_UPLOAD_STALL_TIMEOUT.as_millis() as u64
+}
+
+fn default_upload_chunk_bytes() -> usize {
+    crate::http::DEFAULT_UPLOAD_CHUNK_BYTES
+}
+
+fn default_upload_stall_poll_ms() -> u64 {
+    crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
+}
+
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
+fn default_archive_sweep_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_archive_moves_per_tick() -> i64 {
+    4
+}
+
+fn default_batch_finalizer_enabled() -> bool {
+    true
+}
+
+fn default_batch_finalizer_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_batch_finalizer_cancelled_grace_secs() -> f64 {
+    3_600.0
+}
+
+fn default_batch_finalizer_cancelled_per_tick() -> i64 {
+    50
+}
+
+fn default_archive_cancel_grace_secs() -> f64 {
+    600.0
+}
+
+fn default_archive_backfill_concurrency() -> usize {
+    1
+}
+
+fn default_archive_backfill_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_archive_partitions_weeks_ahead() -> i32 {
+    4
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
+}
+
+fn default_leaks_per_window() -> f64 {
+    60.0
+}
+
+fn default_model_filters_keep_per_model() -> i64 {
+    50
+}
+
+fn default_model_filters_retention_ms() -> u64 {
+    604_800_000
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            mode: DaemonMode::default(),
+            claim_batch_size: 100,
+            model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
+            model_escalations: default_model_escalations(),
+            inject_deadline_priority: false,
+            background_concurrency_limit: 0,
+            claim_interval_ms: 1000,
+            batch_claim_size: default_batch_claim_size(),
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_require_live: false,
+            batch_claim_interval_ms: default_batch_claim_interval_ms(),
+            claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
+            claim_query_timeout_ms: default_claim_query_timeout_ms(),
+            max_concurrent_state_writes: default_max_concurrent_state_writes(),
+            max_retries: Some(1000),
+            stop_before_deadline_ms: Some(0),
+            backoff_ms: 1000,
+            backoff_factor: 2,
+            max_backoff_ms: 10000,
+            upload_stall_timeout_ms: default_upload_stall_timeout_ms(),
+            upload_chunk_bytes: default_upload_chunk_bytes(),
+            upload_stall_poll_ms: default_upload_stall_poll_ms(),
+            first_chunk_timeout_ms: 540_000,
+            chunk_timeout_ms: 540_000,
+            body_timeout_ms: 60_000,
+            status_log_interval_ms: Some(2000),
+            heartbeat_interval_ms: 5000,
+            should_retry: Arc::new(default_should_retry),
+            additional_retryable_statuses: default_additional_retryable_statuses(),
+            claim_timeout_ms: 60000,
+            processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
+            stale_daemon_threshold_ms: 30_000,
+            unclaim_batch_size: 100,
+            cancellation_poll_interval_ms: 5000,
+            batch_metadata_fields: default_batch_metadata_fields(),
+            purge_interval_ms: 600_000,
+            batch_archive_sweep_enabled: false,
+            batch_archive_sweep_interval_ms: default_archive_sweep_interval_ms(),
+            batch_archive_sweep_moves_per_tick: default_archive_moves_per_tick(),
+            batch_archive_sweep_dwell_secs: 0.0,
+            batch_archive_cancel_grace_secs: default_archive_cancel_grace_secs(),
+            batch_archive_backfill_enabled: false,
+            batch_archive_backfill_interval_ms: default_archive_backfill_interval_ms(),
+            batch_archive_backfill_moves_per_tick: default_archive_moves_per_tick(),
+            batch_archive_backfill_concurrency: default_archive_backfill_concurrency(),
+            batch_archive_partitions_weeks_ahead: default_archive_partitions_weeks_ahead(),
+            batch_finalizer_enabled: default_batch_finalizer_enabled(),
+            batch_finalizer_interval_ms: default_batch_finalizer_interval_ms(),
+            batch_finalizer_cancelled_grace_secs: default_batch_finalizer_cancelled_grace_secs(),
+            batch_finalizer_cancelled_per_tick: default_batch_finalizer_cancelled_per_tick(),
+            purge_batch_size: 1000,
+            purge_throttle_ms: 100,
+            throughput_log_interval_ms: Some(60_000),
+            urgency_weight: 0.0,
+            service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
+            default_completion_window_ms: default_completion_window_ms(),
+            claim_ramp_exponent: default_claim_ramp_exponent(),
+            leaks_per_window: default_leaks_per_window(),
+            model_filters_keep_per_model: default_model_filters_keep_per_model(),
+            model_filters_retention_ms: default_model_filters_retention_ms(),
+        }
+    }
+}
+
+impl DaemonConfig {
+    pub(crate) fn retry_predicate(&self) -> ShouldRetryFn {
+        let should_retry = self.should_retry.clone();
+        let additional_retryable_statuses: HashSet<u16> = self
+            .additional_retryable_statuses
+            .iter()
+            .copied()
+            .filter(|status| *status >= 400)
+            .collect();
+
+        Arc::new(move |response| {
+            should_retry(response) || additional_retryable_statuses.contains(&response.status)
+        })
+    }
+}
+
+impl From<&DaemonConfig> for crate::request::transitions::RetryConfig {
+    fn from(config: &DaemonConfig) -> Self {
+        Self {
+            max_retries: config.max_retries,
+            stop_before_deadline_ms: config.stop_before_deadline_ms,
+            backoff_ms: config.backoff_ms,
+            backoff_factor: config.backoff_factor,
+            max_backoff_ms: config.max_backoff_ms,
+            max_capacity_reschedule_age_ms: Some(
+                crate::request::transitions::DEFAULT_MAX_CAPACITY_RESCHEDULE_AGE_MS,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(status: u16, body: &str) -> HttpResponse {
+        HttpResponse {
+            x_request_id: None,
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn fixed_leak_intervals_resolve_exact_model_overrides() {
+        let config: LeakConfig = serde_json::from_value(serde_json::json!({
+            "model_leak_interval_seconds": {"large/model": 10}
+        }))
+        .unwrap();
+        assert_eq!(config.interval("large/model").as_secs(), 10);
+        assert_eq!(config.interval("other/model").as_secs(), 60);
+        assert_eq!(config.interval("large/model-suffix").as_secs(), 60);
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "leak_interval_seconds": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "model_leak_interval_seconds": {"large/model": 0}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retention_maintenance_defaults_are_safe_and_bounded() {
+        let config = RetentionMaintenanceConfig::default();
+
+        assert!(!config.policy.is_enabled());
+        assert!(!config.batchless_archive_sweep_enabled);
+        assert!(!config.batchless_archive_backfill_enabled);
+        assert!(!config.retained_response_retirement_enabled);
+        assert!(config.batchless_archive_groups_per_tick > 0);
+        assert!(config.batchless_archive_bytes_per_tick > 0);
+        assert_eq!(config.batchless_archive_backfill_concurrency, 1);
+        assert!(config.retained_response_partitions_days_ahead > 0);
+    }
+
+    #[test]
+    fn daemon_mode_metric_labels_match_serde_encoding() {
+        for mode in [
+            DaemonMode::Both,
+            DaemonMode::RequestOnly,
+            DaemonMode::BatchOnly,
+        ] {
+            let serde_encoding = serde_json::to_value(mode).unwrap();
+            assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
+        }
+    }
+
+    #[test]
+    fn adaptive_concurrency_ships_dark() {
+        let config = DaemonConfig::default();
+        assert!(!config.adaptive_concurrency);
+        assert_eq!(config.memory_gate_high_fraction, 0.0);
+    }
+
+    #[test]
+    fn adaptive_concurrency_knobs_default_and_round_trip() {
+        let default_config = DaemonConfig::default();
+        assert_eq!(default_config.adaptive_growth_factor, 1.5);
+        assert_eq!(default_config.adaptive_cut_factor, 0.8);
+
+        let mut serialized = serde_json::to_value(&default_config).unwrap();
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("adaptive_concurrency");
+            serialized.remove("adaptive_growth_factor");
+            serialized.remove("adaptive_cut_factor");
+            serialized.remove("memory_gate_high_fraction");
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 1.5);
+        assert_eq!(decoded.adaptive_cut_factor, 0.8);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.0);
+
+        let configured = DaemonConfig {
+            adaptive_concurrency: true,
+            adaptive_growth_factor: 2.0,
+            adaptive_cut_factor: 0.5,
+            memory_gate_high_fraction: 0.75,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
+        assert!(decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 2.0);
+        assert_eq!(decoded.adaptive_cut_factor, 0.5);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.75);
+    }
+
+    #[test]
+    fn archive_flags_default_off_and_knobs_sane() {
+        let c = DaemonConfig::default();
+        assert!(!c.batch_archive_sweep_enabled);
+        assert!(!c.batch_archive_backfill_enabled);
+        assert_eq!(c.batch_archive_sweep_dwell_secs, 0.0);
+        assert_eq!(c.batch_archive_cancel_grace_secs, 600.0);
+        assert_eq!(c.batch_archive_partitions_weeks_ahead, 4);
+        assert!(c.batch_archive_sweep_moves_per_tick > 0);
+        assert!(c.batch_archive_backfill_moves_per_tick > 0);
+        assert_eq!(c.batch_archive_backfill_concurrency, 1);
+        let mut serialized = serde_json::to_value(&c).unwrap();
+        let obj = serialized.as_object_mut().unwrap();
+        for key in [
+            "batch_archive_sweep_enabled",
+            "batch_archive_sweep_interval_ms",
+            "batch_archive_sweep_moves_per_tick",
+            "batch_archive_sweep_dwell_secs",
+            "batch_archive_backfill_concurrency",
+            "batch_archive_cancel_grace_secs",
+            "batch_archive_backfill_enabled",
+            "batch_archive_backfill_interval_ms",
+            "batch_archive_backfill_moves_per_tick",
+            "batch_archive_partitions_weeks_ahead",
+        ] {
+            obj.remove(key);
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!decoded.batch_archive_sweep_enabled);
+        assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
+    }
+
+    #[test]
+    fn preserves_existing_default_retry_statuses() {
+        for status in [404, 408, 429, 500, 503] {
+            assert!(default_should_retry(&response(status, "")));
+        }
+
+        for status in [200, 201, 204, 299, 400, 401, 403, 422, 498, 499] {
+            assert!(!default_should_retry(&response(status, "")));
+        }
+    }
+
+    #[test]
+    fn default_config_serializes_additional_retryable_statuses() {
+        let config = serde_json::to_value(DaemonConfig::default()).unwrap();
+
+        assert_eq!(
+            config["additional_retryable_statuses"],
+            serde_json::json!([499])
+        );
+    }
+
+    #[test]
+    fn missing_additional_retryable_statuses_deserializes_to_default() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("additional_retryable_statuses");
+
+        let config: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(config.additional_retryable_statuses, vec![499]);
+    }
+
+    #[test]
+    fn additional_retryable_statuses_are_additive_and_overridable() {
+        let default_config = DaemonConfig::default();
+        let default_predicate = default_config.retry_predicate();
+        assert!(default_predicate(&response(499, "arbitrary upstream body")));
+
+        let disabled_config = DaemonConfig {
+            additional_retryable_statuses: vec![],
+            ..DaemonConfig::default()
+        };
+        let disabled_predicate = disabled_config.retry_predicate();
+        assert!(!disabled_predicate(&response(499, "")));
+        assert!(disabled_predicate(&response(500, "")));
+
+        let overridden_config = DaemonConfig {
+            additional_retryable_statuses: vec![200, 204, 418],
+            ..DaemonConfig::default()
+        };
+        let overridden_predicate = overridden_config.retry_predicate();
+        assert!(overridden_predicate(&response(418, "")));
+        assert!(!overridden_predicate(&response(499, "")));
+        assert!(!overridden_predicate(&response(200, "")));
+        assert!(!overridden_predicate(&response(204, "")));
+
+        let custom_config = DaemonConfig {
+            should_retry: Arc::new(|response| response.status == 409),
+            additional_retryable_statuses: vec![418],
+            ..DaemonConfig::default()
+        };
+        let custom_predicate = custom_config.retry_predicate();
+        assert!(custom_predicate(&response(409, "")));
+        assert!(custom_predicate(&response(418, "")));
+        assert!(!custom_predicate(&response(500, "")));
+    }
+
+    #[test]
+    fn explicit_additional_retryable_statuses_round_trip() {
+        for statuses in [vec![], vec![418, 499]] {
+            let config = DaemonConfig {
+                additional_retryable_statuses: statuses.clone(),
+                ..DaemonConfig::default()
+            };
+
+            let serialized = serde_json::to_value(config).unwrap();
+            let deserialized: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+            assert_eq!(deserialized.additional_retryable_statuses, statuses);
+        }
+    }
+
+    #[test]
+    fn upload_watchdog_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("upload_stall_timeout_ms");
+            serialized.remove("upload_chunk_bytes");
+            serialized.remove("upload_stall_poll_ms");
+        }
+
+        let config: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(config.upload_stall_timeout_ms, 60_000);
+        assert_eq!(config.upload_chunk_bytes, 64 * 1024);
+        assert_eq!(config.upload_stall_poll_ms, 100);
+    }
+
+    #[test]
+    fn upload_watchdog_explicit_values_round_trip() {
+        let config = DaemonConfig {
+            upload_stall_timeout_ms: 12_345,
+            upload_chunk_bytes: 8 * 1024,
+            upload_stall_poll_ms: 25,
+            ..DaemonConfig::default()
+        };
+
+        let serialized = serde_json::to_value(config).unwrap();
+        let deserialized: DaemonConfig = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(deserialized.upload_stall_timeout_ms, 12_345);
+        assert_eq!(deserialized.upload_chunk_bytes, 8 * 1024);
+        assert_eq!(deserialized.upload_stall_poll_ms, 25);
+    }
+
+    #[test]
+    fn state_write_concurrency_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_state_writes");
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 64);
+    }
+
+    #[test]
+    fn state_write_concurrency_explicit_value_round_trips() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["max_concurrent_state_writes"] = serde_json::json!(17);
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        let reencoded = serde_json::to_value(decoded).unwrap();
+
+        assert_eq!(reencoded["max_concurrent_state_writes"], 17);
+    }
+}

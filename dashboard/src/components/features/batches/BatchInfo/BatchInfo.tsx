@@ -1,0 +1,899 @@
+import React, { useState, useEffect, useCallback } from "react";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import {
+  ArrowLeft,
+  FileInput,
+  FileCheck,
+  AlertCircle,
+  Loader2,
+  RotateCcw,
+  ExternalLink,
+  Copy,
+  Check,
+  Info,
+  List,
+  Download,
+  ChevronDown,
+} from "lucide-react";
+import {
+  useBatch,
+  useBatchAnalytics,
+  useRetryBatch,
+} from "../../../../api/control-layer/hooks";
+import { Card, CardContent, CardHeader, CardTitle } from "../../../ui/card";
+import { Button } from "../../../ui/button";
+import { Skeleton } from "../../../ui/skeleton";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../../../ui/dropdown-menu";
+import type { BatchStatus } from "../../../../api/control-layer/types";
+import { useAuthorization, copyToClipboard } from "../../../../utils";
+import {
+  getBatchDownloadFilename,
+  downloadFile,
+} from "../../../../utils/batch";
+import BatchResults from "./BatchResults";
+import { batchModelName } from "../model";
+import { getCompletionWindowLabel } from "../../../../utils/serviceTier";
+
+const BatchInfo: React.FC = () => {
+  const { batchId } = useParams<{ batchId: string }>();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+
+  const fromUrl = searchParams.get("from");
+
+  const { data: batch, isLoading, error } = useBatch(batchId!);
+  const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
+    batchId!,
+  );
+  const retryMutation = useRetryBatch();
+
+  const { userRoles, hasPermission } = useAuthorization();
+  const hasRequestsPermission = userRoles.some(
+    (role) => role === "RequestViewer",
+  );
+  const hasConnectionsPermission = hasPermission("connections");
+
+  const tabFromUrl = searchParams.get("tab");
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    if (tabFromUrl === "results") return "results";
+    return "details";
+  });
+
+  useEffect(() => {
+    const tabFromUrl = searchParams.get("tab");
+    if (tabFromUrl === "details" || tabFromUrl === "results") {
+      setActiveTab(tabFromUrl);
+    }
+  }, [searchParams]);
+
+  const handleTabChange = (value: string) => {
+    setActiveTab(value);
+    const newParams = new URLSearchParams(searchParams);
+    newParams.set("tab", value);
+    navigate(`/batches/${batchId}?${newParams.toString()}`, { replace: true });
+  };
+
+  const handleRetry = () => {
+    if (batchId) {
+      retryMutation.mutate(batchId);
+    }
+  };
+
+  const handleDownload = async (fileId: string, filename: string) => {
+    try {
+      await downloadFile(`/ai/v1/files/${fileId}/content`, filename);
+    } catch (error) {
+      console.error("Download failed:", error);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <div
+            className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"
+            aria-label="Loading"
+          ></div>
+          <p className="text-doubleword-neutral-600">
+            Loading batch details...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <div className="text-red-500 mb-4">
+            <ArrowLeft className="h-12 w-12 mx-auto" />
+          </div>
+          <p className="text-red-600 font-semibold">
+            Error: {error instanceof Error ? error.message : "Unknown error"}
+          </p>
+          <Button
+            variant="outline"
+            onClick={() => navigate(fromUrl || "/batches")}
+            className="mt-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {fromUrl ? "Go Back" : "Back to Batches"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!batch) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <div className="text-center">
+          <p className="text-gray-600 font-semibold">Batch not found</p>
+          <Button
+            variant="outline"
+            onClick={() => navigate(fromUrl || "/batches")}
+            className="mt-4"
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {fromUrl ? "Go Back" : "Back to Batches"}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  const isQueued =
+    batch.status === "in_progress" &&
+    batch.request_counts.completed === 0 &&
+    batch.request_counts.failed === 0;
+
+  const getStatusBadge = (status: BatchStatus) => {
+    const statusColors: Record<string, string> = {
+      validating: "bg-yellow-100 text-yellow-800",
+      in_progress: "bg-blue-100 text-blue-800",
+      finalizing: "bg-blue-100 text-blue-800",
+      completed: "bg-green-100 text-green-800",
+      failed: "bg-red-100 text-red-800",
+      expired: "bg-orange-100 text-orange-800",
+      cancelling: "bg-gray-100 text-gray-800",
+      cancelled: "bg-gray-100 text-gray-800",
+    };
+
+    const statusLabels: Record<string, string> = {
+      in_progress: "in progress",
+    };
+
+    const displayStatus = isQueued ? "queued" : (statusLabels[status] || status);
+    const colorClass = isQueued
+      ? "bg-gray-100 text-gray-700"
+      : (statusColors[status] || "bg-gray-100 text-gray-800");
+
+    return (
+      <span
+        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${colorClass}`}
+      >
+        {displayStatus}
+      </span>
+    );
+  };
+
+  const formatTimestamp = (timestamp: number | null | undefined) => {
+    if (!timestamp) return "N/A";
+    return new Date(timestamp * 1000).toLocaleString();
+  };
+
+  const formatDuration = (
+    startTimestamp: number | null | undefined,
+    endTimestamp: number | null | undefined,
+  ) => {
+    if (!startTimestamp || !endTimestamp) return "N/A";
+    const durationMs = (endTimestamp - startTimestamp) * 1000;
+    const seconds = Math.floor(durationMs / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) {
+      return `${hours}h ${minutes % 60}m`;
+    } else if (minutes > 0) {
+      return `${minutes}m ${seconds % 60}s`;
+    } else {
+      return `${seconds}s`;
+    }
+  };
+
+  const progress =
+    batch.request_counts.total > 0
+      ? Math.floor(
+          ((batch.request_counts.completed + batch.request_counts.failed) /
+            batch.request_counts.total) *
+            100,
+        )
+      : 0;
+  const reasoningTokens = analytics?.total_reasoning_tokens ?? 0;
+  const modelName = batchModelName(batch);
+
+  const description = batch.metadata?.batch_description;
+
+  return (
+    <div className="p-6">
+      <Tabs
+        value={activeTab}
+        onValueChange={handleTabChange}
+        className="space-y-4"
+      >
+        { }
+        <div className="mb-6">
+          <div className="flex items-center gap-4 mb-4">
+            <button
+              onClick={() => {
+                if (activeTab === "results") {
+                  handleTabChange("details");
+                } else {
+                  navigate(fromUrl || "/batches");
+                }
+              }}
+              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors"
+              aria-label={
+                activeTab === "results"
+                  ? "Back to Details"
+                  : fromUrl
+                    ? "Go back"
+                    : "Back to Batches"
+              }
+              title={
+                activeTab === "results"
+                  ? "Back to Details"
+                  : fromUrl
+                    ? "Go back"
+                    : "Back to Batches"
+              }
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+            <div className="flex-1">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                <div>
+                  <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+                    {activeTab === "results"
+                      ? "Batch Results"
+                      : "Batch Details"}
+                  </h1>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="flex items-center gap-1 text-doubleword-neutral-600 font-mono text-sm">
+                      {batch.id}
+                      <CopyIconButton value={batch.id} />
+                    </span>
+                    {getStatusBadge(batch.status)}
+                  </div>
+                  {description && (
+                    <h2
+                      className="text-xl text-doubleword-neutral-700 mt-1 truncate max-w-sm"
+                      title={description}
+                    >
+                      {description}
+                    </h2>
+                  )}
+                </div>
+                <div className="flex items-center gap-3">
+                  <TabsList>
+                    <TabsTrigger
+                      value="details"
+                      className="flex items-center gap-2"
+                    >
+                      <Info className="h-4 w-4" />
+                      Details
+                    </TabsTrigger>
+                    <TabsTrigger
+                      value="results"
+                      className="flex items-center gap-2"
+                    >
+                      <List className="h-4 w-4" />
+                      Results
+                    </TabsTrigger>
+                  </TabsList>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        variant="outline"
+                        disabled={
+                          !batch.input_file_id &&
+                          !(
+                            batch.output_file_id &&
+                            batch.request_counts.completed > 0
+                          ) &&
+                          !(
+                            batch.error_file_id &&
+                            batch.request_counts.failed > 0
+                          )
+                        }
+                      >
+                        <Download className="h-4 w-4 mr-2" />
+                        Download
+                        <ChevronDown className="h-4 w-4 ml-2" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      {batch.input_file_id && (
+                        <DropdownMenuItem
+                          onClick={() =>
+                            handleDownload(
+                              batch.input_file_id!,
+                              getBatchDownloadFilename(batchId!, "input"),
+                            )
+                          }
+                        >
+                          <FileInput className="h-4 w-4 mr-2" />
+                          Input File
+                        </DropdownMenuItem>
+                      )}
+                      {batch.output_file_id &&
+                        batch.request_counts.completed > 0 && (
+                          <DropdownMenuItem
+                            onClick={() =>
+                              handleDownload(
+                                batch.output_file_id!,
+                                getBatchDownloadFilename(batchId!, "output"),
+                              )
+                            }
+                          >
+                            <FileCheck className="h-4 w-4 mr-2" />
+                            Output File
+                          </DropdownMenuItem>
+                        )}
+                      {batch.error_file_id &&
+                        batch.request_counts.failed > 0 && (
+                          <DropdownMenuItem
+                            onClick={() =>
+                              handleDownload(
+                                batch.error_file_id!,
+                                getBatchDownloadFilename(batchId!, "error"),
+                              )
+                            }
+                          >
+                            <AlertCircle className="h-4 w-4 mr-2" />
+                            Error File
+                          </DropdownMenuItem>
+                        )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <TabsContent value="details">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            { }
+            <div className="lg:col-span-2 space-y-6">
+              { }
+              {!isQueued &&
+                batch.status !== "validating" &&
+                batch.status !== "failed" &&
+                batch.status !== "cancelled" &&
+                batch.status !== "expired" && (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="px-6 pt-5 pb-4">
+                      <CardTitle>Progress</CardTitle>
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      <div className="space-y-4">
+                        { }
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">
+                              Overall Progress
+                            </span>
+                            <span className="font-medium">{progress}%</span>
+                          </div>
+                          <div className="relative w-full rounded-full h-2.5 bg-gray-200 overflow-hidden">
+                            <div
+                              className="absolute left-0 top-0 h-full bg-emerald-400 transition-all duration-300"
+                              style={{
+                                width: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                              }}
+                            ></div>
+                            <div
+                              className="absolute top-0 h-full bg-rose-400 transition-all duration-300"
+                              style={{
+                                left: `${batch.request_counts.total > 0 ? (batch.request_counts.completed / batch.request_counts.total) * 100 : 0}%`,
+                                width: `${batch.request_counts.total > 0 ? (batch.request_counts.failed / batch.request_counts.total) * 100 : 0}%`,
+                              }}
+                            ></div>
+                          </div>
+                        </div>
+
+                        { }
+                        <div className="grid grid-cols-3 gap-4 pt-4">
+                          <button
+                            className="text-center p-3 rounded-lg hover:bg-gray-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                            onClick={() => {
+                              if (batch.request_counts.total > 0) {
+                                navigate(`/batches/${batchId}?tab=results`);
+                              }
+                            }}
+                            disabled={batch.request_counts.total === 0}
+                            title={
+                              batch.request_counts.total > 0
+                                ? "Click to view all results"
+                                : "No results"
+                            }
+                          >
+                            <p className="text-2xl font-bold text-gray-900">
+                              {batch.request_counts.total}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Total Requests
+                            </p>
+                          </button>
+                          <button
+                            className="text-center p-3 rounded-lg hover:bg-green-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                            onClick={() => {
+                              if (batch.request_counts.completed > 0) {
+                                navigate(
+                                  `/batches/${batchId}?tab=results&status=completed`,
+                                );
+                              }
+                            }}
+                            disabled={batch.request_counts.completed === 0}
+                            title={
+                              batch.request_counts.completed > 0
+                                ? "Click to view completed results"
+                                : "No completed results"
+                            }
+                          >
+                            <p className="text-2xl font-bold text-green-700">
+                              {batch.request_counts.completed}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">
+                              Completed
+                            </p>
+                          </button>
+                          <button
+                            className="text-center p-3 rounded-lg hover:bg-red-50 transition-colors cursor-pointer disabled:cursor-default disabled:hover:bg-transparent"
+                            onClick={() => {
+                              if (batch.request_counts.failed > 0) {
+                                navigate(
+                                  `/batches/${batchId}?tab=results&status=failed`,
+                                );
+                              }
+                            }}
+                            disabled={batch.request_counts.failed === 0}
+                            title={
+                              batch.request_counts.failed > 0
+                                ? "Click to view failed results"
+                                : "No failed results"
+                            }
+                          >
+                            <p className="text-2xl font-bold text-red-700">
+                              {batch.request_counts.failed}
+                            </p>
+                            <p className="text-xs text-gray-600 mt-1">Failed</p>
+                          </button>
+                        </div>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
+
+              { }
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Associated Files</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="space-y-2">
+                    {batch.input_file_id ? (
+                      <div className="flex items-center gap-2 p-2 bg-gray-50 rounded">
+                        <FileInput className="w-4 h-4 text-gray-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Input File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.input_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.input_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 p-2 bg-gray-100 rounded">
+                        <FileInput className="w-4 h-4 text-gray-400" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-500">Input File</p>
+                          <p className="text-xs text-gray-400">Source file has been deleted</p>
+                        </div>
+                      </div>
+                    )}
+                    {batch.output_file_id && batch.request_counts.completed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-green-50 rounded">
+                        <FileCheck className="w-4 h-4 text-green-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Output File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.output_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.output_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                    {batch.error_file_id && batch.request_counts.failed > 0 && (
+                      <div className="flex items-center gap-2 p-2 bg-red-50 rounded">
+                        <AlertCircle className="w-4 h-4 text-red-600" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-700">Error File</p>
+                          <p className="text-xs text-gray-500 font-mono truncate">{batch.error_file_id}</p>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => navigate(`/batches/files/${batch.error_file_id}/content?from=/batches/${batchId}`)} className="shrink-0">View</Button>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              { }
+              {batch &&
+                batch.request_counts.failed > 0 &&
+                (batch.status === "completed" ||
+                  batch.status === "failed" ||
+                  batch.status === "cancelled") && (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="px-6 pt-5 pb-4">
+                      <CardTitle>Retry Failed Requests</CardTitle>
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm text-gray-700">
+                            This batch has{" "}
+                            <span className="font-semibold text-red-700">
+                              {batch.request_counts.failed} failed request
+                              {batch.request_counts.failed !== 1 ? "s" : ""}
+                            </span>
+                            .
+                          </p>
+                          {!batch.input_file_id ? (
+                            <p className="text-xs text-red-600 mt-1">
+                              Source file has been deleted. Cannot retry.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-gray-500 mt-1">
+                              Click to reset them to pending and retry
+                              processing.
+                            </p>
+                          )}
+                        </div>
+                        <Button
+                          onClick={handleRetry}
+                          disabled={
+                            retryMutation.isPending || !batch.input_file_id
+                          }
+                          className="ml-4"
+                        >
+                          {retryMutation.isPending ? (
+                            <>
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              Retrying...
+                            </>
+                          ) : (
+                            <>
+                              <RotateCcw className="mr-2 h-4 w-4" />
+                              Retry Failed
+                            </>
+                          )}
+                        </Button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                )}
+
+              { }
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Batch Information</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">Endpoint</p>
+                        <p className="font-medium font-mono text-sm">
+                          {batch.endpoint}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">
+                          Service tier
+                        </p>
+                        <p className="font-medium text-sm">
+                          {getCompletionWindowLabel(batch.completion_window)}
+                        </p>
+                      </div>
+                      {batch.metadata?.created_by_email && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">Created by</p>
+                          <p className="font-medium text-sm wrap-break-word">
+                            {batch.metadata.created_by_email}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    {description && (
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">
+                          Description
+                        </p>
+                        <p className="text-gray-700">{description}</p>
+                      </div>
+                    )}
+
+                    { }
+                    {batch.errors && batch.errors.data.length > 0 && (
+                      <div className="border-t pt-6">
+                        <h4 className="text-sm font-medium text-gray-900 mb-3">
+                          Errors
+                        </h4>
+                        <div className="space-y-2">
+                          {batch.errors.data.map((error, index) => (
+                            <div
+                              key={index}
+                              className="p-3 bg-red-50 border border-red-200 rounded-lg"
+                            >
+                              <div className="flex items-start gap-2">
+                                <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 shrink-0" />
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm font-medium text-red-900">
+                                    {error.code}
+                                  </p>
+                                  <p className="text-sm text-red-700 mt-1">
+                                    {error.message}
+                                  </p>
+                                  {error.line && (
+                                    <p className="text-xs text-red-600 mt-1">
+                                      Line {error.line}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            { }
+            <div className="space-y-6">
+              { }
+              <Card className="p-0 gap-0 rounded-lg">
+                <CardHeader className="px-6 pt-5 pb-4">
+                  <CardTitle>Timeline</CardTitle>
+                </CardHeader>
+                <CardContent className="px-6 pb-6 pt-0">
+                  <div className="space-y-3">
+                    <div>
+                      <p className="text-sm text-gray-600 mb-1">Created</p>
+                      <p className="text-sm font-medium">
+                        {formatTimestamp(batch.created_at)}
+                      </p>
+                    </div>
+
+                    {batch.completed_at && (
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">Completed</p>
+                        <p className="text-sm font-medium">
+                          {formatTimestamp(batch.completed_at)}
+                        </p>
+                      </div>
+                    )}
+
+                    {batch.failed_at && batch.status === "failed" && (
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">Failed</p>
+                        <p className="text-sm font-medium text-red-600">
+                          {formatTimestamp(batch.failed_at)}
+                        </p>
+                      </div>
+                    )}
+
+                    {batch.in_progress_at && batch.completed_at && (
+                      <div className="border-t border-doubleword-border-light pt-3">
+                        <p className="text-sm text-gray-600 mb-1">Duration</p>
+                        <p className="text-sm font-medium">
+                          {formatDuration(
+                            batch.in_progress_at,
+                            batch.completed_at,
+                          )}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+
+              { }
+              {analytics &&
+                (batch.request_counts.completed > 0 ||
+                  batch.request_counts.failed > 0) && (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="flex w-full justify-between px-6 pt-5 pb-4">
+                      <CardTitle>Metrics</CardTitle>
+                      {hasRequestsPermission && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            navigate(
+                              `/analytics?tab=requests&fusillade_batch_id=${batchId}&from=/batches/${batchId}`,
+                            )
+                          }
+                        >
+                          Analytics
+                          <ExternalLink className="ml-1 h-3 w-3" />
+                        </Button>
+                      )}
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      {analyticsLoading ? (
+                        <div className="space-y-2">
+                          <Skeleton className="h-5 w-full" />
+                          <Skeleton className="h-5 w-full" />
+                          <Skeleton className="h-5 w-full" />
+                        </div>
+                      ) : analytics.total_requests > 0 ? (
+                        <div className="space-y-2">
+                          <div className="flex justify-between items-center gap-3 text-sm">
+                            <span className="text-gray-600">Model</span>
+                            {modelName ? (
+                              <span
+                                className="font-mono text-xs text-doubleword-neutral-700 bg-doubleword-neutral-100 rounded-md px-1.5 py-0.5 truncate max-w-[180px]"
+                                title={modelName}
+                              >
+                                {modelName}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">-</span>
+                            )}
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Prompt</span>
+                            <span className="font-medium tabular-nums">
+                              {analytics.total_prompt_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span className="text-gray-600">Completion</span>
+                            <span className="font-medium tabular-nums">
+                              {analytics.total_completion_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          {reasoningTokens > 0 && (
+                            <div className="flex justify-between text-sm">
+                              <span className="text-gray-600">Reasoning</span>
+                              <span className="font-medium tabular-nums">
+                                {reasoningTokens.toLocaleString()}
+                              </span>
+                            </div>
+                          )}
+                          <div className="flex justify-between text-sm font-medium border-t border-doubleword-border-light pt-2 mt-2">
+                            <span>Total tokens</span>
+                            <span className="tabular-nums">
+                              {analytics.total_tokens.toLocaleString()}
+                            </span>
+                          </div>
+                          {analytics.total_cost &&
+                            parseFloat(analytics.total_cost) > 0 && (
+                              <div className="flex justify-between text-sm border-t border-doubleword-border-light pt-2 mt-2">
+                                <span className="text-gray-600">Cost</span>
+                                <span className="font-medium text-green-700">
+                                  ${parseFloat(analytics.total_cost).toFixed(4)}
+                                </span>
+                              </div>
+                            )}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-gray-500">
+                          Analytics will appear as requests complete.
+                        </p>
+                      )}
+                    </CardContent>
+                  </Card>
+                )}
+
+              { }
+              {hasConnectionsPermission && batch.dwext?.source === "sync" && (
+                <Card className="p-0 gap-0 rounded-lg">
+                  <CardHeader className="px-6 pt-5 pb-4">
+                    <CardTitle>Source</CardTitle>
+                  </CardHeader>
+                  <CardContent className="px-6 pb-6 pt-0">
+                    <div className="space-y-2">
+                      {batch.dwext?.source_name && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">Connection</p>
+                          <p className="text-sm font-medium">{batch.dwext.source_name}</p>
+                        </div>
+                      )}
+                      {batch.dwext?.source_file && (
+                        <div>
+                          <p className="text-sm text-gray-600 mb-1">External File</p>
+                          <p className="text-sm font-medium font-mono">{batch.dwext.source_file}</p>
+                        </div>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
+
+              { }
+              {batch.metadata && (() => {
+                const userMetadata = Object.entries(batch.metadata).filter(
+                  ([key]) => !["created_by_email", "context_name", "context_type"].includes(key),
+                );
+                return userMetadata.length > 0 ? (
+                  <Card className="p-0 gap-0 rounded-lg">
+                    <CardHeader className="px-6 pt-5 pb-4">
+                      <CardTitle>Metadata</CardTitle>
+                    </CardHeader>
+                    <CardContent className="px-6 pb-6 pt-0">
+                      <div className="space-y-2">
+                        {userMetadata.map(([key, value]) => (
+                          <div key={key}>
+                            <p className="text-sm text-gray-600 mb-1">{key}</p>
+                            <p className="text-sm font-medium wrap-break-word">
+                              {value}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </CardContent>
+                  </Card>
+                ) : null;
+              })()}
+            </div>
+          </div>
+        </TabsContent>
+
+        <TabsContent value="results">
+          <BatchResults
+            batchId={batchId!}
+            batchStatus={batch.status}
+            inputFileDeleted={!batch.input_file_id}
+          />
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+};
+
+function CopyIconButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = useCallback(async () => {
+    const ok = await copyToClipboard(value);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }
+  }, [value]);
+  return (
+    <button
+      onClick={handleCopy}
+      className="shrink-0 p-1 text-gray-400 hover:text-gray-600 transition-colors"
+      aria-label="Copy to clipboard"
+    >
+      {copied ? (
+        <Check className="h-4 w-4 text-green-600" />
+      ) : (
+        <Copy className="h-4 w-4" />
+      )}
+    </button>
+  );
+}
+
+export default BatchInfo;

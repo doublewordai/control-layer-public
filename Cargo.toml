@@ -1,0 +1,22 @@
+[workspace]
+members = [
+  "dwctl",
+  "fusillade",
+  "fusillade-arsenal",
+  "fusillade-core",
+  "onwards",
+  "openai-reassembler",
+  "dwctl/test-macros",
+]
+default-members = ["dwctl"]
+resolver = "2"
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+
+[profile.ci]
+inherits = "test"
+debug = 0
+incremental = false

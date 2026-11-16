@@ -1,0 +1,55 @@
+# Development overrides, applied automatically on top of docker-compose.yml
+# by `just dev`.
+#
+# What this gives you: the published dwctl image, Postgres exposed on the host,
+# and the dashboard running under Vite with HMR.
+#
+# For Rust work use `just dev-native` instead.
+#
+# This file used to build dwctl from source via `target: dev`.
+
+services:
+  postgres:
+    ports:
+      - "5433:5432"
+    healthcheck:
+      disable: true
+
+  control-layer:
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgres://control_layer:control_layer_password@postgres:5432/control_layer
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_started
+    healthcheck:
+      disable: true
+
+  control-layer-frontend:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - BACKEND_URL=http://control-layer:3001
+    volumes:
+      - ./dashboard:/app
+      - control_layer_frontend_node_modules:/app/node_modules
+      - /app/.vite
+    develop:
+      watch:
+        - action: rebuild
+          path: ./dashboard/package.json
+        - action: rebuild
+          path: ./dashboard/Dockerfile
+
+volumes:
+  control_layer_frontend_node_modules:
+
+networks:
+  default:
+    driver: bridge

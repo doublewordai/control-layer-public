@@ -1,0 +1,19 @@
+
+export interface RequestsEntry {
+  id: string;
+  timestamp: string;
+  method: string;
+  uri: string;
+  model?: string;
+  status_code?: number;
+  duration_ms?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  reasoning_tokens?: number;
+  total_tokens?: number;
+  response_type?: string;
+  fusillade_batch_id?: string;
+  input_price_per_token?: string;
+  output_price_per_token?: string;
+  custom_id?: string;
+}

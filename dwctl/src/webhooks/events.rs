@@ -1,0 +1,284 @@
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use uuid::Uuid;
+
+use crate::notifications::BatchNotificationInfo;
+use crate::types::UserId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookScope {
+    Own,
+    Platform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookEventType {
+    #[serde(rename = "batch.completed")]
+    BatchCompleted,
+    #[serde(rename = "batch.failed")]
+    BatchFailed,
+
+    #[serde(rename = "user.created")]
+    UserCreated,
+    #[serde(rename = "batch.created")]
+    BatchCreated,
+    #[serde(rename = "api_key.created")]
+    ApiKeyCreated,
+}
+
+impl WebhookEventType {
+    pub fn scope(&self) -> WebhookScope {
+        match self {
+            Self::BatchCompleted | Self::BatchFailed => WebhookScope::Own,
+            Self::UserCreated | Self::BatchCreated | Self::ApiKeyCreated => WebhookScope::Platform,
+        }
+    }
+}
+
+impl std::fmt::Display for WebhookEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BatchCompleted => write!(f, "batch.completed"),
+            Self::BatchFailed => write!(f, "batch.failed"),
+            Self::UserCreated => write!(f, "user.created"),
+            Self::BatchCreated => write!(f, "batch.created"),
+            Self::ApiKeyCreated => write!(f, "api_key.created"),
+        }
+    }
+}
+
+impl std::str::FromStr for WebhookEventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "batch.completed" => Ok(Self::BatchCompleted),
+            "batch.failed" => Ok(Self::BatchFailed),
+            "user.created" => Ok(Self::UserCreated),
+            "batch.created" => Ok(Self::BatchCreated),
+            "api_key.created" => Ok(Self::ApiKeyCreated),
+            _ => Err(format!("Unknown event type: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestCounts {
+    pub total: i64,
+    pub completed: i64,
+    pub failed: i64,
+    pub cancelled: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WebhookEvent {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub timestamp: DateTime<Utc>,
+    pub data: serde_json::Value,
+}
+
+impl WebhookEvent {
+    pub fn batch_terminal(event_type: WebhookEventType, info: &BatchNotificationInfo) -> Self {
+        let status = match event_type {
+            WebhookEventType::BatchCompleted => "completed",
+            WebhookEventType::BatchFailed => "failed",
+            _ => "unknown",
+        };
+
+        let finished_at = info.finished_at.unwrap_or_else(Utc::now);
+
+        Self {
+            event_type: event_type.to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({
+                "batch_id": format!("batch_{}", info.batch_uuid),
+                "status": status,
+                "request_counts": {
+                    "total": info.total_requests,
+                    "completed": info.completed_requests,
+                    "failed": info.failed_requests,
+                    "cancelled": info.cancelled_requests,
+                },
+                "output_file_id": info.output_file_id.map(|id| format!("file_{}", id)),
+                "error_file_id": info.error_file_id.map(|id| format!("file_{}", id)),
+                "created_at": info.created_at,
+                "finished_at": finished_at,
+            }),
+        }
+    }
+
+    pub fn user_created(user_id: UserId, email: &str, auth_source: &str) -> Self {
+        Self {
+            event_type: WebhookEventType::UserCreated.to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({
+                "user_id": user_id,
+                "email": email,
+                "auth_source": auth_source,
+            }),
+        }
+    }
+
+    pub fn batch_created(batch_id: Uuid, user_id: UserId, endpoint: &str) -> Self {
+        Self {
+            event_type: WebhookEventType::BatchCreated.to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({
+                "batch_id": format!("batch_{}", batch_id),
+                "user_id": user_id,
+                "endpoint": endpoint,
+            }),
+        }
+    }
+
+    pub fn api_key_created(key_id: Uuid, user_id: UserId, created_by: UserId, name: &str) -> Self {
+        Self {
+            event_type: WebhookEventType::ApiKeyCreated.to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({
+                "api_key_id": key_id,
+                "user_id": user_id,
+                "created_by": created_by,
+                "name": name,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_type_from_str() {
+        assert_eq!(
+            "batch.completed".parse::<WebhookEventType>().unwrap(),
+            WebhookEventType::BatchCompleted
+        );
+        assert_eq!("user.created".parse::<WebhookEventType>().unwrap(), WebhookEventType::UserCreated);
+        assert_eq!("batch.created".parse::<WebhookEventType>().unwrap(), WebhookEventType::BatchCreated);
+        assert_eq!(
+            "api_key.created".parse::<WebhookEventType>().unwrap(),
+            WebhookEventType::ApiKeyCreated
+        );
+        assert!("invalid".parse::<WebhookEventType>().is_err());
+    }
+
+    #[test]
+    fn test_event_type_scope() {
+        assert_eq!(WebhookEventType::BatchCompleted.scope(), WebhookScope::Own);
+        assert_eq!(WebhookEventType::BatchFailed.scope(), WebhookScope::Own);
+        assert_eq!(WebhookEventType::UserCreated.scope(), WebhookScope::Platform);
+        assert_eq!(WebhookEventType::BatchCreated.scope(), WebhookScope::Platform);
+        assert_eq!(WebhookEventType::ApiKeyCreated.scope(), WebhookScope::Platform);
+    }
+
+    #[test]
+    fn test_webhook_event_serialization() {
+        let info = BatchNotificationInfo {
+            batch_id: "batch_00000000-0000-0000-0000-000000000000".to_string(),
+            batch_uuid: Uuid::nil(),
+            user_id: Uuid::nil(),
+            endpoint: "test".to_string(),
+            model: "test-model".to_string(),
+            outcome: crate::notifications::BatchOutcome::Completed,
+            created_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            total_requests: 100,
+            completed_requests: 98,
+            failed_requests: 2,
+            cancelled_requests: 0,
+            completion_window: "24h".to_string(),
+            filename: None,
+            description: None,
+            output_file_id: Some(Uuid::nil()),
+            error_file_id: Some(Uuid::nil()),
+        };
+
+        let event = WebhookEvent::batch_terminal(WebhookEventType::BatchCompleted, &info);
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("batch.completed"));
+        assert!(json.contains("batch_00000000-0000-0000-0000-000000000000"));
+    }
+
+    #[test]
+    fn test_user_created_event() {
+        let event = WebhookEvent::user_created(Uuid::nil(), "test@example.com", "native");
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("user.created"));
+        assert!(json.contains("test@example.com"));
+        assert!(json.contains("native"));
+    }
+
+    #[test]
+    fn test_batch_created_event() {
+        let batch_id = Uuid::nil();
+        let user_id = Uuid::nil();
+        let event = WebhookEvent::batch_created(batch_id, user_id, "/v1/chat/completions");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("batch.created"));
+        assert!(json.contains("batch_00000000-0000-0000-0000-000000000000"));
+        assert!(json.contains("/v1/chat/completions"));
+
+        let data = &event.data;
+        assert_eq!(data["endpoint"], "/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_api_key_created_event() {
+        let key_id = Uuid::nil();
+        let user_id = Uuid::nil();
+        let created_by = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let event = WebhookEvent::api_key_created(key_id, user_id, created_by, "My Test Key");
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("api_key.created"));
+        assert!(json.contains("My Test Key"));
+
+        let data = &event.data;
+        assert_eq!(data["name"], "My Test Key");
+        assert_eq!(data["user_id"], user_id.to_string());
+        assert_eq!(data["created_by"], created_by.to_string());
+    }
+
+    #[test]
+    fn test_batch_failed_event() {
+        let info = BatchNotificationInfo {
+            batch_id: "batch_00000000-0000-0000-0000-000000000000".to_string(),
+            batch_uuid: Uuid::nil(),
+            user_id: Uuid::nil(),
+            endpoint: "test".to_string(),
+            model: "test-model".to_string(),
+            outcome: crate::notifications::BatchOutcome::Failed,
+            created_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            total_requests: 50,
+            completed_requests: 0,
+            failed_requests: 50,
+            cancelled_requests: 0,
+            completion_window: "24h".to_string(),
+            filename: None,
+            description: None,
+            output_file_id: None,
+            error_file_id: Some(Uuid::nil()),
+        };
+
+        let event = WebhookEvent::batch_terminal(WebhookEventType::BatchFailed, &info);
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("batch.failed"));
+        assert!(json.contains("\"status\":\"failed\""));
+
+        let data = &event.data;
+        assert_eq!(data["request_counts"]["total"], 50);
+        assert_eq!(data["request_counts"]["failed"], 50);
+        assert!(data["output_file_id"].is_null());
+        assert!(!data["error_file_id"].is_null());
+    }
+}

@@ -1,0 +1,523 @@
+import { useState } from "react";
+import { NavLink, Link, useNavigate, useLocation } from "react-router-dom";
+import {
+  Settings,
+  Box,
+  Layers,
+  Users,
+  Key,
+  User,
+  Play,
+  Server,
+  ExternalLink,
+  LogOut,
+  ChevronUp,
+  ChevronRight,
+  DollarSign,
+  BarChart3,
+  LifeBuoy,
+  Activity,
+  Building,
+  Check,
+  Cable,
+  Plus,
+  Zap,
+} from "lucide-react";
+import {
+  useUser,
+  useConfig,
+  useUserBalance,
+  useTransactions,
+} from "../../../api/control-layer/hooks";
+import { UserAvatar, Tooltip, TooltipContent, TooltipTrigger } from "../../ui";
+import { useAuthorization } from "../../../utils";
+import { useAuth } from "../../../contexts/auth";
+import { useSettings, useOrganizationContext } from "../../../contexts";
+import { SupportRequestModal } from "../../modals";
+import { CreateOrganizationModal } from "../../features/organizations/CreateOrganizationModal";
+import { RouteErrorBoundary } from "../../common";
+import type { FeatureFlags } from "../../../contexts/settings/types";
+import onwardsLogo from "../../../assets/onwards-logo.svg";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
+  SidebarProvider,
+  SidebarInset,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { formatDollars } from "@/utils/money";
+
+interface NavItem {
+  path: string;
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  featureFlag?: keyof FeatureFlags;
+  demoOnly?: boolean;
+  hidden?: boolean;
+}
+
+export function AppSidebar() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { data: currentUser, isLoading: loading } = useUser("current", { include: "organizations" });
+  const { canAccessRoute, hasPermission } = useAuthorization();
+  const { logout } = useAuth();
+  const { isFeatureEnabled } = useSettings();
+  const { activeOrganizationId, isOrgContext, setActiveOrganization } =
+    useOrganizationContext();
+  const { data: config } = useConfig();
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+  const [isCreateOrgModalOpen, setIsCreateOrgModalOpen] = useState(false);
+
+  const canManageModels = hasPermission("manage-models");
+
+  const allNavItems: NavItem[] = [
+    { path: "/models", icon: Layers, label: "Models" },
+    {
+      path: "/responses",
+      icon: Zap,
+      label: "Responses",
+      demoOnly: false,
+      hidden:
+        config !== undefined &&
+        (!config.batches?.enabled || !config.batches?.async_requests?.enabled),
+    },
+    {
+      path: "/batches",
+      icon: Box,
+      label: "Batches",
+      demoOnly: false,
+      hidden: config !== undefined && !config.batches?.enabled,
+    },
+    {
+      path: "/endpoints",
+      icon: Server,
+      label: "Endpoints",
+      hidden: canManageModels,
+    },
+    { path: "/playground", icon: Play, label: "Playground" },
+    { path: "/analytics", icon: BarChart3, label: "Analytics" },
+    { path: "/users-groups", icon: Users, label: "User Access" },
+    ...(isOrgContext
+      ? [{ path: "/organization", icon: Building, label: "Organization" }]
+      : []),
+    { path: "/api-keys", icon: Key, label: "API Keys" },
+    { path: "/usage", icon: Activity, label: "Usage" },
+    { path: "/connections", icon: Cable, label: "Connections" },
+    { path: "/system", icon: Settings, label: "System" },
+  ];
+
+  const navItems = allNavItems.filter((item) => {
+    if (item.hidden) {
+      return false;
+    }
+    if (item.featureFlag && !isFeatureEnabled(item.featureFlag)) {
+      return false;
+    }
+    if (item.demoOnly && !isFeatureEnabled("demo")) {
+      return false;
+    }
+    return canAccessRoute(item.path);
+  });
+
+  return (
+    <Sidebar>
+      <SidebarHeader className="border-b border-sidebar-border">
+        <Link to="/" className="flex items-center px-2 py-4">
+          <img
+            src={onwardsLogo}
+            alt="Onwards"
+            className="h-10 w-auto hover:opacity-80 transition-opacity"
+          />
+        </Link>
+      </SidebarHeader>
+
+      <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {navItems.map((item) => {
+                if (item.path === "/models" && canManageModels) {
+                  const isManageModelsActive =
+                    location.pathname === "/models/manage" ||
+                    (location.pathname.startsWith("/models/manage/") &&
+                      location.pathname !== "/models/manage/providers");
+                  const isManageProvidersActive =
+                    location.pathname === "/models/manage/providers";
+                  const isEndpointsActive =
+                    location.pathname === "/endpoints";
+                  return (
+                    <Collapsible
+                      key="models"
+                      defaultOpen
+                      className="group/collapsible"
+                    >
+                      <SidebarMenuItem>
+                        <NavLink to="/models" end>
+                          {({ isActive }) => (
+                            <SidebarMenuButton
+                              isActive={isActive}
+                              className={
+                                isActive
+                                  ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
+                                  : "hover:bg-sidebar-border/50"
+                              }
+                            >
+                              <Layers className="h-4 w-4" />
+                              <span>Models</span>
+                            </SidebarMenuButton>
+                          )}
+                        </NavLink>
+                        <CollapsibleTrigger asChild>
+                          <SidebarMenuAction className="data-[state=open]:rotate-90 transition-transform">
+                            <ChevronRight />
+                          </SidebarMenuAction>
+                        </CollapsibleTrigger>
+                        <CollapsibleContent>
+                          <SidebarMenuSub>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isManageModelsActive}
+                                className={
+                                  isManageModelsActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/models/manage">
+                                  Manage Models
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isManageProvidersActive}
+                                className={
+                                  isManageProvidersActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/models/manage/providers">
+                                  Manage Providers
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                            <SidebarMenuSubItem>
+                              <SidebarMenuSubButton
+                                asChild
+                                isActive={isEndpointsActive}
+                                className={
+                                  isEndpointsActive
+                                    ? "bg-sidebar-accent! text-sidebar-accent-foreground!"
+                                    : "hover:bg-sidebar-border/50 hover:text-sidebar-foreground"
+                                }
+                              >
+                                <NavLink to="/endpoints">
+                                  Manage Endpoints
+                                </NavLink>
+                              </SidebarMenuSubButton>
+                            </SidebarMenuSubItem>
+                          </SidebarMenuSub>
+                        </CollapsibleContent>
+                      </SidebarMenuItem>
+                    </Collapsible>
+                  );
+                }
+
+                return (
+                  <SidebarMenuItem key={item.path}>
+                    <NavLink to={item.path}>
+                      {({ isActive }) => (
+                        <SidebarMenuButton
+                          isActive={isActive}
+                          className={
+                            isActive
+                              ? "bg-sidebar-accent! text-sidebar-accent-foreground! hover:bg-sidebar-accent!"
+                              : "hover:bg-sidebar-border/50"
+                          }
+                        >
+                          <item.icon className="h-4 w-4" />
+                          <span>{item.label}</span>
+                        </SidebarMenuButton>
+                      )}
+                    </NavLink>
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+
+      <SidebarFooter className="border-t border-sidebar-border">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              className="w-full justify-start px-2 py-2 h-auto hover:bg-sidebar-border/50"
+            >
+              <div className="flex items-center gap-3 w-full">
+                {loading ? (
+                  <>
+                    <div className="w-10 h-10 bg-muted rounded-full animate-pulse"></div>
+                    <div className="flex-1 min-w-0">
+                      <div className="h-4 bg-muted rounded animate-pulse mb-1 w-24"></div>
+                      <div className="h-3 bg-muted rounded animate-pulse w-12"></div>
+                    </div>
+                  </>
+                ) : currentUser ? (
+                  <>
+                    <UserAvatar user={currentUser} size="lg" />
+                    <div className="flex-1 text-left min-w-0">
+                      <p className="text-sm font-medium truncate">
+                        {currentUser.display_name || currentUser.username}
+                      </p>
+                      <p className="text-xs text-muted-foreground truncate">
+                        {currentUser.email}
+                      </p>
+                    </div>
+                    <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                  </>
+                ) : (
+                  <>
+                    <div className="w-10 h-10 bg-muted rounded-full flex items-center justify-center">
+                      <User className="w-5 h-5 text-muted-foreground" />
+                    </div>
+                    <div className="flex-1 text-left min-w-0">
+                      <p className="text-sm font-medium">Unknown User</p>
+                      <p className="text-xs text-muted-foreground">
+                        Error loading
+                      </p>
+                    </div>
+                    <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                  </>
+                )}
+              </div>
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
+            {currentUser?.organizations &&
+              currentUser.organizations.length > 0 && (
+                <>
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">
+                    Switch Account
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem
+                    onClick={() => void setActiveOrganization(null).catch(console.error)}
+                  >
+                    <User className="w-4 h-4 mr-2" />
+                    Personal
+                    {!activeOrganizationId && (
+                      <Check className="w-4 h-4 ml-auto" />
+                    )}
+                  </DropdownMenuItem>
+                  {currentUser.organizations.map((org) => (
+                    <DropdownMenuItem
+                      key={org.id}
+                      onClick={() => void setActiveOrganization(org.id).catch(console.error)}
+                    >
+                      <Building className="w-4 h-4 mr-2" />
+                      <span className="truncate">{org.name}</span>
+                      {activeOrganizationId === org.id && (
+                        <Check className="w-4 h-4 ml-auto flex-shrink-0" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                </>
+              )}
+            <DropdownMenuItem onClick={() => setIsCreateOrgModalOpen(true)}>
+              <Plus className="w-4 h-4 mr-2" />
+              New Organization
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => navigate("/profile")}>
+              <User className="w-4 h-4 mr-2" />
+              Profile
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => navigate("/cost-management")}>
+              <DollarSign className="w-4 h-4 mr-2" />
+              Billing
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => setIsSupportModalOpen(true)}>
+              <LifeBuoy className="w-4 h-4 mr-2" />
+              Support
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => logout()}>
+              <LogOut className="w-4 h-4 mr-2" />
+              Logout
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarFooter>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+      />
+      <CreateOrganizationModal
+        isOpen={isCreateOrgModalOpen}
+        onClose={() => setIsCreateOrgModalOpen(false)}
+        isPlatformManager={hasPermission("users-groups")}
+      />
+    </Sidebar>
+  );
+}
+
+export function AppLayout({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  const { data: config, isLoading: configLoading } = useConfig();
+  const { isFeatureEnabled } = useSettings();
+  const { activeOrganizationId, activeOrganization } =
+    useOrganizationContext();
+  const isDemoMode = isFeatureEnabled("demo");
+  const [isSupportModalOpen, setIsSupportModalOpen] = useState(false);
+
+  const balanceUserId = activeOrganizationId || user?.id || "";
+
+  const { data: balance = 0 } = useUserBalance(balanceUserId);
+  const { data: transactionsData } = useTransactions({
+    userId: balanceUserId,
+  });
+
+  const currentBalance =
+    isDemoMode && transactionsData?.page_start_balance !== undefined
+      ? transactionsData.page_start_balance
+      : balance;
+
+  return (
+    <SidebarProvider>
+      <div className="flex min-h-screen w-full">
+        <AppSidebar />
+        <SidebarInset className="flex flex-col flex-1">
+          <header className="flex h-16 items-center justify-between border-b px-4 md:px-6">
+            <div className="flex items-center gap-2">
+              <SidebarTrigger />
+              {activeOrganization && (
+                <div className="flex items-center gap-2 rounded-md bg-muted px-3 py-1.5 text-sm">
+                  <Building className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="font-medium">{activeOrganization.name}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-3 md:gap-6 text-sm text-muted-foreground">
+              {!configLoading && config && (
+                <>
+                  {config.region && (
+                    <>
+                      { }
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div
+                            tabIndex={0}
+                            className="hidden lg:flex items-center gap-2 cursor-help rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            <span className="text-muted-foreground/70">
+                              Region:
+                            </span>
+                            <span className="font-medium text-foreground">
+                              {config.region}
+                            </span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          Your account and its data live in the{" "}
+                          {config.region} region. To use an account in a
+                          different region, sign out and sign in at that
+                          region's URL.
+                        </TooltipContent>
+                      </Tooltip>
+                      <div className="hidden lg:block w-px h-4 bg-border"></div>
+                    </>
+                  )}
+                  {config.organization && (
+                    <>
+                      <div className="hidden md:flex items-center gap-2">
+                        <span className="text-muted-foreground/70">
+                          Organization:
+                        </span>
+                        <span className="font-medium text-foreground">
+                          {config.organization}
+                        </span>
+                      </div>
+                      <div className="hidden lg:block w-px h-4 bg-border"></div>
+                    </>
+                  )}
+                  <Link
+                    to="/cost-management"
+                    className="flex items-center gap-2 text-sm hover:text-primary transition-colors"
+                  >
+                    <span className="text-gray-600">Balance:</span>
+                    <span className="font-semibold text-gray-900">
+                      {formatDollars(currentBalance)}
+                    </span>
+                  </Link>
+                  <div className="hidden md:block w-px h-4 bg-border"></div>
+                </>
+              )}
+              <button
+                onClick={() => setIsSupportModalOpen(true)}
+                className="hidden md:block text-muted-foreground hover:text-primary transition-colors font-medium"
+              >
+                Request a model
+              </button>
+              {config?.docs_url && (
+                <>
+                  <div className="hidden md:block w-px h-4 bg-border"></div>
+                <a
+                  href={config.docs_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-2 text-muted-foreground hover:text-primary transition-colors font-medium"
+                >
+                  <span className="hidden sm:inline">Documentation</span>
+                  <span className="sm:hidden">Docs</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+                </>
+              )}
+              <ThemeToggle />
+            </div>
+          </header>
+          <main className="flex-1">
+            <RouteErrorBoundary>{children}</RouteErrorBoundary>
+          </main>
+        </SidebarInset>
+      </div>
+
+      <SupportRequestModal
+        isOpen={isSupportModalOpen}
+        onClose={() => setIsSupportModalOpen(false)}
+        defaultSubject="Model/Feature Request"
+      />
+    </SidebarProvider>
+  );
+}

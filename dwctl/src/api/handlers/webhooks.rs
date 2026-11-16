@@ -1,0 +1,1052 @@
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Json,
+};
+use sqlx_pool_router::PoolProvider;
+use tracing::instrument;
+
+use crate::{
+    AppState,
+    api::models::webhooks::{
+        UserWebhookPathParams, WebhookCreate, WebhookPathParams, WebhookResponse, WebhookUpdate, WebhookWithSecretResponse,
+    },
+    auth::permissions,
+    db::handlers::Webhooks,
+    db::models::webhooks::{WebhookCreateDBRequest, WebhookUpdateDBRequest},
+    errors::{Error, Result},
+    types::{Operation, Permission, Resource, UserId, UserIdOrCurrent},
+    webhooks::{WebhookEventType, WebhookScope, signing},
+};
+
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/webhooks",
+    tag = "webhooks",
+    summary = "List webhooks",
+    description = "List all webhooks for a user. Users can list their own webhooks; admins can list any user's webhooks; members of an organization can list webhooks owned by that organization (read-only).",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+    ),
+    responses(
+        (status = 200, description = "List of webhooks", body = [WebhookResponse]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn list_webhooks<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<UserWebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+) -> Result<Json<Vec<WebhookResponse>>> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
+    let can_read_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !is_member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::ReadAll),
+                    Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadAll,
+                resource: format!("webhooks for user {}", target_user_id),
+            });
+        }
+    }
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut conn);
+
+    let webhooks = repo.list_by_user(target_user_id).await?;
+    let responses: Vec<WebhookResponse> = webhooks
+        .into_iter()
+        .filter(|webhook| webhook.scope != "platform" || current_user.can_manage_platform())
+        .map(Into::into)
+        .collect();
+
+    Ok(Json(responses))
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/webhooks",
+    tag = "webhooks",
+    summary = "Create webhook",
+    description = "Create a new webhook for a user. Returns the secret which is only shown once.",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+    ),
+    request_body = WebhookCreate,
+    responses(
+        (status = 201, description = "Webhook created", body = WebhookWithSecretResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn create_webhook<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<UserWebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+    Json(request): Json<WebhookCreate>,
+) -> Result<(StatusCode, Json<WebhookWithSecretResponse>)> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_create_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::CreateAll);
+    let can_create_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::CreateOwn);
+
+    if !can_create_all && !can_create_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::CreateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::CreateOwn),
+                ]),
+                action: Operation::CreateAll,
+                resource: format!("webhooks for user {}", target_user_id),
+            });
+        }
+    }
+
+    let is_local = request.url.starts_with("http://localhost") || request.url.starts_with("http://127.0.0.1");
+    if !request.url.starts_with("https://") && !is_local {
+        return Err(Error::BadRequest {
+            message: "Webhook URL must use HTTPS (HTTP allowed for localhost only)".to_string(),
+        });
+    }
+
+    if request.scope != "own" && request.scope != "platform" {
+        return Err(Error::BadRequest {
+            message: format!("Invalid scope: '{}'. Valid scopes are: own, platform", request.scope),
+        });
+    }
+
+    if request.scope == "platform" && !current_user.can_manage_platform() {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Webhooks, Operation::CreateAll),
+            action: Operation::CreateAll,
+            resource: "platform-scoped webhooks".to_string(),
+        });
+    }
+
+    if let Some(ref event_types) = request.event_types {
+        for event_type in event_types {
+            let parsed = event_type.parse::<WebhookEventType>().map_err(|_| Error::BadRequest {
+                message: format!(
+                    "Invalid event type: '{}'. Valid types are: batch.completed, batch.failed, user.created, batch.created, api_key.created",
+                    event_type,
+                ),
+            })?;
+            let expected_scope = if request.scope == "platform" {
+                WebhookScope::Platform
+            } else {
+                WebhookScope::Own
+            };
+            if parsed.scope() != expected_scope {
+                return Err(Error::BadRequest {
+                    message: format!(
+                        "Event type '{}' belongs to scope '{:?}', but webhook scope is '{}'",
+                        event_type,
+                        parsed.scope(),
+                        request.scope,
+                    ),
+                });
+            }
+        }
+    }
+
+    let secret = signing::generate_secret();
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut tx);
+
+    let db_request = WebhookCreateDBRequest {
+        user_id: target_user_id,
+        url: request.url,
+        secret,
+        event_types: request.event_types,
+        description: request.description,
+        scope: request.scope,
+    };
+
+    let webhook = repo.create(&db_request).await?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok((StatusCode::CREATED, Json(webhook.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/webhooks/{webhook_id}",
+    tag = "webhooks",
+    summary = "Get webhook",
+    description = "Get a specific webhook. Users can read their own webhooks; admins can read any user's webhooks; members of an organization can read webhooks owned by that organization (read-only). Secret is not included in the response.",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+        ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
+    ),
+    responses(
+        (status = 200, description = "Webhook details", body = WebhookResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Webhook not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn get_webhook<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<WebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+) -> Result<Json<WebhookResponse>> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_read_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadAll);
+    let can_read_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::ReadOwn);
+
+    if !can_read_all && !can_read_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let is_member = permissions::is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !is_member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::ReadAll),
+                    Permission::Allow(Resource::Webhooks, Operation::ReadOwn),
+                ]),
+                action: Operation::ReadAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
+    }
+
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut conn);
+
+    let webhook = repo.get_by_id(params.webhook_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "Webhook".to_string(),
+        id: params.webhook_id.to_string(),
+    })?;
+
+    if webhook.user_id != target_user_id || (webhook.scope == "platform" && !current_user.can_manage_platform()) {
+        return Err(Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        });
+    }
+
+    Ok(Json(webhook.into()))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/users/{user_id}/webhooks/{webhook_id}",
+    tag = "webhooks",
+    summary = "Update webhook",
+    description = "Update a webhook's URL, enabled status, event types, or description.",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+        ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
+    ),
+    request_body = WebhookUpdate,
+    responses(
+        (status = 200, description = "Webhook updated", body = WebhookResponse),
+        (status = 400, description = "Bad request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Webhook not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn update_webhook<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<WebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+    Json(request): Json<WebhookUpdate>,
+) -> Result<Json<WebhookResponse>> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_update_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateAll);
+    let can_update_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
+
+    if !can_update_all && !can_update_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
+    }
+
+    if let Some(ref url) = request.url {
+        let is_local = url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1");
+        if !url.starts_with("https://") && !is_local {
+            return Err(Error::BadRequest {
+                message: "Webhook URL must use HTTPS (HTTP allowed for localhost only)".to_string(),
+            });
+        }
+    }
+
+    if let Some(Some(ref event_types)) = request.event_types {
+        for event_type in event_types {
+            if event_type.parse::<WebhookEventType>().is_err() {
+                return Err(Error::BadRequest {
+                    message: format!(
+                        "Invalid event type: {}. Valid types are: batch.completed, batch.failed, user.created, batch.created, api_key.created",
+                        event_type
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut tx);
+
+    let existing = repo.get_by_id(params.webhook_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "Webhook".to_string(),
+        id: params.webhook_id.to_string(),
+    })?;
+
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
+        return Err(Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        });
+    }
+
+    let db_request = WebhookUpdateDBRequest {
+        url: request.url,
+        enabled: request.enabled,
+        event_types: request.event_types,
+        description: request.description,
+    };
+
+    let webhook = repo.update(params.webhook_id, &db_request).await?.ok_or_else(|| Error::NotFound {
+        resource: "Webhook".to_string(),
+        id: params.webhook_id.to_string(),
+    })?;
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(webhook.into()))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/users/{user_id}/webhooks/{webhook_id}",
+    tag = "webhooks",
+    summary = "Delete webhook",
+    description = "Delete a webhook.",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+        ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
+    ),
+    responses(
+        (status = 204, description = "Webhook deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Webhook not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn delete_webhook<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<WebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+) -> Result<StatusCode> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_delete_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::DeleteAll);
+    let can_delete_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::DeleteOwn);
+
+    if !can_delete_all && !can_delete_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::DeleteAll),
+                    Permission::Allow(Resource::Webhooks, Operation::DeleteOwn),
+                ]),
+                action: Operation::DeleteAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut tx);
+
+    let existing = repo.get_by_id(params.webhook_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "Webhook".to_string(),
+        id: params.webhook_id.to_string(),
+    })?;
+
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
+        return Err(Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        });
+    }
+
+    let deleted = repo.delete(params.webhook_id).await?;
+    if !deleted {
+        return Err(Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        });
+    }
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/webhooks/{webhook_id}/rotate-secret",
+    tag = "webhooks",
+    summary = "Rotate webhook secret",
+    description = "Generate a new secret for a webhook. Returns the new secret which is only shown once.",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID"),
+        ("webhook_id" = uuid::Uuid, Path, description = "Webhook ID"),
+    ),
+    responses(
+        (status = 200, description = "Secret rotated", body = WebhookWithSecretResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Webhook not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[instrument(skip_all)]
+pub async fn rotate_secret<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(params): Path<WebhookPathParams>,
+    current_user: crate::api::models::users::CurrentUser,
+) -> Result<Json<WebhookWithSecretResponse>> {
+    let target_user_id: UserId = match params.user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(id) => id,
+    };
+
+    let can_update_all = permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateAll);
+    let can_update_own =
+        target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Webhooks, Operation::UpdateOwn);
+
+    if !can_update_all && !can_update_own {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let can_org = permissions::can_manage_org_resource(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateAll),
+                    Permission::Allow(Resource::Webhooks, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateAll,
+                resource: format!("webhook {}", params.webhook_id),
+            });
+        }
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Webhooks::new(&mut tx);
+
+    let existing = repo.get_by_id(params.webhook_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "Webhook".to_string(),
+        id: params.webhook_id.to_string(),
+    })?;
+
+    if existing.user_id != target_user_id || (existing.scope == "platform" && !current_user.can_manage_platform()) {
+        return Err(Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        });
+    }
+
+    let new_secret = signing::generate_secret();
+    let webhook = repo
+        .rotate_secret(params.webhook_id, new_secret)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Webhook".to_string(),
+            id: params.webhook_id.to_string(),
+        })?;
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(webhook.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::users::Role;
+    use crate::test::utils::*;
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook",
+            "description": "Test webhook"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        response.assert_status(StatusCode::CREATED);
+        let created: WebhookWithSecretResponse = response.json();
+        assert_eq!(created.url, "https://example.com/webhook");
+        assert!(created.secret.starts_with("whsec_"));
+        assert!(created.enabled);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_webhook_requires_https(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "http://example.com/webhook"
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        response.assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_webhook_invalid_event_type(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook",
+            "event_types": ["invalid.event"]
+        });
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        response.assert_status_bad_request();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        app.post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let webhooks: Vec<WebhookResponse> = response.json();
+        assert_eq!(webhooks.len(), 1);
+        assert_eq!(webhooks[0].url, "https://example.com/webhook");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        let create_response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let created: WebhookWithSecretResponse = create_response.json();
+
+        let update_data = json!({
+            "url": "https://example.com/new-webhook",
+            "enabled": false
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}/webhooks/{}", user.id, created.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_ok();
+        let updated: WebhookResponse = response.json();
+        assert_eq!(updated.url, "https://example.com/new-webhook");
+        assert!(!updated.enabled);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        let create_response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let created: WebhookWithSecretResponse = create_response.json();
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/webhooks/{}", user.id, created.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(StatusCode::NO_CONTENT);
+
+        let get_response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks/{}", user.id, created.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        get_response.assert_status_not_found();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_rotate_secret(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        let create_response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let created: WebhookWithSecretResponse = create_response.json();
+        let old_secret = created.secret.clone();
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks/{}/rotate-secret", user.id, created.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let rotated: WebhookWithSecretResponse = response.json();
+        assert_ne!(rotated.secret, old_secret);
+        assert!(rotated.secret.starts_with("whsec_"));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_cannot_access_other_users_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        let create_response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user1.id))
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let created: WebhookWithSecretResponse = create_response.json();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks/{}", user1.id, created.id))
+            .add_header(&add_auth_headers(&user2)[0].0, &add_auth_headers(&user2)[0].1)
+            .add_header(&add_auth_headers(&user2)[1].0, &add_auth_headers(&user2)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_admin_cannot_access_other_users_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let webhook_data = json!({
+            "url": "https://example.com/webhook"
+        });
+
+        let create_response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&webhook_data)
+            .await;
+
+        let created: WebhookWithSecretResponse = create_response.json();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks/{}", user.id, created.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+
+    async fn create_org_webhook(
+        app: &axum_test::TestServer,
+        owner: &crate::api::models::users::UserResponse,
+        org_id: UserId,
+        url: &str,
+    ) -> WebhookWithSecretResponse {
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org_id))
+            .add_header(&add_auth_headers(owner)[0].0, &add_auth_headers(owner)[0].1)
+            .add_header(&add_auth_headers(owner)[1].0, &add_auth_headers(owner)[1].1)
+            .json(&json!({ "url": url }))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        response.json()
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_can_list_org_webhooks_without_secrets(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let webhooks: Vec<WebhookResponse> = response.json();
+        assert_eq!(webhooks.len(), 1);
+        assert_eq!(webhooks[0].url, "https://example.com/hook");
+
+        let raw: serde_json::Value = response.json();
+        let item = &raw.as_array().unwrap()[0];
+        assert!(item.get("secret").is_none(), "list response must not include secret");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_can_get_single_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let raw: serde_json::Value = response.json();
+        assert!(raw.get("secret").is_none(), "get response must not include secret");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_non_member_cannot_list_org_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let outsider = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+
+        create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&outsider)[0].0, &add_auth_headers(&outsider)[0].1)
+            .add_header(&add_auth_headers(&outsider)[1].0, &add_auth_headers(&outsider)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_create_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "url": "https://example.com/hook" }))
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_update_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "enabled": false }))
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_delete_org_webhook(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}/webhooks/{}", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_member_cannot_rotate_org_webhook_secret(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        let created = create_org_webhook(&app, &alice, org.id, "https://example.com/hook").await;
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks/{}/rotate-secret", org.id, created.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_org_admin_can_still_manage_webhooks(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "admin").await;
+
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/webhooks", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({ "url": "https://example.com/hook" }))
+            .await;
+
+        response.assert_status(StatusCode::CREATED);
+        let webhook: WebhookWithSecretResponse = response.json();
+        let collection = format!("/admin/api/v1/users/{}/webhooks", org.id);
+        let item = format!("{collection}/{}", webhook.id);
+
+        sqlx::query("DELETE FROM user_organizations WHERE user_id = $1 AND organization_id = $2")
+            .bind(bob.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let headers = add_auth_headers(&bob);
+        for path in [&collection, &item] {
+            app.get(path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await
+                .assert_status_forbidden();
+        }
+        app.post(&collection)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"url": "https://example.com/revoked"}))
+            .await
+            .assert_status_forbidden();
+        app.patch(&item)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"enabled": false}))
+            .await
+            .assert_status_forbidden();
+        app.delete(&item)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .assert_status_forbidden();
+        app.post(&format!("{item}/rotate-secret"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .assert_status_forbidden();
+    }
+}

@@ -1,0 +1,328 @@
+# Control Layer API Server (dwctl)
+
+Rust-based API server for user, group, and model management with PostgreSQL database.
+
+## Local Development Setup
+
+### Prerequisites
+
+- Rust (latest stable)
+- PostgreSQL running locally
+- sqlx-cli: `cargo install sqlx-cli`
+
+### 1. Database Setup
+
+```bash
+# Start PostgreSQL (macOS with Homebrew)
+brew services start postgresql
+
+# Create database
+createdb control_layer
+
+# Or connect to existing PostgreSQL instance
+psql -c "CREATE DATABASE control_layer;"
+```
+
+### 2. Environment Configuration
+
+Create `.env` file in the `dwctl` directory:
+
+```bash
+# dwctl/.env
+DATABASE_URL=postgres://your-username@localhost:5432/control_layer
+```
+
+Replace `your-username` with your PostgreSQL username.
+
+### 3. Run Database Migrations
+
+```bash
+cd dwctl
+sqlx migrate run
+```
+
+### 4. Generate Query Cache (for builds without database)
+
+```bash
+# Generate offline query cache
+cargo sqlx prepare
+
+# This creates .sqlx/ directory with cached query metadata
+```
+
+## Running the Service
+
+```bash
+cd dwctl
+
+# Run with live database connection
+cargo run
+
+# Run tests (requires database)
+cargo test
+```
+
+## Configuration
+
+The service uses `config.yaml` (or `DWCTL_*` environment variables):
+
+- `DWCTL_HOST`: Server host (default: 0.0.0.0)
+- `DWCTL_PORT`: Server port (default: 3001)
+- `DATABASE_URL`: PostgreSQL connection string
+
+### Database Configuration
+
+The control layer uses PostgreSQL for data storage. By default, all components share a single database using separate schemas:
+
+- **Main schema** (`public`): Core application data (users, groups, models, etc.)
+- **Fusillade schema** (`fusillade`): Batch processing data
+- **Outlet schema** (`outlet`): Request logging data
+
+#### Basic Configuration
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+```
+
+#### With Read Replica
+
+For high-traffic deployments, you can configure a read replica for read-heavy operations:
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@primary:5432/dwctl
+  replica_url: postgres://user:pass@replica:5432/dwctl
+```
+
+#### Component Database Isolation
+
+Components can optionally use dedicated databases instead of schemas. This is useful for:
+
+- Isolating workloads (batch processing won't affect main app)
+- Independent scaling and backups
+- Using different database instances for different components
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+
+  # Use dedicated database for batch processing
+  fusillade:
+    mode: dedicated
+    url: postgres://user:pass@localhost:5432/fusillade
+    replica_url: postgres://user:pass@replica:5432/fusillade
+    pool:
+      max_connections: 30
+
+  # Keep outlet in main database (default behavior)
+  outlet:
+    mode: schema
+    name: outlet
+    pool:
+      max_connections: 5
+```
+
+#### Connection Pool Settings
+
+Each component can have its own pool configuration:
+
+```yaml
+database:
+  type: external
+  url: postgres://user:pass@localhost:5432/dwctl
+  pool:
+    max_connections: 10
+    min_connections: 0
+    acquire_timeout_secs: 30
+    idle_timeout_secs: 600
+    max_lifetime_secs: 1800
+```
+
+## Authentication
+
+Control Layer supports two authentication methods:
+
+### Native Authentication
+
+Username/password authentication with session cookies. Users can register and log in directly through the Control Layer UI or API.
+
+### Proxy Header Authentication
+
+Accepts user identity from HTTP headers set by an upstream authentication proxy (e.g., oauth2-proxy, Vouch, Authentik, Auth0).
+
+#### Header Configuration
+
+You can configure authentication in two ways:
+
+**Single Header Mode (Simple)**
+
+- Send only `x-doubleword-user` header with the user's email
+- The email must be unique per user
+- Example: `x-doubleword-user: "user@example.com"`
+
+**Dual Header Mode (Federated Identity)**
+
+- Send both `x-doubleword-user` (unique identifier from IdP) and `x-doubleword-email` (email address)
+- Allows multiple accounts with the same email from different identity providers
+- The combination of (email, external_user_id) must be unique
+- Examples:
+  - GitHub user: `x-doubleword-user: "github|user123"`, `x-doubleword-email: "user@example.com"`
+  - Google user: `x-doubleword-user: "google-oauth2|456"`, `x-doubleword-email: "user@example.com"`
+
+In dual header mode, the same email can belong to different users as long as they have different external user IDs from their identity providers.
+
+#### Configuration
+
+See `config.yaml` for proxy header authentication settings:
+
+```yaml
+auth:
+  proxy_header:
+    enabled: true
+    header_name: "x-doubleword-user"           # User identifier or email (single mode)
+    email_header_name: "x-doubleword-email"    # User's email (dual mode, optional)
+    auto_create_users: true                     # Auto-create users on first login
+```
+
+## User Roles and Permissions
+
+Control Layer uses an additive role-based access control system where users can have multiple roles that combine to provide different levels of access.
+
+### Role Types
+
+#### StandardUser (Base Role)
+
+- **Required for all users** - Cannot be removed
+- Enables basic authentication and login functionality
+- Provides access to user's own profile and data
+- Allows model access, API key creation, and playground usage
+- Foundation role that all other roles build upon
+
+#### PlatformManager
+
+- **Administrative access** to most platform functionality
+- Can create, update, and delete users
+- Can manage groups and group memberships
+- Can control access to models and manage inference endpoints
+- Can configure system settings
+- **Cannot** view private request data (requires RequestViewer)
+
+#### RequestViewer
+
+- **Read-only access** to request logs and analytics
+- Can view all requests that have transited the gateway
+- Useful for auditing, monitoring, and analytics purposes
+- Often combined with other roles for full administrative access
+
+### Role Combinations
+
+Roles are additive, meaning users gain the combined permissions of all their assigned roles:
+
+- **StandardUser only**: Basic user with profile access and model usage
+- **StandardUser + PlatformManager**: Full administrative access except request viewing
+- **StandardUser + RequestViewer**: Basic user who can also view request logs
+- **StandardUser + PlatformManager + RequestViewer**: Full system administrator with all permissions
+
+### Role Management
+
+- All users automatically receive and retain the `StandardUser` role
+- Additional roles can be assigned/removed via the admin interface
+- The system automatically ensures `StandardUser` is preserved during role updates
+- Role changes take effect immediately without requiring user re-authentication, unless using native auth with jwts, whereby a user needs to logout and back for API access effects to take place
+
+## Troubleshooting
+
+**Database connection errors**
+
+- Ensure PostgreSQL is running: `brew services start postgresql`
+- Check DATABASE_URL in `.env` file
+- Verify database exists: `psql -l | grep control_layer`
+
+**Migration errors**
+
+```bash
+# Reset database
+sqlx database reset # add `-y` to skip confirmation and `-f` if you get a
+                    # 'other user are connected' error (usually your IDE is also connected)
+```
+
+## Database Schema
+
+Migrations are stored in the `migrations/` directory. By default they run
+automatically on startup (`migrations.mode: run`); deployments run them from a
+pre-rollout Job with `dwctl migrate` and set `migrations.mode: check` on the
+serving pods. See [docs/migrations.md](../docs/migrations.md) for how to add
+migrations, concurrent indexes and destructive changes.
+
+- `001_initial.sql` - Users, groups, models tables
+- `002_listen_notify.sql` - PostgreSQL notify triggers
+- `003_make_hosted_on_not_null.sql` - Schema updates
+
+## API Endpoints
+
+- See OpenAPI docs at `/admin/docs` when running
+- AI proxy requests are served under `/ai/v1/*` (e.g. `/ai/v1/chat/completions`, `/ai/v1/responses`) and routed by the embedded `onwards` layer
+- Management API requests are served under `/admin/api/v1/*`
+- Provider display configs (operator-set logos / display names for inference providers) live under `/admin/api/v1/provider-display-configs`, with `GET .../{provider_key}/icon` serving as a same-origin proxy for operator-set icon URLs so the dashboard can keep a tight `img-src` CSP regardless of which CDN an admin pastes
+
+## First-token metrics
+
+The embedded onwards proxy records `onwards_first_token_seconds` and
+`onwards_first_token_breaches_total` with `model`, `pool`, and `role` labels.
+The histogram measures observed strict-mode SSE data frames; the counter
+records first-token failover deadlines, including waits for response headers.
+Timeouts never enter the latency histogram. See
+[First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
+for sampling limits and label semantics before using these series to compare
+providers. Eligible priority pools also use the AIMD controller described below.
+
+### Load-aware priority routing (AIMD)
+
+Priority composite models with fallback enabled use an AIMD preferred-first
+traffic share controller by default, including existing models. Override its
+settings through the model API's `aimd` object and explicit `first_token_timeout_ms`. The controller applies only to strict-mode
+streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
+`PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
+
+By default the share decreases by 20% when more than 10% of the preferred
+provider's recent completed attempts breach — a first frame later than 10 seconds
+(the attempt keeps streaming; `onwards.first_token_timeout_ms` only cuts it off
+and fails over at 20 seconds), or an overload status (429, 503, 529) — holds between 3% and 10%, and recovers by
+five percentage points per healthy 30-second dwell. Pools with too few samples to
+judge recover a step every five minutes. Other errors and cancellations are
+excluded rather than counted either way.
+
+`onwards_provider_share{model,pool}` reports the configured preferred-first share;
+`onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.
+`onwards_aimd_active`, `onwards_aimd_window_samples`, `onwards_aimd_window_breach_rate`
+and `onwards_aimd_in_flight` expose controller state, and
+`onwards_aimd_unknown_total` / `onwards_aimd_overload_breaches_total{status}` count
+excluded and overload outcomes. The share is per gateway process, and
+capacity/concurrency constraints can change the realized split.
+
+`fallback_realtime_on_status` on a model (default `[529]` for new composite models;
+the dashboard's "Overloaded (529, realtime only)" failover switch) lists upstream
+statuses that fail a realtime request over to the next provider, in addition to
+`fallback_on_status`. Fusillade daemon traffic is never affected. Catalog files set
+it as `routing.fallback.realtime_on_status`; omitting it keeps the stored value.
+See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
+before enabling a model. The existing histogram is not the controller denominator.
+
+### Conversation affinity
+
+Priority composite models can keep each conversation on one side of the
+preferred/alternate split instead of choosing per request, so the provider that
+holds a conversation's prefix cache keeps serving it. Set it through the model
+API's `affinity` object or the catalog's `routing.fallback.affinity`, with
+`target_conversations` sized to what the preferred member can serve
+concurrently; it does not adapt on its own. `PATCH {"affinity": null}` returns the
+model to per-request selection. Gateway replicas agree without shared state.
+
+`onwards_affinity_share{model,pool}`, `onwards_affinity_active_conversations` and
+`onwards_affinity_admitted_conversations` report each process's view;
+`onwards_affinity_routed_total{model,pool,side}` counts decisions. See
+[conversation affinity](../onwards/docs/src/load-balancing.md#conversation-affinity).

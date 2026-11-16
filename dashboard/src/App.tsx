@@ -1,0 +1,665 @@
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Component, useEffect, Suspense, type ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+import { ThemeProvider } from "next-themes";
+import { Toaster } from "./components/ui/sonner";
+import { AppLayout } from "./components/layout";
+import {
+  ProtectedRoute,
+  LoginForm,
+  RegisterForm,
+  AuthGuard,
+  PasswordResetRequestForm,
+  PasswordResetForm,
+} from "./components/auth";
+import { SettingsProvider, useSettings, OrganizationProvider } from "./contexts";
+import { AuthProvider, useAuth } from "./contexts/auth";
+import { useAuthorization, lazyWithRetry } from "./utils";
+import { useRegistrationInfo } from "./api/control-layer/hooks";
+import { captureException } from "./lib/telemetry";
+import { TelemetryIdentity } from "./lib/TelemetryIdentity";
+
+class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    console.error("React ErrorBoundary caught:", error, info.componentStack);
+    captureException(error, {
+      source: "react-error-boundary",
+      componentStack: info.componentStack ?? undefined,
+    });
+  }
+  render() {
+    if (this.state.error) {
+      const showDetails = import.meta.env.DEV;
+      return (
+        <div style={{ padding: 32, fontFamily: "monospace" }}>
+          <h2 style={{ color: "red" }}>Something went wrong</h2>
+          {showDetails ? (
+            <>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 14 }}>
+                {this.state.error.message}
+              </pre>
+              <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#666" }}>
+                {this.state.error.stack}
+              </pre>
+            </>
+          ) : (
+            <p>An unexpected error occurred. Please try reloading the page.</p>
+          )}
+          <button
+            onClick={() => {
+              localStorage.removeItem("demo-mode-state");
+              window.location.reload();
+            }}
+            style={{ marginTop: 16, padding: "8px 16px" }}
+          >
+            Clear demo state & reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const ApiKeys = lazyWithRetry(() =>
+  import("./components/features/api-keys").then((m) => ({
+    default: m.ApiKeys,
+  })),
+);
+const CostManagement = lazyWithRetry(() =>
+  import("./components/features/cost-management").then((m) => ({
+    default: m.CostManagement,
+  })),
+);
+const Endpoints = lazyWithRetry(() =>
+  import("./components/features/endpoints").then((m) => ({
+    default: m.Endpoints,
+  })),
+);
+const ModelCatalog = lazyWithRetry(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelCatalog,
+  })),
+);
+const ModelDetail = lazyWithRetry(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelDetail,
+  })),
+);
+const Models = lazyWithRetry(() =>
+  import("./components/features/models").then((m) => ({ default: m.Models })),
+);
+const ModelInfo = lazyWithRetry(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ModelInfo,
+  })),
+);
+const ProviderDisplayConfigs = lazyWithRetry(() =>
+  import("./components/features/models").then((m) => ({
+    default: m.ProviderDisplayConfigs,
+  })),
+);
+const Playground = lazyWithRetry(() =>
+  import("./components/features/playground").then((m) => ({
+    default: m.Playground,
+  })),
+);
+const Profile = lazyWithRetry(() =>
+  import("./components/features/profile").then((m) => ({
+    default: m.Profile,
+  })),
+);
+const Requests = lazyWithRetry(() =>
+  import("./components/features/requests").then((m) => ({
+    default: m.Requests,
+  })),
+);
+const UsersGroups = lazyWithRetry(() =>
+  import("./components/features/users-groups").then((m) => ({
+    default: m.UsersGroups,
+  })),
+);
+const Batches = lazyWithRetry(() =>
+  import("./components/features/batches").then((m) => ({
+    default: m.Batches,
+  })),
+);
+const BatchInfo = lazyWithRetry(() =>
+  import("./components/features/batches").then((m) => ({
+    default: m.BatchInfo,
+  })),
+);
+const FileRequests = lazyWithRetry(() =>
+  import("./components/features/batches/FileRequests").then((m) => ({
+    default: m.FileRequests,
+  })),
+);
+const System = lazyWithRetry(() =>
+  import("./components/features/system").then((m) => ({
+    default: m.System,
+  })),
+);
+const Usage = lazyWithRetry(() =>
+  import("./components/features/usage").then((m) => ({
+    default: m.Usage,
+  })),
+);
+const OrganizationDetail = lazyWithRetry(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.OrganizationDetail,
+  })),
+);
+const MyOrganization = lazyWithRetry(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.MyOrganization,
+  })),
+);
+const AcceptInvite = lazyWithRetry(() =>
+  import("./components/features/organizations").then((m) => ({
+    default: m.AcceptInvite,
+  })),
+);
+const AsyncRequests = lazyWithRetry(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequests,
+  })),
+);
+const AsyncRequestDetail = lazyWithRetry(() =>
+  import("./components/features/async-requests").then((m) => ({
+    default: m.AsyncRequestDetail,
+  })),
+);
+const Connections = lazyWithRetry(() =>
+  import("./components/features/connections").then((m) => ({
+    default: m.Connections,
+  })),
+);
+
+function RouteLoader() {
+  return (
+    <div className="flex items-center justify-center h-64">
+      <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue"></div>
+    </div>
+  );
+}
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 5 * 60 * 1000,
+      gcTime: 10 * 60 * 1000,
+      refetchOnWindowFocus: false,
+      retry: (failureCount, error) => {
+        if (error instanceof Error) {
+          if (
+            "status" in error &&
+            (error.status === 401 ||
+              error.status === 403 ||
+              error.status === 404)
+          ) {
+            return false;
+          }
+          if (
+            error.message.includes("401") ||
+            error.message.includes("403") ||
+            error.message.includes("404")
+          ) {
+            return false;
+          }
+        }
+        return failureCount < 3;
+      },
+    },
+    mutations: {
+      onError: (error) => {
+        if (
+          error instanceof Error &&
+          "status" in error &&
+          error.status === 401
+        ) {
+          queryClient.clear();
+          window.location.href = "/login";
+        }
+      },
+    },
+  },
+});
+
+queryClient.getQueryCache().config.onError = (error) => {
+  if (error instanceof Error && "status" in error && error.status === 401) {
+    queryClient.clear();
+    window.location.href = "/login";
+  }
+};
+
+function RootRedirect() {
+  const { isAuthenticated, isLoading } = useAuth();
+  const { getFirstAccessibleRoute, isLoading: authorizationLoading } =
+    useAuthorization();
+  const { search } = useLocation();
+
+  if (isLoading || authorizationLoading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue"></div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <Navigate to={`/login${search}`} replace />;
+  }
+
+  return (
+    <Navigate
+      to={`${getFirstAccessibleRoute()}${search}`}
+      replace
+    />
+  );
+}
+
+
+function AppRoutes() {
+  const { isFeatureEnabled, isMswReady, setMswReady } = useSettings();
+  const { data: registrationInfo } = useRegistrationInfo();
+
+  useEffect(() => {
+    async function enableMocking() {
+      if (!isFeatureEnabled("demo")) {
+        return;
+      }
+
+      console.log("Demo mode is enabled, setting up MSW...");
+      try {
+        const { worker } = await import("./utils/msw");
+
+        const registration = await worker.start({
+          onUnhandledRequest: "bypass",
+          serviceWorker: {
+            url: "/mockServiceWorker.js",
+          },
+        });
+
+        console.log("MSW started successfully", registration);
+        setMswReady(true);
+      } catch (error) {
+        console.error("Failed to start MSW:", error);
+        setMswReady(true);
+      }
+    }
+
+    enableMocking();
+  }, [isFeatureEnabled, setMswReady]);
+
+  if (isFeatureEnabled("demo") && !isMswReady) {
+    return (
+      <div className="min-h-screen bg-doubleword-background-secondary flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue mx-auto mb-4"></div>
+          <p className="text-doubleword-neutral-600">
+            Initializing demo mode...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <BrowserRouter>
+      <Routes>
+        { }
+        <Route
+          path="/login"
+          element={
+            <AuthGuard requireAuth={false}>
+              <LoginForm />
+            </AuthGuard>
+          }
+        />
+        { }
+        {registrationInfo?.enabled && (
+          <Route
+            path="/register"
+            element={
+              <AuthGuard requireAuth={false}>
+                <RegisterForm />
+              </AuthGuard>
+            }
+          />
+        )}
+
+        { }
+        <Route
+          path="/forgot-password"
+          element={
+            <AuthGuard requireAuth={false}>
+              <PasswordResetRequestForm />
+            </AuthGuard>
+          }
+        />
+        <Route
+          path="/reset-password"
+          element={
+            <AuthGuard requireAuth={false}>
+              <PasswordResetForm />
+            </AuthGuard>
+          }
+        />
+
+        { }
+        <Route
+          path="/org-invite"
+          element={
+            <Suspense fallback={<div className="flex items-center justify-center h-screen"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-doubleword-accent-blue"></div></div>}>
+              <AcceptInvite />
+            </Suspense>
+          }
+        />
+
+        { }
+        <Route path="/" element={<RootRedirect />} />
+        <Route
+          path="/analytics"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/analytics">
+                <Suspense fallback={<RouteLoader />}>
+                  <Requests />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        { }
+        <Route
+          path="/responses"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/responses">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequests />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/responses/:requestId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/responses">
+                <Suspense fallback={<RouteLoader />}>
+                  <AsyncRequestDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Suspense fallback={<RouteLoader />}>
+                  <Batches />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches/:batchId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Suspense fallback={<RouteLoader />}>
+                  <BatchInfo />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/batches/files/:fileId/content"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/batches">
+                <Suspense fallback={<RouteLoader />}>
+                  <FileRequests />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/endpoints"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/endpoints">
+                <Suspense fallback={<RouteLoader />}>
+                  <Endpoints />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models">
+                <Suspense fallback={<RouteLoader />}>
+                  <ModelCatalog />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <Models />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage/:modelId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <ModelInfo />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/manage/providers"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models/manage">
+                <Suspense fallback={<RouteLoader />}>
+                  <ProviderDisplayConfigs />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/models/:modelId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/models">
+                <Suspense fallback={<RouteLoader />}>
+                  <ModelDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/playground"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/playground">
+                <Suspense fallback={<RouteLoader />}>
+                  <Playground />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/users-groups"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/users-groups">
+                <Suspense fallback={<RouteLoader />}>
+                  <UsersGroups />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/organization"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/organization">
+                <Suspense fallback={<RouteLoader />}>
+                  <MyOrganization />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/organizations"
+          element={<Navigate to="/users-groups?tab=orgs" replace />}
+        />
+        <Route
+          path="/organizations/:organizationId"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/organizations/:organizationId">
+                <Suspense fallback={<RouteLoader />}>
+                  <OrganizationDetail />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route path="/settings" element={<Navigate to="/system" replace />} />
+        <Route
+          path="/profile"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/profile">
+                <Suspense fallback={<RouteLoader />}>
+                  <Profile />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/api-keys"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/api-keys">
+                <Suspense fallback={<RouteLoader />}>
+                  <ApiKeys />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/usage"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/usage">
+                <Suspense fallback={<RouteLoader />}>
+                  <Usage />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/cost-management"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/cost-management">
+                <Suspense fallback={<RouteLoader />}>
+                  <CostManagement />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/system"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/system">
+                <Suspense fallback={<RouteLoader />}>
+                  <System />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+        <Route
+          path="/connections"
+          element={
+            <AppLayout>
+              <ProtectedRoute path="/connections">
+                <Suspense fallback={<RouteLoader />}>
+                  <Connections />
+                </Suspense>
+              </ProtectedRoute>
+            </AppLayout>
+          }
+        />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+
+function App() {
+  return (
+    <ErrorBoundary>
+      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+        <QueryClientProvider client={queryClient}>
+          <SettingsProvider>
+            <AuthProvider>
+              <TelemetryIdentity />
+              <OrganizationProvider>
+                <AppRoutes />
+              </OrganizationProvider>
+            </AuthProvider>
+          </SettingsProvider>
+          {import.meta.env.DEV && <ReactQueryDevtools initialIsOpen={false} />}
+          <Toaster />
+        </QueryClientProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
+  );
+}
+
+export default App;

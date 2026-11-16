@@ -1,0 +1,472 @@
+use axum::http::StatusCode;
+use axum_test::TestServer;
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use uuid::Uuid;
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use crate::api::models::users::Role;
+use crate::config::{SchedulingConfig, TolerationPreset};
+use crate::scheduling::{SchedulingOperator, SchedulingToleration};
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user_with_roles};
+use crate::{Application, BackgroundServices};
+
+fn test_config_with_presets() -> crate::config::Config {
+    let mut config = create_test_config();
+    config.scheduling = SchedulingConfig {
+        toleration_presets: vec![
+            SchedulingConfig::default_preset(),
+            TolerationPreset {
+                id: "gpu".to_string(),
+                label: "GPU only".to_string(),
+                description: "Pin to GPU capacity only.".to_string(),
+                tolerations: vec![SchedulingToleration {
+                    key: "pool".to_string(),
+                    operator: Some(SchedulingOperator::Equal),
+                    value: Some("gpu".to_string()),
+                    effect: None,
+                }],
+            },
+        ],
+    };
+    config
+}
+
+struct Fixture {
+    server: TestServer,
+    upstream: MockServer,
+    services: BackgroundServices,
+    user: Uuid,
+    key: String,
+    pool: PgPool,
+}
+
+impl Fixture {
+    async fn new(pool: &PgPool) -> Self {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = request.body_json().unwrap();
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"chatcmpl-test","created":1,"model":body["model"],
+                    "object":"chat.completion",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+                }))
+            })
+            .mount(&upstream)
+            .await;
+        let mut config = test_config_with_presets();
+        config.onwards.strict_mode = true;
+        config.background_services.onwards_sync.enabled = true;
+        let app = Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
+        let (server, services) = app.into_test_server();
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let admin = create_test_admin_user(pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        server
+            .post("/admin/api/v1/transactions")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"user_id":user.id,"transaction_type":"admin_grant","amount":100,"source_id":admin.id}))
+            .await
+            .assert_status(StatusCode::CREATED);
+        let key = format!("sk-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO api_keys (name,secret_hash,secret_prefix,user_id,created_by,purpose) VALUES ('preset-test',sha256(convert_to($1,'UTF8')),left($1,8),$2,$2,'realtime')")
+            .bind(&key)
+            .bind(user.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let endpoint: Uuid = sqlx::query_scalar(
+            "INSERT INTO inference_endpoints (name,url,created_by,kind) VALUES ('preset-test',$1,$2,'hosted') RETURNING id",
+        )
+        .bind(upstream.uri())
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let member: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,hosted_on,created_by,type) VALUES ('preset-upstream','preset-member',$1,$2,'CHAT') RETURNING id",
+        )
+        .bind(endpoint)
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let model: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,created_by,type,is_composite) VALUES ('plain','plain',$1,'CHAT',true) RETURNING id",
+        )
+        .bind(user.id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO deployed_model_components (composite_model_id,deployed_model_id) VALUES ($1,$2)")
+            .bind(model)
+            .bind(member)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,'00000000-0000-0000-0000-000000000000',$2)",
+        )
+        .bind(model)
+        .bind(user.id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'test',$2,$2,'realtime')")
+            .bind(model).bind(rust_decimal::Decimal::new(1,6))
+            .execute(pool).await.unwrap();
+        services.sync_onwards_config(pool).await.unwrap();
+        Self {
+            server,
+            upstream,
+            services,
+            user: user.id,
+            key,
+            pool: pool.clone(),
+        }
+    }
+
+    async fn post_realtime(&self) -> Value {
+        let body = json!({
+            "model": "plain",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+        });
+        self.server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {}", self.key))
+            .json(&body)
+            .await
+            .assert_status_ok();
+        self.upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .body_json()
+            .unwrap()
+    }
+
+    async fn post_responses(&self) -> Value {
+        let body = json!({
+            "model": "plain",
+            "input": "hi",
+            "max_output_tokens": 16,
+            "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+        });
+        self.server
+            .post("/ai/v1/responses")
+            .add_header("Authorization", format!("Bearer {}", self.key))
+            .json(&body)
+            .await
+            .assert_status_ok();
+        self.upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .body_json()
+            .unwrap()
+    }
+
+    async fn post_messages(&self) -> Value {
+        let body = json!({
+            "model": "plain",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+        });
+        self.server
+            .post("/ai/v1/messages")
+            .add_header("x-api-key", &self.key)
+            .add_header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .await
+            .assert_status_ok();
+        self.upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .body_json()
+            .unwrap()
+    }
+
+    async fn upload_batch(&self) -> Value {
+        let jsonl = format!(
+            "{}\n",
+            json!({
+                "custom_id": "preset-batch",
+                "method": "POST",
+                "url": "/v1/chat/completions",
+                "body": {
+                    "model": "plain",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "nvext": {"routing_constraints": {"tolerations": [{"operator": "Exists"}]}}
+                }
+            })
+        );
+        let file = axum_test::multipart::Part::bytes(jsonl.into_bytes()).file_name("preset.jsonl");
+        let form = axum_test::multipart::MultipartForm::new()
+            .add_part("purpose", axum_test::multipart::Part::text("batch"))
+            .add_part("file", file);
+        self.server
+            .post("/ai/v1/files")
+            .add_header("Authorization", format!("Bearer {}", self.key))
+            .multipart(form)
+            .await
+            .assert_status(StatusCode::CREATED);
+        sqlx::query_scalar::<_, String>("SELECT body FROM fusillade.request_templates_all ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn set_preset(&self, id: Option<&str>) {
+        match id {
+            Some(id) => {
+                sqlx::query("UPDATE users SET toleration_preset = $2 WHERE id = $1")
+                    .bind(self.user)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .unwrap();
+            }
+            None => {
+                sqlx::query("UPDATE users SET toleration_preset = NULL WHERE id = $1")
+                    .bind(self.user)
+                    .execute(&self.pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        self.services.sync_key_policy(&self.pool).await.unwrap();
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn a_preset_account_carries_its_tolerations_and_the_client_cannot_override(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    let body = f.post_realtime().await;
+    assert!(
+        body["nvext"]["routing_constraints"]["tolerations"].is_null(),
+        "a Default account carries no tolerations: {body}"
+    );
+
+    f.set_preset(Some("no-overflow")).await;
+    let body = f.post_realtime().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "the empty-list preset is written verbatim: {body}"
+    );
+
+    f.set_preset(Some("gpu")).await;
+    let body = f.post_realtime().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset list overrides the client's: {body}"
+    );
+
+    f.set_preset(None).await;
+    let body = f.post_realtime().await;
+    assert!(
+        body["nvext"]["routing_constraints"]["tolerations"].is_null(),
+        "clearing the preset removes the tolerations: {body}"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn an_unconfigured_preset_at_runtime_fails_closed_to_the_empty_list(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    sqlx::query("UPDATE users SET toleration_preset = 'retired' WHERE id = $1")
+        .bind(f.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    f.services.sync_key_policy(&pool).await.unwrap();
+
+    let body = f.post_realtime().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "an unknown preset id fails closed to the empty list: {body}"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn a_preset_account_carries_its_tolerations_on_responses_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    f.set_preset(Some("gpu")).await;
+    let body = f.post_responses().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset survives Responses translation: {body}"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn a_preset_account_carries_its_tolerations_on_messages_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    let body = f.post_messages().await;
+    assert!(
+        body["nvext"]["routing_constraints"]["tolerations"].is_null(),
+        "a Default account carries no tolerations: {body}"
+    );
+
+    f.set_preset(Some("no-overflow")).await;
+    let body = f.post_messages().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([]),
+        "the preset survives Anthropic translation: {body}"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn a_preset_account_stamps_its_tolerations_on_uploaded_batch_requests(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+
+    let body = f.upload_batch().await;
+    assert!(
+        body["nvext"]["routing_constraints"]["tolerations"].is_null(),
+        "a Default upload carries no tolerations: {body}"
+    );
+
+    f.set_preset(Some("gpu")).await;
+    let body = f.upload_batch().await;
+    assert_eq!(
+        body["nvext"]["routing_constraints"]["tolerations"],
+        json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]),
+        "the preset is stamped on the stored batch body: {body}"
+    );
+    assert_eq!(body["model"], "plain");
+}
+
+impl Fixture {
+    async fn set_model_preset(&self, alias: &str, class: Option<&str>, preset: &str) {
+        sqlx::query(
+            "INSERT INTO account_model_policies (user_id, deployed_model_id, serving_class, toleration_preset, provisioning_source)
+             SELECT $1, id, $3, $4, 'account-catalog' FROM deployed_models WHERE alias = $2",
+        )
+        .bind(self.user)
+        .bind(alias)
+        .bind(class)
+        .bind(preset)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        self.services.sync_key_policy(&self.pool).await.unwrap();
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn a_model_preset_overrides_the_account_preset_on_that_model(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let gpu = json!([{"key": "pool", "operator": "Equal", "value": "gpu"}]);
+    f.set_preset(Some("gpu")).await;
+
+    f.set_model_preset("preset-member", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+
+    f.set_model_preset("plain", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+
+    f.set_model_preset("plain", Some("standard"), "gpu").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.post_responses().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+    assert_eq!(f.upload_batch().await["nvext"]["routing_constraints"]["tolerations"], gpu);
+}
+
+#[dwctl_test_macros::test]
+async fn a_model_preset_pins_an_otherwise_default_account(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.set_model_preset("preset-member", None, "gpu").await;
+    let body = f.post_realtime().await;
+    assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
+
+    f.set_model_preset("plain", None, "no-overflow").await;
+    assert_eq!(f.post_realtime().await["nvext"]["routing_constraints"]["tolerations"], json!([]));
+}
+
+#[dwctl_test_macros::test]
+async fn support_cannot_change_a_customer_preset(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let headers = add_auth_headers(&create_test_admin_user(&pool, Role::PlatformManager).await);
+    let member = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+    let member_headers = add_auth_headers(&member);
+
+    for preset in [json!("no-overflow"), json!("does-not-exist"), Value::Null] {
+        f.server
+            .patch(&format!("/admin/api/v1/users/{}", f.user))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"toleration_preset": preset}))
+            .await
+            .assert_status(StatusCode::FORBIDDEN);
+    }
+
+    f.set_preset(Some("no-overflow")).await;
+    let body = f.post_realtime().await;
+    assert_eq!(body["nvext"]["routing_constraints"]["tolerations"], json!([]), "{body}");
+
+    let as_member_response = f
+        .server
+        .get(&format!("/admin/api/v1/users/{}", member.id))
+        .add_header(&member_headers[0].0, &member_headers[0].1)
+        .add_header(&member_headers[1].0, &member_headers[1].1)
+        .await;
+    as_member_response.assert_status_ok();
+    assert!(as_member_response.json::<Value>().get("toleration_preset").is_none());
+    f.server
+        .patch(&format!("/admin/api/v1/users/{}", member.id))
+        .add_header(&member_headers[0].0, &member_headers[0].1)
+        .add_header(&member_headers[1].0, &member_headers[1].1)
+        .json(&json!({"toleration_preset": "no-overflow"}))
+        .await
+        .assert_status(StatusCode::FORBIDDEN);
+    f.set_preset(None).await;
+    let body = f.post_realtime().await;
+    assert!(body["nvext"]["routing_constraints"]["tolerations"].is_null(), "{body}");
+}
+
+#[dwctl_test_macros::test]
+async fn config_exposes_the_scheduling_toleration_presets(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let user = create_test_user_with_roles(&pool, vec![Role::StandardUser]).await;
+    let headers = add_auth_headers(&user);
+    let response = f
+        .server
+        .get("/admin/api/v1/config")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    response.assert_status_ok();
+    let json: Value = response.json();
+    let presets = json["scheduling_toleration_presets"].as_array().unwrap();
+    assert!(presets.iter().any(|preset| preset["id"] == "no-overflow"), "{json}");
+    assert!(
+        presets
+            .iter()
+            .all(|preset| preset["label"].is_string() && preset["description"].is_string()),
+        "{json}"
+    );
+}

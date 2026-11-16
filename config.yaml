@@ -1,0 +1,1186 @@
+# Clay configuration
+# This is the default configuration file.
+
+# Server configuration
+# To advertise publically, set to "0.0.0.0", or the specific network interface
+# you've exposed.
+host: "0.0.0.0"
+port: 3001
+
+# Base URL where the dashboard is accessible
+# Used for password reset links, payment redirect URLs, and batch notification emails
+dashboard_url: "http://localhost:5173"
+
+# Onboarding redirect URL for new users (first login)
+# When set, users who have never logged in will be redirected here after authentication.
+# onboarding_url: "https://onboarding.doubleword.ai"
+
+# Email address where support requests are sent
+# support_email: "support@doubleword.ai"
+
+# Schema migrations
+#
+# `dwctl migrate` applies every pending migration (main, fusillade, underway,
+# and outlet when request logging is enabled) and exits; it repairs
+# interrupted concurrent index builds first and verifies the result. Run it
+# from a pre-rollout Job with the release image, or by hand against a local
+# database.
+#
+# `migrations.mode` decides what the serving process does at startup:
+#   run   - apply pending migrations before serving (default; local
+#           development and single-instance installs)
+#   check - never execute DDL. Verify the database carries every migration
+#           this binary ships with matching checksums and refuse to start
+#           otherwise. A database that is AHEAD of the binary is accepted, so
+#           replicas of the previous release keep serving while the next
+#           release's migrations are applied before its rollout.
+# Deployments that run the migration Job set `check` on the application pods
+# (DWCTL_MIGRATIONS__MODE=check).
+migrations:
+  mode: run
+
+# Database configuration
+database:
+  # Configure connectivity to an external postgres database here
+  type: external
+  url: postgres://postgres:password@localhost:5432/dwctl
+
+  # Optional: Read replica URL for read-heavy operations (analytics, config sync)
+  # replica_url: postgres://postgres:password@replica:5432/dwctl
+  # Can also be set via environment variables (in order of precedence):
+  #   DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (recommended)
+  #   DWCTL_DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (single underscore)
+  # Note: DWCTL_DATABASE__REPLICA_URL (double underscore) won't work due to config structure
+
+  # Optional: transaction-pooled endpoint for query traffic. The direct URL above
+  # still serves migrations, LISTEN subscriptions, and leader election.
+  # pooled_url: postgres://postgres:password@pooler:6432/dwctl
+  # Also accepts DATABASE_POOLED_URL or DWCTL_DATABASE_POOLED_URL independently
+  # of DATABASE_URL. Without a pooled endpoint, pool settings are unchanged.
+  # direct_pool:
+  #   max_connections: 8
+  #   min_connections: 0
+  #
+  # Schema components default to pooled_schema_mode: role_default. Give each
+  # component a login whose persistent search_path selects its schema, using
+  # both url (direct migrations/session work) and pooled_url (query traffic).
+  # The direct schema URL must reach the same live database as main; startup
+  # verifies this before creating the schema or running component migrations.
+  # Recycle existing pooler backends after changing role defaults.
+  # Fusillade can instead share the main credentials with explicit
+  # pooled_schema_mode: transaction, which selects the schema in each query
+  # transaction. Outlet supports only role_default.
+
+  # Main database pool settings for primary (and replica if not specified separately)
+  # pool:
+  #   max_connections: 10
+  #   min_connections: 0
+  #   acquire_timeout_secs: 30
+  #   idle_timeout_secs: 600
+  #   max_lifetime_secs: 1800
+
+  # Optional: Separate pool settings for replica connections
+  # If not specified, replica uses the same settings as pool
+  # replica_pool:
+  #   max_connections: 5  # Typically fewer connections for replicas
+  #   min_connections: 0
+  #   acquire_timeout_secs: 30
+  #   idle_timeout_secs: 600
+  #   max_lifetime_secs: 1800
+
+  # We also bundle a copy of postgres with dwctl. It's launched on a random
+  # port, and data is stored in $HOME/.dwctl_data/ To have data persist
+  # across restarts, set persistent=true.
+  # We strongly recommend setting up external postgres in production!
+  # type: embedded
+  # persistent: true
+
+  # Component databases: fusillade (batch processing) and outlet (request logging)
+  # By default, these use separate schemas within the main database.
+  # You can optionally configure them to use dedicated databases.
+
+  # Fusillade - batch processing database
+  # Default: uses "fusillade" schema in main database (inherits main's replica if configured)
+  # fusillade:
+  #   mode: schema
+  #   name: fusillade
+  #   # Scoped identity: use the same role for migrations, queries and maintenance.
+  #   # url: postgres://fusillade:password@localhost:5432/dwctl
+  #   # pooled_url: postgres://fusillade:password@pooler:6432/dwctl
+  #   # pooled_schema_mode: role_default # default; verify primary and replica
+  #   # replica_url: postgres://fusillade:password@replica-pooler:6432/dwctl
+  #   # An explicit url never inherits the main replica: reads fall back to this
+  #   # primary unless replica_url is set. With a main pooler, an explicit url
+  #   # also requires an explicit pooled_url to avoid changing query credentials.
+  #   # Shared main login compatibility: omit url and use
+  #   # pooled_schema_mode: transaction (Fusillade only).
+  #   # direct_pool:
+  #   #   max_connections: 2
+  #   pool:
+  #     max_connections: 20
+  #     min_connections: 2
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 10
+  #
+  # Alternative: use a dedicated database for fusillade
+  # fusillade:
+  #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
+  #   url: postgres://postgres:password@localhost:5432/fusillade
+  #   replica_url: postgres://postgres:password@replica:5432/fusillade
+  #   pool:
+  #     max_connections: 20
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 10
+
+  # Outlet - request logging database
+  # Default: uses "outlet" schema in main database (inherits main's replica if configured)
+  # outlet:
+  #   mode: schema
+  #   name: outlet
+  #   # url: postgres://outlet_pool:password@localhost:5432/dwctl
+  #   # pooled_schema_mode: role_default
+  #   # pooled_url: postgres://outlet_pool:password@pooler:6432/dwctl
+  #   # replica_url: postgres://outlet_pool:password@replica-pooler:6432/dwctl
+  #   pool:
+  #     max_connections: 5
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 3
+  #
+  # Alternative: use a dedicated database for outlet
+  # outlet:
+  #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
+  #   url: postgres://postgres:password@localhost:5432/outlet
+  #   pool:
+  #     max_connections: 5
+  #   # Optional: separate replica pool settings (defaults to pool settings)
+  #   # replica_pool:
+  #   #   max_connections: 3
+
+# Admin user email - will be created on first startup
+admin_email: "test@doubleword.ai"
+# TODO: Change this in production!
+admin_password: "hunter2"
+
+# Secret key for jwt signing.
+# TODO: Change this in production
+secret_key: insecure-change-in-production
+
+# Payment configuration
+# Dummy provider is enabled by default for testing
+# For production, configure Stripe or another provider
+payment:
+  dummy:
+    amount: 100.00
+
+# Model sources - inference endpoints to connect to
+# Uncomment and configure as needed
+model_sources: []
+
+# Example configurations:
+# model_sources:
+#   # OpenAI API
+#   - name: "openai"
+#     url: "https://api.openai.com"
+#     api_key: "sk-..."  # Required for model sync
+#
+#   # Internal model server (no auth required)
+#   - name: "internal"
+#     url: "http://localhost:8080"
+
+# Frontend metadata
+metadata:
+  title: "Doubleword Control Layer"
+  # region: "UK South"
+  # organization: "ACME Corp"
+  docs_url: "https://doublewordai.github.io/control-layer/"
+  docs_jsonl_url: "https://docs.doubleword.ai/batches/jsonl-files"
+
+# Authentication configuration
+auth:
+  # Native username/password authentication
+  native:
+    enabled: true # Enable native login system
+    allow_registration: true
+    password:
+      min_length: 8
+      max_length: 64
+    session:
+      timeout: "24h"
+      cookie_name: "dwctl_session"
+      cookie_secure: true
+      cookie_same_site: "strict"
+    password_reset_token_duration: "30m"
+
+  # Proxy header authentication
+  # Accepts user identity from HTTP headers set by an upstream authentication proxy
+  # (e.g., oauth2-proxy, Vouch, Authentik, Auth0)
+  #
+  # Two modes:
+  #   Single header: Send only header_name with user's email (must be unique)
+  #   Dual header: Send both header_name (IdP identifier) and email_header_name (email)
+  #                Allows multiple accounts per email from different identity providers
+  proxy_header:
+    enabled: true
+
+    # header_name: User identifier or email
+    # Single header mode: User's email (e.g., "user@example.com")
+    # Dual header mode: Unique identifier from IdP (e.g., "github|user123", "google-oauth2|456")
+    header_name: "x-doubleword-user"
+
+    # email_header_name: User's email address (optional, enables dual header mode)
+    # If provided: Enables federated identity with (email, external_user_id) uniqueness
+    # If omitted: Uses header_name value as email (single header mode, email must be unique)
+    email_header_name: "x-doubleword-email"
+
+    # auto_create_users: Automatically create users on first login
+    auto_create_users: true
+
+  # Extra email domains to treat as personal, on top of the built-in list.
+  #
+  # A personal domain can't be claimed by a workspace and is never used to route
+  # a signup to one. The built-in list covers the major free-mail providers and
+  # consumer ISPs, but it can only ever be a snapshot: a provider it misses gets
+  # claimed by whoever signs up first, and everyone who signs up at that provider
+  # afterwards is routed into that stranger's workspace. Add a domain here to
+  # close that immediately — it also retires any existing claim, since the claim
+  # is only consulted after this check.
+  #
+  # personal_email_domains:
+  #   - "example-isp.net"
+  personal_email_domains: []
+
+  # Default roles assigned to newly created non-admin users
+  # Applies to both native user registration and proxy header auto-creation
+  # StandardUser role is always guaranteed to be present even if not specified
+  # Available roles:
+  #   - StandardUser: Required base role for all users (cannot be removed)
+  #   - RequestViewer: Read-only access to request logs and analytics
+  #   - BillingManager: Full access to credit system and user billing
+  #   - BatchAPIUser: Can manage files and batches for batch processing
+  #   - BackgroundInferenceUser: Can submit spare-capacity background inference
+  # Example: To give all new users request viewing capabilities:
+  #   default_user_roles: ["StandardUser", "RequestViewer"]
+  default_user_roles: ["StandardUser", "BatchAPIUser", "BackgroundInferenceUser"]
+
+  # Security settings
+  security:
+    jwt_expiry: "1h"
+    cors:
+      allowed_origins:
+        - "http://localhost:5173" # Development frontend (Vite)
+        - "http://localhost:3001" # Local control layer
+        - "https://localhost" # Local HTTPS
+      allow_credentials: true
+      max_age: 3600 # Cache preflight requests for 1 hour
+      # exposed_headers: []  # Optional: Custom headers to expose to browser (e.g., ["X-Incomplete", "X-Last-Line"])
+    # Browser security response headers added to every response (defence in
+    # depth — emitted even if a proxy/ingress in front does not add them).
+    # Each header is set only if the response does not already carry it.
+    headers:
+      enabled: true
+      frame_options: "DENY" # X-Frame-Options; "" to disable. (X-Content-Type-Options: nosniff is fixed on whenever headers.enabled is true.)
+      referrer_policy: "strict-origin-when-cross-origin" # "" to disable
+      permissions_policy: "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+      # Opt-in headers (empty = not sent):
+      # content_security_policy: "default-src 'self'"  # set a policy that matches your frontend; a wrong policy can break the dashboard
+      # content_security_policy_report_only: ""        # roll a CSP out in report-only first
+      # strict_transport_security: "max-age=31536000; includeSubDomains"  # usually set on whatever terminates TLS instead
+
+# Email configuration for password resets and notifications
+email:
+  # Email transport - either 'file' (for development) or 'smtp' (for production)
+  type: file
+  path: "./emails" # Directory for file-based email (when type=file)
+  # For SMTP (production), use:
+  # type: smtp
+  # host: "smtp.example.com"
+  # port: 587
+  # username: "noreply@example.com"
+  # password: "your-smtp-password"
+  # use_tls: true
+# Credits configuration
+credits:
+  # Initial credits given to standard users when they are created
+  # Set to 0 to disable initial credits (users start with no credits)
+  # Example: 100.00 gives users 100 credits on registration
+  initial_credits_for_standard_users: 0
+  # First-payment match promotion: a user's first ever payment (checkout or
+  # auto-topup) is matched with bonus credits, up to this amount (in dollars).
+  # A first payment below this is matched in full; above it is capped here.
+  # Set to 0 to disable. Existing paying customers are never matched (eligibility
+  # is derived from whether they have any prior purchase).
+  # Example: 50 matches a new user's first $50 of credits.
+  first_payment_match_up_to: 0
+  # Signup credits granted the first time a billing target verifies a payment
+  # method through setup-mode checkout (POST /payments/setup) — the onboarding
+  # "Add Payment Method" step, which saves and verifies a card without charging
+  # it. Set to 0 to disable.
+  #
+  # Unlike initial_credits_for_standard_users (granted to everyone at account
+  # creation), this only pays out once a real card has been verified, so it
+  # can't be farmed by signing up repeatedly. Granted at most once per billing
+  # target, and idempotent across the webhook/front-channel race.
+  # Example: 25 gives a newly verified user 25 credits.
+  verification_credits: 0
+  # Delay after a transient provider failure or first soft card decline before
+  # another automatic charge is eligible. Keep the 24h production default;
+  # staging can shorten this to exercise the complete decline lifecycle.
+  auto_topup_retry_delay: 24h
+
+# Optional feature toggles
+enable_metrics: true # Enable Prometheus metrics endpoint
+enable_request_logging: true # Enable request/response logging to database
+# Log output format: compact (human-readable lines) or json (one JSON object
+# per event, for log aggregators). Override with DWCTL_LOG_FORMAT.
+log_format: compact
+
+# Opt-in heap profile listener (GET /debug/pprof/heap, gzip pprof). Profiles exist
+# only if the process also starts with jemalloc sampling on, e.g.
+# _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19.
+# The listener is unauthenticated: keep it on loopback (use port-forwarding) or,
+# for an in-cluster scraper, bind 0.0.0.0 behind a NetworkPolicy.
+# See docs/memory-observability.md. DWCTL_HEAP_PROFILING__ENABLED=true etc.
+heap_profiling:
+  enabled: false # Default: false
+  bind_address: "127.0.0.1:6060" # Default: 127.0.0.1:6060
+  dump_timeout: 30s # Default: 30s
+
+# Scheduling toleration presets.
+#
+# An operator can pin an account (a user or an organization) to one of these
+# presets through the admin API / dashboard. Every inference request from a
+# pinned account then carries the preset's toleration list at
+# `nvext.routing_constraints.tolerations` before it reaches the inference
+# backend, for realtime, flex and batch traffic alike, so a backend that
+# honours tolerations keeps the account's work on the capacity you intend.
+#
+# Pinning restricts where an account's requests can be placed, and can make
+# scheduling harder for accounts sharing the same capacity, depending on how
+# the backend treats tolerations. Pin as few accounts as possible and only
+# when a customer requires it.
+#
+# This is a distinct setting from `self_hosted_only` (the account's
+# `users.self_hosted_only` / `organizations.self_hosted_only` flag): that flag
+# is the *gateway's* provider-fallback control and decides whether onwards may
+# route a request to a third-party (`external`) provider at all. These presets
+# say nothing about which provider is chosen; they only constrain where the
+# chosen backend may place an accepted request.
+#
+# `tolerations` uses the same shape as the request field: a list of
+# Kubernetes-style entries, each `{key, operator?, value?, effect?}` where
+# `operator` is `Equal` (the default, needs a `value`) or `Exists`, and
+# `effect` is `NoSchedule` (the default) or `PreferNoSchedule`. An empty list
+# asks the backend to keep the account off any tainted capacity. Wording here
+# is deliberately backend-agnostic.
+#
+# An account stores only the preset's `id` (`users.toleration_preset`). An id
+# the config no longer defines is a misconfiguration: the request path logs it
+# and fails closed by applying the empty (most restrictive) list.
+scheduling:
+  toleration_presets:
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
+# Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
+# DWCTL_PORT=8080
+#
+# The exception is DATABASE_URL:
+# DATABASE_URL=postgres://prod@db:5432/my_database
+#
+# For arrays like model_sources, use environment-specific config files
+# (e.g., config.production.yaml) rather than env vars.
+
+# Zero-data-retention (ZDR) keystore.
+#
+# Holds the per-request keys that decrypt ZDR flex request/response bodies. The
+# bodies are stored encrypted in Postgres; the keys live here with a TTL, so a
+# body becomes permanently unreadable once its key is deleted (on retrieval) or
+# expires (crypto-shred). Absent (the default) means ZDR is off and flex bodies
+# are stored in plaintext as before. See zdr-flex-encryption-plan.md.
+#
+# REQUIRED to serve flex requests from zero-data-retention accounts
+# (users.zero_data_retention, synced per-key into memory): the flex body is
+# encrypted at rest with keys held here. If a ZDR account sends a flex request
+# while this section is absent, the request is REJECTED (500) rather than stored
+# in plaintext. Non-ZDR flex requests are unaffected. Realtime ZDR needs no
+# keystore - it is non-persistence (bodies are suppressed, not encrypted).
+#
+# Also REQUIRED to issue an API key to another user (an org manager issuing to a
+# member): the key's
+# secret is held in Postgres, wrapped with these wrap keys, until the holder's
+# one-off reveal. Without this section such requests are refused (501);
+# self-created keys are unaffected, and rotating a key whose reveal is pending
+# spends the reveal (the rotating caller gets the secret). Those wrapped
+# secrets have no TTL: a
+# background task re-wraps them with each instance's current wrap key every 15
+# minutes. During a rolling rotation an instance still on the old current key
+# re-wraps with it, so keep a retired wrap key until every instance uses the new
+# current key and a reconcile has completed after that.
+#
+# Local dev: run `just redis-start`, then uncomment the block below.
+keystore:
+ # Redis holding the wrapped per-request keys (single instance, AOF on).
+ redis_url: "redis://localhost:6379"
+ # TTL applied to every stored key. Set it above the longest flex completion
+ # window plus a retrieval grace, or in-flight requests self-destruct before
+ # they are processed.
+ default_ttl_seconds: 7200
+ # Which wrap key seals new values; must be an id present in wrap_keys below.
+ current_wrap_key_id: "dev-1"
+ # Wrap keys by id (each passphrase is run through the KDF). In production
+ # these come from a Kubernetes secret; keep retired ids around for one TTL
+ # during rotation (see the plan's "Wrap-key rotation"). The dev value below
+ # is NOT a secret - never use it outside local dev.
+ wrap_keys:
+   dev-1: "local-dev-wrap-key-not-a-secret"
+
+# Batches API configuration
+batches:
+  # Enable batches API endpoints (/files, /batches)
+  # When disabled, these endpoints will not be available (default: true)
+  enabled: true
+
+  # TTL for batch capacity reservations (seconds)
+  reservation_ttl_secs: 600
+
+  # Upload-volume cap for UNVERIFIED creditors, in requests per hour of
+  # completion window. The effective cap for a submission scales with
+  # its completion window: unverified_requests_per_completion_hour * window_hours
+  # (e.g. 1000 for a 1h async window, 24000 for a 24h batch window), measured
+  # over a rolling window equal to the completion window. Applies to both batch
+  # creation and flex/async submission. Verified creditors are never limited.
+  # Over-limit submissions get HTTP 429 with guidance to verify (add a payment
+  # method / make a payment). Set to 0 to disable. Default: 1000.
+  unverified_requests_per_completion_hour: 1000
+
+  pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
+
+  # Allowed completion windows for batch processing
+  # These define the maximum time from batch creation to completion
+  # Default: ["24h"] - only 24 hour completion window is allowed
+  allowed_completion_windows:
+    - "24h"
+    - "1h"
+    # - "12h"  # Uncomment to allow 12 hour
+    # - "48h"  # Uncomment to allow 48 hour
+
+  # Async requests configuration
+  # Controls the async UI page and which completion window is used for async requests
+  async_requests:
+    enabled: true
+    completion_window: "1h"  # Must be in allowed_completion_windows above
+
+  # Per-window relaxation factors for capacity acceptance.
+  # A multiplier on the model's computed capacity for that window.
+  #   1.0 (default) = strict, only accept what current throughput supports
+  #   1.5           = accept up to 50% more (rely on autoscaling for headroom)
+  #   0.0           = block all new batches for this window
+  # Keys must be present in allowed_completion_windows.
+  # Windows not listed here default to 1.0.
+  window_relaxation_factors:
+    "1h": 1.0 # strict — no over-acceptance for high priority window
+    "24h": 1.25 # 25% over-acceptance — time to provision more capacity
+
+  # Allowed OpenAI-compatible URL paths for batch requests.
+  # This is used by both /files upload validation and /batches endpoint validation.
+  allowed_url_paths:
+    - "/v1/chat/completions"
+    - "/v1/completions"
+    - "/v1/embeddings"
+    - "/v1/responses"
+    - "/v1/messages"
+
+  # Files configuration for batch file uploads/downloads
+  # NOTE: max_file_size has moved to limits.files.max_file_size
+  files:
+    # How long file content stays available. default_expiry_seconds is the
+    # expires_at given to an upload that sends no expires_after, and to a
+    # batch's output and error files from the batch's creation. Uploads may
+    # request expires_after[seconds] between min and max; a value outside
+    # that range is refused with 400. File content and batch results past
+    # expires_at answer 410. These are validated even when batches are
+    # disabled; min <= default <= max. Keep default and max no longer than
+    # content retention, so no file shows a date its content will not reach.
+    # default_expiry_seconds: 2592000 # 30 days
+    # min_expiry_seconds: 3600 # 1 hour
+    # max_expiry_seconds: 2592000 # 30 days
+    upload_buffer_size: 100 # Buffer size for file upload streams (default: 100)
+    download_buffer_size: 100 # Buffer size for file download streams (default: 100)
+    # Database insertion batch size of request templates for file uploads
+    # Higher values improve throughput for large files but use more memory
+    # Reduce value if you encounter memory spike issues with many concurrent uploads
+    batch_insert_size: 5000
+
+# Resource limits configuration
+# Controls file size, request count, and concurrency limits to prevent resource exhaustion
+# limits:
+#   files:
+#     # Maximum file size in bytes (default: 100MB). Gzip and zstd files are
+#     # decoded as they upload, and this limit applies to the decoded size
+#     # (the compressed upload may not exceed it either).
+#     # Set to 0 for unlimited (not recommended for production)
+#     max_file_size: 104857600
+#     # Maximum number of requests (JSONL lines) per file
+#     # Set to 0 for unlimited (default, not recommended for production)
+#     max_requests_per_file: 50000
+#     # Maximum concurrent file uploads allowed system-wide
+#     # Set to 0 for unlimited (default, not recommended for production)
+#     max_concurrent_uploads: 10
+#     # Maximum uploads that can wait in queue for a slot
+#     # When reached, new uploads receive HTTP 429 immediately
+#     # Set to 0 for unlimited waiting queue (not recommended)
+#     max_waiting_uploads: 20
+#     # Maximum seconds to wait for an upload slot before returning HTTP 429
+#     # Set to 0 to reject immediately when no slot is available
+#     max_upload_wait_secs: 60
+#   requests:
+#     # Maximum body size per individual request (bytes). Applies to requests
+#     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
+#     # Inference bodies are bounded before parsing or request logging;
+#     # oversized bodies return HTTP 413. Multipart uploads use max_file_size.
+#     # Realtime bodies may be sent with Content-Encoding gzip, zstd or br;
+#     # the limit applies to the decoded size, and other codings get HTTP 415.
+#     # Set to 0 for unlimited (not recommended for production)
+#     # Default: 10MB (10485760)
+#     # Changing this limit requires a restart to rebuild all routing layers.
+#     max_body_size: 10485760
+#   realtime_inflight:
+#     # Refuse realtime requests over each account's in-flight limit (default: false)
+#     enforce: true
+#     # Redis that holds the realtime in-flight counts every replica shares.
+#     # Unset or unreachable: each replica counts only its own requests.
+#     redis_url: rediss://:password@limits-redis.example:6379
+#   batch_inflight:
+#     # Refuse batch requests over each virtual model's batch_capacity
+#     # (default: false). Off: every batch request is admitted and no shared
+#     # count is touched. Reuses the realtime_inflight.redis_url above; batch
+#     # and realtime counts use separate key spaces.
+#     enforce: true
+#     # Global batch in-flight cap for virtual models that do not set their own
+#     # positive batch_capacity (default: 200). Does not change fusillade's
+#     # per-daemon starting concurrency, which keeps using
+#     # background_services.batch_daemon.default_model_concurrency. Set to 0 or
+#     # null for no default. Raise it per model where batch runs higher.
+#     default_capacity: 200
+
+# External data source connections (S3, etc.)
+# Allows users to connect external storage and sync files for batch processing.
+connections:
+  # Encryption key for connection credentials. Any string works (hashed to 32 bytes).
+  # Falls back to secret_key if not set. Set independently for production use.
+  encryption_key: null
+  sync:
+    # Default completion window for sync-created batches.
+    default_completion_window: "24h"
+    # Default endpoint for sync-created batches.
+    default_endpoint: "/v1/chat/completions"
+
+# OpenAPI spec exposure controls
+# Both surfaces always require authentication when enabled. Disabled
+# routes return 404 (not 403) so probes can't tell the route exists.
+openapi:
+  # Expose /admin/openapi.json and /admin/docs.
+  # The Admin spec describes internal management endpoints, so access
+  # requires an admin-level identity (PlatformManager role, the admin
+  # user, or a platform-purpose API key). Inference sk-* keys are
+  # rejected. Set to false to remove the routes entirely.
+  # Set via environment: DWCTL_OPENAPI__ADMIN_ENABLED=false
+  admin_enabled: true
+  # Expose /ai/openapi.json and /ai/docs.
+  # The AI surface mirrors the publicly-documented OpenAI API; requires
+  # any authenticated identity.
+  ai_enabled: true
+
+# Model discovery (GET /ai/v1/models)
+discovery:
+  # List each serving class of a class-routed model (alias:<class>) as its own
+  # entry. Off by default: classes stay callable but unlisted until announced.
+  # Set via environment: DWCTL_DISCOVERY__LIST_CLASS_ROUTES=true
+  list_class_routes: false
+
+# Onwards AI proxy configuration
+# Controls behavior of the onwards routing layer for AI proxy requests
+onwards:
+  # Maximum pending bytes of an unfinished SSE event; complete events are forwarded first.
+  # Increase for providers with large tool-call events. This is not a response-length limit.
+  # Exceeding it fails the response body stream. Zero permits no unfinished bytes.
+  # Set via environment: DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576
+  sse_buffer_limit: 65536
+  # Enable strict mode with schema validation and typed handlers.
+  # When false (default), all requests are passed through transparently.
+  # When true, only known OpenAI API paths are accepted and validated.
+  # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
+  strict_mode: false
+  # Public message for upstream 429 responses, including exhausted retries.
+  # Local request and concurrency limits keep their existing messages.
+  # Set via environment: DWCTL_ONWARDS__UPSTREAM_RATE_LIMIT_MESSAGE
+  upstream_rate_limit_message: "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+  # Failover deadline (ms) for the first token of a realtime streamed response.
+  # While a model still has another provider to fail over to, an attempt that
+  # hasn't started streaming within this window is abandoned and the next
+  # provider tried. The final attempt is never cut off, and fusillade daemon
+  # traffic (batch, flex, background) is exempt. Set to 0 to disable.
+  # AIMD records a first token later than its separate 10-second latency budget as
+  # a breach without cutting the attempt off; once breaches exceed its target rate,
+  # later requests shift to the alternates.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=20000
+  first_token_timeout_ms: 20000
+  # Models may override the deadline via first_token_timeout_ms in the model API.
+  # Priority composites with fallback enabled use AIMD by default in strict mode.
+  # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
+  # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
+  # Strict-mode chat and legacy completions parameters refused with a 400
+  # instead of forwarded.
+  # Onwards counts and traces every parameter not every worker can serve
+  # (onwards_unsupported_params_total); only the ones listed here are refused.
+  # Names come from onwards::unsupported_params::params(), e.g. [n, logprobs].
+  # Set via environment: DWCTL_ONWARDS__REJECTED_PARAMS='[n,logprobs]'
+  rejected_params: []
+  # Per-model exceptions to rejected_params, keyed by model alias (never a
+  # model:<class> name): the listed parameters are forwarded for that model and
+  # each of its serving classes anyway. For a model whose every worker honours a
+  # parameter the rest of the fleet can't.
+  # e.g. {"example/model": [logprobs, top_logprobs]}
+  model_allowed_params: {}
+
+# Cached-input pricing (the dwctl-owned cache layer)
+cache:
+  # Enable cached-input pricing. When false (default), the cache layer is not added to
+  # the stack: zero request-path overhead, behaviour identical to today. When true, the
+  # classifier runs concurrently with the upstream model call under a deadline (so it adds
+  # no latency), strips cache_control markers, injects cache_* usage fields, and commits
+  # prefix writes on success. Per-model activation is still gated by an active
+  # model_cache_tariffs row, so this flag alone does nothing until a model is enabled.
+  # Set via environment: DWCTL_CACHE__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc (only consulted when enabled). A namespace-relative
+  # service name resolves to the tokenizer-svc in the pod's own namespace.
+  # Set via environment: DWCTL_CACHE__TOKENIZER_URL=http://tokenizer-svc:8088
+  tokenizer_url: http://localhost:8088
+  # The cache TTL tiers the platform currently offers (Anthropic-style: "5m", "1h", "24h").
+  # A request whose cache_control marker names a tier NOT listed here is rejected with a 400
+  # (like an unknown parameter), not silently un-cached, so billing stays honest. Restrict
+  # this to roll out a subset (e.g. omit "24h" until the KV-store mechanism exists); a model
+  # may still carry a tariff for a disabled tier, it just can't be reached until re-enabled.
+  # Set via environment: DWCTL_CACHE__ENABLED_TTLS=5m,1h
+  enabled_ttls:
+    - 5m
+    - 1h
+  # The tier a cache_control marker with no explicit ttl defaults to (Anthropic defaults to
+  # "5m"). Must be one of enabled_ttls.
+  # Set via environment: DWCTL_CACHE__DEFAULT_TTL=5m
+  default_ttl: 5m
+  # Deadline (seconds) for joining the classify fork at response time. classify races the
+  # (slower) model call, so this only bites when classification is still unresolved as the
+  # response completes — in which case the request bills un-cached (fail-safe). Keep tight on
+  # latency-sensitive realtime pods; raise on the fusillade-batch pod (no first-token
+  # pressure) so index retries have room to land. Default 5.
+  # Set via environment: DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10
+  # classify_deadline_secs: 5
+  # Retries per cache-index DB op (lookup/write/refresh) after a connection-class failure
+  # (severed idle conn / TLS EOF / auth timeout — the burst-churn family; other errors never
+  # retry). Backed off 100ms*2^n; the classify deadline still bounds the caller. Raise on the
+  # bursty batch pod (e.g. 3); default 1.
+  # Set via environment: DWCTL_CACHE__INDEX_CONN_RETRIES=3
+  # index_conn_retries: 1
+  # Default pricing multipliers — pre-fill values when enabling caching on a model without
+  # explicit per-tier rates. The model_cache_tariffs row is the source of truth, so these
+  # only matter at enable-time. Defaults shown; uncomment to override.
+  # pricing:
+  #   default_write_multiplier_5m: 1.25
+  #   default_write_multiplier_1h: 2.0
+  #   default_write_multiplier_24h: 2.5
+  #   default_read_multiplier: 0.1
+  #   default_min_prefix_tokens: 1024
+
+# Mid-stream continuation (the resume layer): when a streaming generation dies
+# mid-output, rebuild the prompt + partial output as token-ids (tokenizer-svc
+# /v1/render) and resume it as a /v1/completions request through the model's
+# completions pool, splicing the result into the client's still-open stream with
+# merged billing. Per-model activation is DATA, not config: a model rescues only
+# when its composite carries a completions pool with an enabled member.
+# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain.
+# clickhouse:
+#   endpoint_url: "https://<service>.<region>.aws.clickhouse.cloud:8443"
+#   database: "clay"
+#   user: "dwctl"
+#   password: ""
+
+# Prefix-chain capture: per chat-completions request, keyed hashes of the prompt's
+# content blocks plus per-block token counts, written to ClickHouse. No content.
+prefix_chain:
+  enabled: false
+  models: null # null: every model; a non-empty list: exactly those aliases
+  hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
+
+# Shadow reference-cache estimate: for chat completions from the listed principals,
+# records in http_analytics.reference_cached_tokens how many prompt tokens an ideal
+# per-principal prefix cache would have served. Observational only: nothing is billed
+# from it and the usage returned to the caller is unchanged. Requires enable_analytics.
+reference_cache:
+  enabled: false
+  # Sliding window: an entry expires this long after the last request that used it.
+  ttl_secs: 300
+  # Billing principals (api_keys.user_id: the org id for org keys). Required when
+  # enabled. Env: DWCTL_REFERENCE_CACHE__ORGS="<uuid>,<uuid>"
+  orgs: []
+  models: null # null: every model; a non-empty list: exactly those aliases
+  # Per-alias tokens subtracted from an exact match (chat-template tail). Default 0.
+  template_allowance_tokens: {}
+  # Bound on the estimate in the analytics handler (past it the column is NULL) and on
+  # each entry write. Must be greater than 0.
+  estimate_timeout_ms: 2000
+  sweep_interval_secs: 60
+  # Connections of the main pool the estimate may hold at once, so it cannot starve it.
+  max_connections: 4
+
+continuation:
+  # Global kill switch. When false (default), the layer is not added to the
+  # stack and the request path is byte-identical to a build without it.
+  # Set via environment: DWCTL_CONTINUATION__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc used to render resume prefixes. Unset
+  # (default) falls back to cache.tokenizer_url — the same service serves both
+  # layers; set only to split them.
+  # Set via environment: DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088
+  # tokenizer_url: http://localhost:8088
+  # Per-origin eligibility gates (derived from the API key's purpose, the same
+  # signal analytics uses for request_origin). Permanent config, not rollout
+  # scaffolding: resume economics differ per origin (paying a provider again vs
+  # a plain retry behind fusillade's masking).
+  origins:
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__REALTIME=true
+    realtime: true
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__BATCH=true
+    batch: false
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true
+    playground: false
+  # Maximum resume legs for one logical stream (a leg that itself dies re-enters
+  # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
+  # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
+  max_attempts: 2
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte).
+  # Crossed -> that leg is abandoned; attempts exhausted -> the original death
+  # surfaces. Cold provider prefill dominates on long prompts.
+  # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
+  resume_deadline_secs: 20
+  # Inter-frame silence after which an armed stream is declared stalled and
+  # rescued. Rescue CANCELS the original leg, so this must never undercut the
+  # platform's own liveness judgment (fusillade allows 600s between SSE events
+  # in prod): a preempted-but-progressing stream must be left alone. 540 sits
+  # just inside fusillade's 600s so batch-origin stalls remain rescuable before
+  # the daemon aborts. Arms only after the first generated text.
+  # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
+  stall_timeout_secs: 540
+  # Cap applied separately to each retained allocation per armed stream (the
+  # request body, and the accumulated generation) - worst case ~2x this value.
+  # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
+  # the buffer dropped; the stream itself is unaffected.
+  # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
+  max_buffer_bytes: 2097152
+  # Dynamo scheduler priority on resume legs. Realtime runs 0, batch negative —
+  # positive puts resumes ahead of new work, deliberately: a resume finishes a
+  # stream already accepted, on a seam budget. Onwards strips the field for
+  # pool members that would reject it (third-party providers).
+  # Set via environment: DWCTL_CONTINUATION__PRIORITY=100
+  priority: 100
+  # Per-model cap on concurrently in-flight resume legs — bounds the stampede a
+  # flapping model can send at its continuation provider during an incident.
+  # Set via environment: DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8
+  max_inflight_per_model: 8
+  # Reconstructor per model alias, for models whose reasoning/tool-call streams
+  # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
+  # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
+  # reasoning/tool streams disarm safely instead of resuming.
+  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  model_reconstructors: {}
+
+# Background services configuration
+# Controls which background services run on this instance
+background_services:
+  # jemalloc statistics sampler (Linux) for the dwctl_jemalloc_* gauges. Runs off
+  # the request path when enable_metrics is true. See docs/memory-observability.md.
+  allocator_metrics:
+    enabled: true # Default: true
+    sample_interval: 15s # Default: 15s (minimum 1s)
+
+  # Onwards config sync - syncs database changes to the AI proxy routing layer
+  # Disabling this will prevent the AI proxy from receiving config updates
+  onwards_sync:
+    enabled: true # Default: true (recommended)
+    # Periodic full-resync safety net (milliseconds). LISTEN/NOTIFY propagates real config
+    # changes in real time; this fallback only guards against dropped notifications. Each tick
+    # triggers a full routing-table reload (heavy DB egress), so keep it in minutes, not seconds.
+    # Default: 300000 (5 min). Set to 0 to disable (not recommended).
+    fallback_interval_milliseconds: 300000
+
+  # Per-key account policy sync - keeps the in-memory map of each API key's owning
+  # account policy (zero data retention, disabled modalities) fresh after startup.
+  # Independent of onwards_sync: the realtime modality gate enforces from this map.
+  # The map is always loaded once at startup; with this off, policy changes only
+  # reach an instance when it restarts.
+  key_policy_sync:
+    enabled: true # Default: true
+    # Periodic full reload (milliseconds). One small join; NOTIFY carries real
+    # changes, so this only guards against a missed notification.
+    # Default: 300000 (5 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 300000
+
+  # Usage-refresh daemon - incrementally folds new http_analytics rows into the
+  # user_model_usage_daily rollup. Woken in-process by the analytics batcher after each
+  # flush (no LISTEN/NOTIFY - emitter and consumer share the pod); the fallback tick only
+  # backstops a missed nudge or a restart. Cross-pod runs are deduped by an advisory lock.
+  usage_refresh:
+    enabled: true # Default: true
+    # Fallback tick (milliseconds). The batcher nudge drives refreshes under load; this only
+    # backstops missed nudges / drains after a restart. Cheap - a tick with no new rows no-ops.
+    # Default: 60000 (1 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 60000
+    # Minimum spacing between refreshes (milliseconds): coalesces bursts of batcher nudges.
+    # Default: 30000 (30s).
+    min_interval_milliseconds: 30000
+
+  # Probe scheduler - periodically checks inference endpoint health
+  # When leader_election is enabled, only runs on the elected leader
+  probe_scheduler:
+    enabled: true # Default: true
+
+  # Batch processing daemon - processes batch requests asynchronously
+  batch_daemon:
+    # Controls when the batch processing daemon runs
+    # - "always": Run on all instances (default)
+    # - "leader": Only run on the elected leader instance
+    # - "never": Never run the daemon
+    enabled: always
+    # Which fusillade claim loops this daemon process runs:
+    # - "both": Run request and batch claim loops (default)
+    # - "request_only": Run only batchless request claims
+    # - "batch_only": Run only batch claims
+    mode: both
+
+    # Performance & Concurrency Settings
+    claim_batch_size: 100 # Maximum number of requests to claim in each iteration
+    default_model_concurrency: 10 # Default concurrent requests per model
+    claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+
+    # Adaptive per-model concurrency. Discovers the sustainable in-flight count
+    # from downstream 529s instead of running flat out at a static number.
+    #
+    # default_model_concurrency and per-model batch_capacity become the value
+    # each model STARTS at; the controller owns the number from there and can go
+    # above it. Turning this off puts every model back on its configured value,
+    # so the flag is safe to flip either way. Set max_total_in_flight first - it
+    # is what bounds this instance's memory once per-model values stop capping.
+    #
+    # adaptive_concurrency: false
+    # adaptive_growth_factor: 1.5    # Multiplier applied each time a limit goes up
+    # adaptive_cut_factor: 0.8       # Multiplier applied on downstream 529
+    # max_total_in_flight: 0         # Hard cap on this instance's total in-flight
+    #                                # requests across all models; 0 disables
+
+    # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
+    # are claimed by independent loops. All optional:
+    # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
+    # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
+    # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
+    # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
+    #                                 # false treats no-event models (external providers) as live
+    # Batches on unavailable models get one immediate claim,
+    # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
+    leak_interval_seconds: 60
+    model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within
+    #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
+    # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
+    #                                 # background workers may send; background work does not
+    #                                 # consume it. 0 disables processing, and a nonzero value requires
+    #                                 # inject_deadline_priority: true below
+
+    # Retry & Backoff Settings
+    # All retry parameters are optional and default to fusillade's built-in defaults
+    # min_retries: 3 - Minimum retries guaranteed regardless of other limits
+    # max_retries: None - No cap on retries (only limited by deadline if set)
+    stop_before_deadline_ms: 0 # When to stop retrying/escalating relative to the batch completion window. Positive means before deadline, negative means after deadline (default: 0, stop on expiration deadline)
+
+    backoff_ms: 1000 # Initial backoff duration in milliseconds
+    backoff_factor: 2 # Exponential backoff multiplier
+    max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
+    additional_retryable_statuses:
+      - 499
+
+    # Timeout Settings
+    # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms
+    first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
+    chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
+    body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
+    # Upload watchdog only covers sending the request body. Keep its stall
+    # timeout below first_chunk_timeout_ms so a stalled upload is reported first.
+    upload_stall_timeout_ms: 60000 # Max time without upload progress (1 minute)
+    upload_chunk_bytes: 65536 # Upload progress granularity (64 KiB)
+    upload_stall_poll_ms: 100 # Upload progress check interval (100 ms)
+    claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
+    processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+    pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
+
+    # Retained-response lifecycle. No retention period is implied by the
+    # application defaults, and movement and retirement remain off unless
+    # explicitly enabled. Only terminal batchless response tiers are accepted
+    # for scheduled lifecycle management in this release; file and file-backed
+    # batch policies fail startup validation. Every configured tier also needs
+    # an explicit positive max_late_writer_seconds fence.
+    # retention:
+    #   batchless_seconds_by_service_tier:
+    #     flex: <seconds>
+    #   max_late_writer_seconds: <seconds>
+    # batchless_archive_sweep_enabled: false
+    # batchless_archive_backfill_enabled: false
+    # batchless_archive_groups_per_tick: <positive bound>
+    # batchless_archive_bytes_per_tick: <positive bound>
+    # batchless_archive_backfill_concurrency: 1  # Graphs the backfill moves at once per tick; the
+    #                                            # one-off drain lever (sweep stays sequential). Needs
+    #                                            # this many spare fusillade write connections.
+    # retained_response_partitions_days_ahead: <positive runway>
+    # With retention configured for "priority", terminal realtime responses
+    # are written directly into these partitions. Missing/unavailable partitions
+    # fall back to live storage for later archival; monitor
+    # fusillade_realtime_retained_fallback_total (normally zero) alongside
+    # fusillade_realtime_retained_total.
+    # Daily partition retirement irreversibly drops whole expired
+    # retained-response partitions. It is independently disabled and needs a
+    # session-capable direct primary connection: in schema mode the primary
+    # connection is reused, while a dedicated fusillade database requires the
+    # explicit direct (non-pooled) endpoint below. Keep the endpoint
+    # configured until every journaled retirement has completed, even if the
+    # enable flag is turned back off.
+    # retained_response_retirement_enabled: false
+    # Content retention for both weekly families below is R =
+    # batches.files.max_expiry_seconds rounded up to whole days. A week drops
+    # once it is R days past its end, so no file's expires_at can outrun its
+    # content. While either family is enabled, a batch can no longer be
+    # retried once it, or its input file, is R - 1 days old (a retry would
+    # hold its weeks open past the period); the API answers 400.
+    #
+    # Weekly batch-archive retirement irreversibly drops a whole archive
+    # partition once the week is past R, measured from the week itself, and
+    # no batch created in that week is still running. The oldest completion
+    # in a dropped week is 7 + R days old, the newest R days. Batch metadata
+    # rows are never touched. Requires the same session-capable maintenance
+    # endpoint as response retirement.
+    # batch_archive_retirement_enabled: false
+    # DEPRECATED and ignored: batch_archive_retention_days and
+    # template_retention_days no longer set retention, which follows
+    # batches.files.max_expiry_seconds. The keys still parse so existing
+    # values files keep loading, but log a warning at startup. Remove them.
+    # batch_archive_retention_days: <ignored>
+    # DEPRECATED and ignored: request templates are always written to the
+    # weekly generation-2 partitions now that the generation-1 heap has been
+    # retired. The key still parses so existing values files keep loading,
+    # but it logs a warning at startup. Remove it.
+    # template_generation_writes_enabled: false
+    # Weekly template retirement irreversibly drops a whole week of request
+    # templates (batch input content) once the week is past R, measured from
+    # the week itself, and no batch still running reads input uploaded in
+    # that week. File metadata rows are never touched; an input file reports
+    # expired from its own expires_at. Requires the same session-capable
+    # maintenance endpoint.
+    # template_retirement_enabled: false
+    # template_retention_days: <ignored, deprecated; see above>
+    # Schema mode reuses the main direct credentials automatically. Override for
+    # dedicated databases or a different Fusillade query role. Use that role on
+    # the DIRECT host; startup attests database, role, schema, and ownership.
+    # retained_response_partition_maintenance_url: postgres://postgres:password@direct:5432/dwctl
+
+    # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
+    # from fusillade.requests into the partitioned batch_requests_archive.
+    # BOTH movers ship DISABLED — deploys never move data, only these flags
+    # do. Sequencing (load-bearing): flip only once every pod runs
+    # location-routing-aware code AND the dwctl version that introduced
+    # these keys is the rollback floor (deny_unknown_fields: an older pod
+    # parsing a config containing them crash-loops). The daily
+    # partition-runway tick always runs on batch-mode daemons regardless of
+    # these flags (fusillade_archive_partitions_ahead gauges it).
+    # batch_archive_sweep_enabled: false      # Steady-state sweeper: archive newly-frozen batches (oldest-first)
+    # batch_archive_sweep_interval_ms: 5000   # Sweep tick cadence (0 disables the worker)
+    # batch_archive_sweep_moves_per_tick: 4   # Bounded batch moves per tick, never drain-until-empty
+    # batch_archive_sweep_dwell_secs: 0       # Post-freeze dwell before archiving (0 = move immediately)
+    # batch_archive_cancel_grace_secs: 600    # Hold batches with in-flight-canceled rows this long so late
+    #                                         # billed results can still supersede the cancel on the live row
+    # batch_archive_backfill_enabled: false   # Historical drain: same mover, own pacing, oldest-first;
+    #                                         # flip off to pause instantly (resumable by construction)
+    # batch_archive_backfill_interval_ms: 1000
+    # batch_archive_backfill_moves_per_tick: 4
+    # batch_archive_backfill_concurrency: 8    # Concurrent moves per tick; the drain-throughput lever
+    #                                          # (per-move cost is mostly fixed txn overhead). 1 = sequential
+    # batch_archive_partitions_weeks_ahead: 4 # Weekly-partition runway maintained by the daily tick
+
+    # Observability
+    status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
+
+    # SLA Daemon configuration
+    # Route-at-claim-time model escalation
+    # When a batch is within `escalation_threshold_seconds` of expiry at claim time,
+    # the daemon routes requests to a different (typically faster) model.
+    # Batch API keys automatically have access to escalation models in the routing cache.
+    # model_escalations:
+    #   gpt-4:  # Original model
+    #     escalation_model: o1-preview  # Route to this model when near expiry
+    #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
+
+    # Endpoints that should use SSE streaming for usage tracking.
+    # Batch requests to these paths have stream: true and stream_options.include_usage
+    # injected on the way out, and the streamed response is reassembled into
+    # non-streaming JSON before it is stored or returned. Only batch traffic is
+    # affected; a client request to the same path is left as the client sent it.
+    streamable_endpoints:
+      - /v1/chat/completions
+      - /v1/completions
+      - /v1/responses
+
+    # Inject a deadline-derived priority hint into outbound request bodies at
+    # `nvext.agent_hints.priority` (NVIDIA Dynamo's unified priority extension;
+    # i32, higher = more important; Dynamo normalizes per backend). The value
+    # is the negated Unix timestamp of the batch SLA deadline so earlier
+    # deadlines produce larger numbers.
+    # inject_deadline_priority: false
+
+  # Batch completion notifications (emails + webhooks)
+  # notifications:
+  #   poll_interval: 30s                # How often to poll for completed batches
+  #   webhooks:
+  #     enabled: true
+  #     timeout_secs: 30                # HTTP timeout per delivery attempt
+  #     circuit_breaker_threshold: 10   # Consecutive failures before auto-disabling
+  #     # Retry backoff schedule in seconds. Length = max attempts before exhaustion.
+  #     # Default: immediate, 5s, 5m, 30m, 2h, 8h, 24h
+  #     retry_schedule_secs: [0, 5, 300, 1800, 7200, 28800, 86400]
+  #     claim_batch_size: 50            # Max deliveries claimed from DB per tick
+  #     max_concurrent_sends: 20        # Max parallel outbound HTTP requests
+  #     channel_capacity: 200           # Internal send/result channel buffer size
+
+  # Leader election - coordinates which instance runs leader-only services
+  # When disabled, all instances run as leader (useful for single-instance deployments)
+  leader_election:
+    enabled: true # Default: true
+
+  # External connection sync workers - process file ingestion and batch activation jobs.
+  # Set enabled: false for API-only replicas (jobs queue in Postgres for other replicas).
+  sync_workers:
+    enabled: true # Default: true
+    ingest_workers: 4 # Concurrent file ingestion workers
+    activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
+    discovery_workers: 1 # Sync discovery workers
+
+# Image input normalisation.
+#
+# When enabled, image references in `/v1/chat/completions` and
+# `/v1/responses` request bodies are routed through a hardened
+# content-addressed object store before being forwarded to upstream
+# providers. Both HTTP(S) `image_url` values and inline `data:` URIs
+# are normalised: each image is fetched (HTTP) or decoded (data URI),
+# validated (IP allow-list for HTTP fetches, plus a MIME allow-list
+# and size cap for both), uploaded to the store, and replaced in the
+# body with a short-lived signed URL.
+#
+# Defaults are conservative — the feature is off until an operator
+# enables it and configures a backend bucket.
+image_normalizer:
+  enabled: false # Default: false; set to true after configuring a backend
+  backend:
+    # `memory` (tests / local dev), `gcs`, or `s3_compatible` (production).
+    type: memory
+    #
+    # Google Cloud Storage (Workload Identity — no static keys):
+    # type: gcs
+    # bucket: doubleword-images
+    # region: europe-west4
+    #
+    # Any S3-compatible store via a custom endpoint (Cloudflare R2, MinIO,
+    # Backblaze B2, AWS S3). Credentials are NOT set here — they are read
+    # from the environment so they never land in config or a config dump.
+    # (Unprefixed, NOT DWCTL_, so the config loader leaves them alone.)
+    #   IMAGE_NORMALIZER_S3_ACCESS_KEY_ID
+    #   IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY
+    # type: s3_compatible
+    # bucket: doubleword-images
+    # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
+    # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
+    # force_path_style: true  # required by most S3-compatible endpoints
+    # reuse_max_age_secs: 432000   # 5 days. Objects are deduplicated by
+    #                               # content hash, and the R2 lifecycle deletes
+    #                               # them 14 days after upload regardless of use.
+    #                               # A batch reference can be dispatched up to
+    #                               # 24h + the 7-day retry buffer after ingest,
+    #                               # so a dedup hit older than this is re-uploaded
+    #                               # rather than left to expire mid-batch.
+    #                               # 0 disables. Ignored when
+    #                               # unique_upload_keys is on.
+  # Store each ingest under its own object key (dw-img://{sha256}.{upload_id})
+  # instead of reusing one object per content hash. Enable only once every
+  # replica runs a version that reads upload-ID tokens; disable before
+  # rolling back past it.
+  unique_upload_keys: false
+  fetcher:
+    max_bytes: 20971520        # 20 MiB
+    timeout_secs: 30
+    max_redirects: 3
+    max_retries: 3
+    retry_base_delay_ms: 250
+    allowed_mime:
+      - image/png
+      - image/jpeg
+      - image/webp
+      - image/gif
+  signing:
+    realtime_ttl_secs: 900            # 15 min — covers a chat completion
+    # dispatch_ttl_secs: 1800         # Optional override. When omitted,
+                                      # derived as
+                                      #   processing_timeout_ms (from
+                                      #   background_services.batch_daemon)
+                                      #   + dispatch_ttl_headroom_secs
+                                      # so the URL is always valid for at
+                                      # least one full dispatch attempt.
+                                      # Each retry gets a brand-new URL.
+    dispatch_ttl_headroom_secs: 300   # +5 min on top of processing_timeout
+    dashboard_ttl_secs: 300           # 5 min — dashboard image-view path
+
+# NOTE on bucket data lifetime:
+#
+# This dwctl process never garbage-collects objects from the image
+# normaliser bucket — that's a GCS-side concern, configured out-of-band
+# via the bucket's Object Lifecycle Management policy
+# (Terraform / gcloud).
+#
+# Recommended lifecycle rule for production:
+#
+#   age (days)  = max_batch_completion_window + investigation_buffer
+#   action      = Delete
+#
+# Example (covers 24h batches + 6 days of headroom for support / replay):
+#
+#   gcloud storage buckets update gs://<bucket> --lifecycle-file=- <<EOF
+#   {"lifecycle":{"rule":[{"action":{"type":"Delete"},
+#                          "condition":{"age":7}}]}}
+#   EOF
+#
+# Tighter retention is fine — the worst-case batch dispatch attempt is
+# bounded by background_services.batch_daemon.processing_timeout_ms,
+# and dispatch URLs are signed per-attempt. The only constraint is the
+# bucket retention MUST exceed the maximum time a batch can sit
+# between ingest and final dispatch attempt (typically the batch
+# completion window, 24h for OpenAI-style "24h" batches).

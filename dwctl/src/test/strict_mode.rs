@@ -1,0 +1,1477 @@
+
+use crate::api::models::users::Role;
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use sqlx::PgPool;
+
+#[dwctl_test_macros::test]
+async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool) {
+    for strict_mode in [true, false] {
+        let mut config = create_test_config();
+        config.onwards.strict_mode = strict_mode;
+        config.cache.enabled = false;
+        config.limits.requests.max_body_size = 64;
+        let app = crate::Application::new_with_pool(config.clone(), Some(pool.clone()), None)
+            .await
+            .expect("Failed to create application");
+        config.limits.requests.max_body_size = 1000;
+        app.app_state.config.store(config);
+        let (server, _services) = app.into_test_server();
+
+        for path in ["chat/completions", "completions", "responses", "messages", "embeddings"] {
+            let response = server.post(&format!("/ai/v1/{path}")).bytes(vec![b'x'; 65].into()).await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "request_too_large");
+            if path == "messages" {
+                assert_eq!(body["type"], "error");
+            }
+
+            let response = server
+                .post(&format!("/ai/v1/{path}"))
+                .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+                .bytes(vec![b'x'; 65].into())
+                .await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        let response = server.post("/ai/v1/files").bytes(vec![b'x'; 65].into()).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+}
+
+async fn assert_compressed_bodies_reach_upstream_decoded(pool: PgPool, strict_mode: bool) {
+    use std::io::Write;
+
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-compressed",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })))
+        .mount(&mock)
+        .await;
+    let mut config = create_test_config();
+    config.onwards.strict_mode = strict_mode;
+    config.cache.enabled = false;
+    let (server, key, _services) = super::responses::setup_ai_test_with_config(pool, &mock, config).await;
+
+    let json = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "compressed hello"}]
+    }))
+    .unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&json).unwrap();
+    for (encoding, body) in [("gzip", gzip.finish().unwrap()), ("zstd", zstd::encode_all(&json[..], 3).unwrap())] {
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .add_header("Content-Type", "application/json")
+            .add_header("Content-Encoding", encoding)
+            .bytes(body.into())
+            .await;
+        response.assert_status_ok();
+    }
+
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2, "strict_mode={strict_mode}");
+    for request in received {
+        assert!(request.headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["messages"][0]["content"], "compressed hello", "strict_mode={strict_mode}");
+    }
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Type", "application/json")
+        .add_header("Content-Encoding", "utf-8")
+        .bytes(json.into())
+        .await;
+    response.assert_status_ok();
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 3, "strict_mode={strict_mode}");
+    assert!(received[2].headers.get("content-encoding").is_none(), "strict_mode={strict_mode}");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("Content-Encoding", "lz4")
+        .bytes((&b"\x04\x22\x4d\x18 compressed bytes"[..]).into())
+        .await;
+    response.assert_status(axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        response.json::<serde_json::Value>()["error"]["code"],
+        "unsupported_content_encoding"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        3,
+        "refused before reaching the upstream"
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_strict_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, true).await;
+}
+
+#[dwctl_test_macros::test]
+async fn test_compressed_bodies_reach_upstream_decoded_in_passthrough_mode(pool: PgPool) {
+    assert_compressed_bodies_reach_upstream_decoded(pool, false).await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
+    let _mock_server = wiremock::MockServer::start().await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Test key"
+        }))
+        .await;
+
+    assert_eq!(key_response.status_code(), 201);
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    let unknown_endpoints = vec![
+        "/v1/unknown/endpoint",
+        "/v1/engines/test/completions",
+        "/v1/audio/speech",
+        "/v1/images/generations",
+    ];
+
+    for endpoint in unknown_endpoints {
+        let response = server
+            .post(&format!("/ai{}", endpoint))
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .add_header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "gpt-4",
+                "input": "test"
+            }))
+            .await;
+
+        let status = response.status_code();
+        let body = response.text();
+        assert_eq!(
+            status, 404,
+            "Expected 404 for unknown endpoint {} in strict mode, got {} with body: {}",
+            endpoint, status, body
+        );
+    }
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let initial_response = server
+        .get("/ai/v1/models")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .await;
+    let initial_status = initial_response.status_code();
+
+    let start = std::time::Instant::now();
+    let mut synced = initial_status == 200;
+    while !synced && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+        synced = check_response.status_code() == 200;
+        if !synced {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(synced, "API key should be synced to onwards within 3 seconds");
+
+    {
+        let endpoint = "/ai/v1/models";
+        let response = server
+            .get(endpoint)
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        let status = response.status_code();
+        let text = response.text();
+        assert_eq!(status, 200, "Expected 200 for {} endpoint in strict mode, got {}", endpoint, status);
+
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("Failed to parse JSON response for {}: {}. Response body: {}", endpoint, e, text));
+        assert!(body["object"].as_str() == Some("list"), "Response should have object: list");
+        assert!(body["data"].is_array(), "Response should have data array");
+    }
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-strict-test",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "This is a test response in strict mode"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+    config.background_services.task_workers.response_writer_batch_size = 1;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "test-openai",
+            "url": mock_server.uri(),
+            "description": "Test OpenAI endpoint for strict mode",
+            "auto_sync_models": false
+        }))
+        .await;
+
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4",
+            "hosted_on": endpoint_id
+        }))
+        .await;
+
+    assert!(
+        model_response.status_code().is_success(),
+        "Failed to create model: {}",
+        model_response.status_code()
+    );
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    let assoc_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert!(
+        assoc_response.status_code().is_success(),
+        "Failed to associate model with group: {}",
+        assoc_response.status_code()
+    );
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Strict mode test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
+
+    let chat_request = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{
+            "role": "user",
+            "content": "Hello, test strict mode"
+        }]
+    });
+    let send_chat = async |body: &serde_json::Value| {
+        server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .add_header("Content-Type", "application/json")
+            .json(body)
+            .await
+    };
+
+    let start = std::time::Instant::now();
+    let (status, body_text) = loop {
+        let chat_response = send_chat(&chat_request).await;
+        let status = chat_response.status_code();
+        if (status != 403 && status != 404) || start.elapsed() > std::time::Duration::from_secs(5) {
+            break (status, chat_response.text());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    };
+    assert_eq!(
+        status, 200,
+        "Expected 200 for chat completions in strict mode. Got {}: {}",
+        status, body_text
+    );
+
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "Response ID should be fusillade ID, got: {id}");
+    assert_eq!(body["object"].as_str(), Some("chat.completion"));
+    assert_eq!(body["model"].as_str(), Some("gpt-4"));
+    assert!(body["choices"].is_array());
+    assert!(body["usage"].is_object());
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-strict-test",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "This is a test response in strict mode"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+    config.limits.requests.max_body_size = 5 * 1024 * 1024;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "test-openai",
+            "url": mock_server.uri(),
+            "description": "Test OpenAI endpoint for strict mode",
+            "auto_sync_models": false
+        }))
+        .await;
+
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4",
+            "hosted_on": endpoint_id
+        }))
+        .await;
+
+    assert!(
+        model_response.status_code().is_success(),
+        "Failed to create model: {}",
+        model_response.status_code()
+    );
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    let assoc_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert!(
+        assoc_response.status_code().is_success(),
+        "Failed to associate model with group: {}",
+        assoc_response.status_code()
+    );
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Strict mode body limit test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
+
+    let chat_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": "x".repeat(3 * 1024 * 1024)
+            }]
+        }))
+        .await;
+
+    let status = chat_response.status_code();
+    assert_eq!(
+        status,
+        200,
+        "Expected 200 for a 3MB body within the configured limit. Got {}: {}",
+        status,
+        chat_response.text()
+    );
+
+    let chat_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": "x".repeat(6 * 1024 * 1024)
+            }]
+        }))
+        .await;
+
+    assert_eq!(
+        chat_response.status_code(),
+        413,
+        "Expected 413 for a 6MB body over the configured limit. Got {}: {}",
+        chat_response.status_code(),
+        chat_response.text()
+    );
+
+    let provider_requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        provider_requests.len(),
+        1,
+        "Expected only the within-limit request to reach the provider, got {} requests",
+        provider_requests.len()
+    );
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_allows_completions(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "cmpl-strict-test",
+            "object": "text_completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "text": "This is a test response from legacy completions",
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 9,
+                "total_tokens": 14
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "test-openai",
+            "url": mock_server.uri(),
+            "description": "Test OpenAI endpoint for completions",
+            "auto_sync_models": false
+        }))
+        .await;
+
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4",
+            "hosted_on": endpoint_id
+        }))
+        .await;
+
+    assert!(
+        model_response.status_code().is_success(),
+        "Failed to create model: {}",
+        model_response.status_code()
+    );
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    let assoc_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert!(
+        assoc_response.status_code().is_success(),
+        "Failed to associate model with group: {}",
+        assoc_response.status_code()
+    );
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Strict mode completions test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
+
+    let completions_response = server
+        .post("/ai/v1/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "prompt": "Say hello"
+        }))
+        .await;
+
+    let status = completions_response.status_code();
+    let body_text = completions_response.text();
+    assert_eq!(
+        status, 200,
+        "Expected 200 for legacy completions in strict mode. Got {}: {}",
+        status, body_text
+    );
+
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response body should be valid JSON");
+    let id = body["id"].as_str().unwrap();
+    assert!(id.starts_with("resp_"), "the gateway's id replaces the upstream's, got {id}");
+    assert_eq!(body["object"].as_str(), Some("text_completion"));
+    assert_eq!(body["model"].as_str(), Some("gpt-4"));
+    assert!(body["choices"].is_array());
+    assert!(body["usage"].is_object());
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_allows_embeddings(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/embeddings"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": [0.1, 0.2, 0.3, 0.4, 0.5],
+                "index": 0
+            }],
+            "model": "text-embedding-3-small",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "test-embeddings",
+            "url": mock_server.uri(),
+            "auto_sync_models": false
+        }))
+        .await;
+
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "text-embedding-3-small",
+            "alias": "text-embedding-3-small",
+            "hosted_on": endpoint_id
+        }))
+        .await;
+
+    assert!(
+        model_response.status_code().is_success(),
+        "Failed to create embedding model: {}",
+        model_response.status_code()
+    );
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Embeddings test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("text-embedding-3-small"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(
+        model_available,
+        "Model text-embedding-3-small should be available in onwards within 3 seconds"
+    );
+
+    let embeddings_response = server
+        .post("/ai/v1/embeddings")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": "Test embeddings in strict mode"
+        }))
+        .await;
+
+    assert_eq!(embeddings_response.status_code(), 200, "Expected 200 for embeddings in strict mode");
+
+    let body: serde_json::Value = embeddings_response.json();
+    assert_eq!(body["object"].as_str(), Some("list"));
+    assert!(body["data"].is_array());
+    assert_eq!(body["model"].as_str(), Some("text-embedding-3-small"));
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .bytes("{invalid json".as_bytes().into())
+        .await;
+
+    assert_eq!(response.status_code(), 400, "Should reject malformed JSON with 400");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .await;
+
+    assert_eq!(
+        response.status_code(),
+        422,
+        "Should reject request missing required fields with 422"
+    );
+}
+
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": {
+                "message": "Internal server error: database connection failed at 10.0.0.5:5432",
+                "type": "internal_error",
+                "code": "database_error",
+                "details": {
+                    "host": "internal-db.example.com",
+                    "stack_trace": "Error at line 42 in auth.py"
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "untrusted-provider",
+            "url": mock_server.uri(),
+            "auto_sync_models": false
+        }))
+        .await;
+
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4-untrusted",
+            "hosted_on": endpoint_id,
+            "sanitize_responses": true,
+            "trusted": false
+        }))
+        .await;
+
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Error sanitization test"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4-untrusted"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Untrusted model should be available");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4-untrusted",
+            "messages": [{
+                "role": "user",
+                "content": "trigger error"
+            }]
+        }))
+        .await;
+
+    let status = response.status_code();
+    let body_text = response.text();
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
+
+    assert_eq!(status, 500, "Should receive 500 error from provider");
+
+    let error_str = body.to_string().to_lowercase();
+    assert!(!error_str.contains("database"), "Sanitized error should not contain 'database'");
+    assert!(!error_str.contains("10.0.0.5"), "Sanitized error should not contain internal IP");
+    assert!(
+        !error_str.contains("internal-db"),
+        "Sanitized error should not contain internal hostname"
+    );
+    assert!(!error_str.contains("stack_trace"), "Sanitized error should not contain stack trace");
+    assert!(!error_str.contains("auth.py"), "Sanitized error should not contain file paths");
+
+    assert!(body["error"].is_object(), "Should have error object");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    let error_response = serde_json::json!({
+        "error": {
+            "message": "Rate limit exceeded for organization org-123",
+            "type": "rate_limit_error",
+            "code": "rate_limit",
+            "param": "requests",
+            "details": {
+                "organization_id": "org-123",
+                "current_usage": 1000,
+                "limit": 1000
+            }
+        }
+    });
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(429).set_body_json(error_response.clone()))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.onwards = serde_json::from_value(serde_json::json!({
+        "strict_mode": true,
+        "upstream_rate_limit_message": "Please contact our team for dedicated capacity."
+    }))
+    .expect("Custom upstream rate-limit message should deserialize");
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "trusted-provider",
+            "url": mock_server.uri(),
+            "auto_sync_models": false
+        }))
+        .await;
+
+    let endpoint: serde_json::Value = endpoint_response.json();
+    let endpoint_id = endpoint["id"].as_str().unwrap();
+
+    let model_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "gpt-4-trusted",
+            "hosted_on": endpoint_id,
+            "trusted": true
+        }))
+        .await;
+
+    let model: serde_json::Value = model_response.json();
+    let deployment_id = model["id"].as_str().unwrap();
+
+    let group_id = "00000000-0000-0000-0000-000000000000";
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id
+        }))
+        .await;
+
+    let key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+        .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+        .add_header("x-doubleword-email", &user.email)
+        .json(&serde_json::json!({
+            "purpose": "realtime",
+            "name": "Trusted test key"
+        }))
+        .await;
+
+    let key_data: serde_json::Value = key_response.json();
+    let api_key = key_data["key"].as_str().unwrap();
+
+    bg_services.sync_onwards_config(&pool).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let mut model_available = false;
+    while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+        let check_response = server
+            .get("/ai/v1/models")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+
+        if check_response.status_code() == 200 {
+            let models: serde_json::Value = check_response.json();
+            if let Some(data) = models["data"].as_array() {
+                model_available = data.iter().any(|m| m["id"].as_str() == Some("gpt-4-trusted"));
+            }
+        }
+
+        if !model_available {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+        }
+    }
+    assert!(model_available, "Trusted model should be available");
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4-trusted",
+            "messages": [{
+                "role": "user",
+                "content": "test trusted provider"
+            }]
+        }))
+        .await;
+
+    let body_text = response.text();
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
+
+    assert_eq!(response.status_code(), 429, "Should preserve the upstream rate limit");
+    assert_eq!(body["error"]["message"], "Please contact our team for dedicated capacity.");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "upstream_rate_limit");
+    assert!(body["error"].get("details").is_none(), "Provider details should remain private");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
+    let test_cases = vec![
+        (
+            "malformed_json",
+            400,
+            "not valid json {{{",
+            "Should handle malformed JSON from provider",
+        ),
+        (
+            "invalid_api_key",
+            401,
+            r#"{"error": {"message": "Invalid API key", "type": "invalid_request_error"}}"#,
+            "Should handle authentication errors",
+        ),
+        (
+            "model_not_found",
+            404,
+            r#"{"error": {"message": "Model not found", "type": "invalid_request_error"}}"#,
+            "Should handle model not found",
+        ),
+        (
+            "timeout",
+            504,
+            r#"{"error": {"message": "Gateway timeout", "type": "timeout"}}"#,
+            "Should handle timeouts",
+        ),
+    ];
+
+    for (test_name, status_code, response_body, description) in test_cases {
+        let mock_server = wiremock::MockServer::start().await;
+
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/models"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "object": "list"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(status_code).set_body_string(response_body.to_string()))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = create_test_config();
+        config.onwards.strict_mode = true;
+        config.background_services.onwards_sync.enabled = true;
+
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+            .await
+            .expect("Failed to create application");
+        let (server, bg_services) = app.into_test_server();
+
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin_user);
+
+        let endpoint_response = server
+            .post("/admin/api/v1/endpoints")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "name": format!("test-{}", test_name),
+                "url": mock_server.uri(),
+                "sync": false
+            }))
+            .await;
+
+        assert_eq!(
+            endpoint_response.status_code(),
+            201,
+            "{}: Endpoint creation returned unexpected status {}",
+            description,
+            endpoint_response.status_code()
+        );
+
+        let endpoint: serde_json::Value = endpoint_response.json();
+        let endpoint_id = endpoint["id"].as_str().unwrap();
+
+        let model_response = server
+            .post("/admin/api/v1/models")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "type": "standard",
+                "model_name": "gpt-4",
+                "alias": format!("gpt-4-{}", test_name),
+                "hosted_on": endpoint_id,
+                "sanitize_responses": true
+            }))
+            .await;
+
+        let model: serde_json::Value = model_response.json();
+        let deployment_id = model["id"].as_str().unwrap();
+
+        let group_id = "00000000-0000-0000-0000-000000000000";
+
+        server
+            .post(&format!("/admin/api/v1/groups/{}/models/{}", group_id, deployment_id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        server
+            .post("/admin/api/v1/transactions")
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&serde_json::json!({
+                "user_id": user.id,
+                "transaction_type": "admin_grant",
+                "amount": 1000,
+                "source_id": admin_user.id
+            }))
+            .await;
+
+        let key_response = server
+            .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))
+            .add_header("x-doubleword-user", user.external_user_id.as_deref().unwrap())
+            .add_header("x-doubleword-email", &user.email)
+            .json(&serde_json::json!({
+                "purpose": "realtime",
+                "name": format!("Test key {}", test_name)
+            }))
+            .await;
+
+        let key_data: serde_json::Value = key_response.json();
+        let api_key = key_data["key"].as_str().unwrap();
+
+        bg_services.sync_onwards_config(&pool).await.unwrap();
+
+        let start = std::time::Instant::now();
+        let mut model_available = false;
+        while !model_available && start.elapsed() < std::time::Duration::from_secs(3) {
+            let check_response = server
+                .get("/ai/v1/models")
+                .add_header("Authorization", &format!("Bearer {}", api_key))
+                .await;
+
+            if check_response.status_code() == 200 {
+                let models: serde_json::Value = check_response.json();
+                if let Some(data) = models["data"].as_array() {
+                    model_available = data.iter().any(|m| m["id"].as_str() == Some(&format!("gpt-4-{}", test_name)));
+                }
+            }
+
+            if !model_available {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        }
+        assert!(model_available, "Model should be available for test: {}", test_name);
+
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .add_header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": format!("gpt-4-{}", test_name),
+                "messages": [{
+                    "role": "user",
+                    "content": "test error handling"
+                }]
+            }))
+            .await;
+
+        let response_status = response.status_code();
+        assert!(
+            response_status.as_u16() >= 400,
+            "{}: Should receive error status code. Got {}",
+            description,
+            response_status
+        );
+    }
+}

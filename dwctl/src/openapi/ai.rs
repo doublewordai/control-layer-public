@@ -1,0 +1,324 @@
+
+use utoipa::{
+    Modify, OpenApi,
+    openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
+};
+
+use super::extra_types;
+use crate::api;
+
+struct AiSecurityAddon;
+
+impl Modify for AiSecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.security_schemes.insert(
+                "BearerAuth".to_string(),
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("API Key")
+                        .description(Some(
+                            "API key authentication. Include your key in the `Authorization` header:\n\n\
+                            ```\nAuthorization: Bearer YOUR_API_KEY\n```\n\n\
+                            API keys can be created and managed in the dashboard.",
+                        ))
+                        .build(),
+                ),
+            );
+        }
+    }
+}
+
+
+#[utoipa::path(
+    post,
+    path = "/chat/completions",
+    tag = "chat",
+    summary = "Create chat completion",
+    description = "Creates a model response for the given chat conversation.
+
+The conversation is provided as an array of messages, where each message has a `role` (system, user, assistant, or tool) and `content`.
+
+Set `stream: true` to receive partial responses as server-sent events.",
+    request_body = extra_types::ChatCompletionRequest,
+    responses(
+        (status = 200, description = "Chat completion generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ChatCompletionResponse),
+        (status = 400, description = "Invalid request — check that your messages array is properly formatted and all required fields are present.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn chat_completions() {}
+
+#[utoipa::path(
+    post,
+    path = "/embeddings",
+    tag = "embeddings",
+    summary = "Create embeddings",
+    description = "Creates embedding vectors representing the input text.
+
+Input can be a single string or an array of strings. Each input produces one embedding vector in the response.",
+    request_body = extra_types::EmbeddingRequest,
+    responses(
+        (status = 200, description = "Embeddings generated successfully. Each input string has a corresponding entry in the `data` array.", body = extra_types::EmbeddingResponse),
+        (status = 400, description = "Invalid request — check that your input is a string or array of strings.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn embeddings() {}
+
+#[utoipa::path(
+    get,
+    path = "/models",
+    tag = "models",
+    summary = "List models",
+    description = "Lists the models available to your API key.
+
+The response includes model IDs that can be used in chat completion and embedding requests.
+
+By default, this endpoint follows the OpenAI-compatible models-list shape. Doubleword also supports optional query-string extensions for model discovery: `group` filters to comma-separated group UUIDs, `available_for_realtime` filters by whether realtime traffic is allowed for the model, and `include_reasoning_capabilities=true` adds the reasoning efforts supported by every provider behind each model.
+
+Use `include=pricing` with an inference key to add `tariffs` and `cache_pricing` to each model. Tariffs contain decimal-string input and output prices per token, the API key purpose (realtime, batch, or playground), and the batch completion window where applicable. Prices reflect the key's billing account, including organization-specific prices with general prices as fallback. Only active customer prices are returned, excluding denied purposes and disabled batch windows. Cache pricing contains multipliers relative to input-token prices and reports `enabled: false` when unavailable. Provider costs, other accounts' prices, and serving-class details are never returned.",
+    params(
+        ("include" = Option<String>, Query, description = "Doubleword extension. Comma-separated additions to the response. 'pricing' adds active customer tariffs and effective prompt-cache pricing for the inference key's billing account. Omitted by default; unknown values are ignored."),
+        ("group" = Option<String>, Query, description = "Doubleword extension. Filter to models in one or more groups (comma-separated UUIDs). This is intersected with the API key's normal model access."),
+        ("available_for_realtime" = Option<bool>, Query, description = "Doubleword extension. true returns models without a realtime deny rule; false returns models with one."),
+        ("include_reasoning_capabilities" = Option<bool>, Query, description = "Doubleword extension, disabled by default. true adds supported_reasoning_efforts when reasoning support is known for every provider behind a model."),
+    ),
+    responses(
+        (status = 200, description = "List of models your API key can access.", body = extra_types::ModelsListResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn list_models() {}
+
+#[utoipa::path(
+    get,
+    path = "/models/{model}",
+    tag = "models",
+    summary = "Retrieve model",
+    description = "Retrieves information about a specific model.",
+    params(
+        ("model" = String, Path, description = "The model ID (e.g., `deepseek-ai/DeepSeek-V4-Pro`, `Qwen/Qwen3-Embedding-8B`)")
+    ),
+    responses(
+        (status = 200, description = "Model details including ID, owner, and creation timestamp.", body = extra_types::ModelObject),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist or you don't have access to it.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn get_model() {}
+
+#[utoipa::path(
+    post,
+    path = "/responses",
+    tag = "responses-api",
+    summary = "Create response",
+    description = "Creates a model response for the given input.
+
+This endpoint implements the Open Responses compatible API, providing enhanced capabilities including:
+
+- **Reasoning models** with controllable effort via `reasoning` parameter
+- **Stateful conversations** via `previous_response_id` for maintaining context across turns
+- **Flexible input** - accepts either a string or array of messages
+- **Text output configuration** via `text` parameter for structured outputs
+- **Context window management** via `truncation` parameter
+
+Set `stream: true` to receive partial responses as server-sent events.
+
+[Open Responses API Reference →](https://www.openresponses.org/reference)",
+    request_body = extra_types::ResponseRequest,
+    responses(
+        (status = 200, description = "Response generated successfully. When streaming, returns a series of SSE events.", body = extra_types::ResponseObject),
+        (status = 400, description = "Invalid request — check that your input is properly formatted and all required fields are present.", body = extra_types::OpenAIErrorResponse),
+        (status = 401, description = "Invalid or missing API key. Ensure your `Authorization` header is set to `Bearer YOUR_API_KEY`.", body = extra_types::OpenAIErrorResponse),
+        (status = 402, description = "Insufficient credits. Top up your account to continue making requests.", body = extra_types::OpenAIErrorResponse),
+        (status = 403, description = "Your API key does not have access to the requested model.", body = extra_types::OpenAIErrorResponse),
+        (status = 404, description = "The specified model does not exist. Use `GET /models` to list available models.", body = extra_types::OpenAIErrorResponse),
+        (status = 429, description = "Rate limit exceeded. Back off and retry after a short delay.", body = extra_types::OpenAIErrorResponse),
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.", body = extra_types::OpenAIErrorResponse),
+    ),
+    security(("BearerAuth" = []))
+)]
+#[allow(unused)]
+fn create_response() {}
+
+
+#[derive(OpenApi)]
+#[openapi(
+    servers(
+        (url = "/ai/v1", description = "AI API server (OpenAI-compatible)")
+    ),
+    modifiers(&AiSecurityAddon),
+    paths(
+        chat_completions,
+        embeddings,
+        list_models,
+        get_model,
+        create_response,
+        crate::inference::handler::delete_response,
+        api::handlers::files::upload_file,
+        api::handlers::files::list_files,
+        api::handlers::files::get_file,
+        api::handlers::files::get_file_content,
+        api::handlers::files::get_file_cost_estimate,
+        api::handlers::files::delete_file,
+        api::handlers::batches::create_batch,
+        api::handlers::batches::get_batch,
+        api::handlers::batches::get_batch_analytics,
+        api::handlers::batches::get_batch_results,
+        api::handlers::batches::cancel_batch,
+        api::handlers::batches::delete_batch,
+        api::handlers::batches::retry_failed_batch_requests,
+        api::handlers::batches::retry_specific_requests,
+        api::handlers::batches::list_batches,
+    ),
+    components(
+        schemas(
+            extra_types::ChatCompletionRequest,
+            extra_types::ChatCompletionResponse,
+            extra_types::ChatMessage,
+            extra_types::ChatChoice,
+            extra_types::ToolCall,
+            extra_types::FunctionCall,
+            extra_types::Tool,
+            extra_types::FunctionDefinition,
+            extra_types::Usage,
+            extra_types::EmbeddingRequest,
+            extra_types::EmbeddingResponse,
+            extra_types::EmbeddingInput,
+            extra_types::EmbeddingData,
+            extra_types::EmbeddingUsage,
+            extra_types::ModelsListResponse,
+            extra_types::ModelObject,
+            extra_types::OpenAIErrorResponse,
+            extra_types::OpenAIError,
+            extra_types::ResponseRequest,
+            extra_types::ResponseObject,
+            extra_types::ResponseInput,
+            extra_types::ResponseItem,
+            crate::inference::handler::ResponseDeleted,
+            crate::inference::handler::ResponseDeletedObjectType,
+            api::models::files::ListFilesQuery,
+            api::models::files::FileResponse,
+            api::models::files::FileDeleteResponse,
+            api::models::files::FileListResponse,
+            api::models::files::FileCostEstimate,
+            api::models::files::ModelCostBreakdown,
+            api::models::files::ObjectType,
+            api::models::files::Purpose,
+            api::models::files::ListObject,
+            api::models::batches::CreateBatchRequest,
+            api::models::batches::RetryRequestsRequest,
+            api::models::batches::BatchResponse,
+            api::models::batches::BatchAnalytics,
+            api::models::batches::BatchObjectType,
+            api::models::batches::RequestCounts,
+            api::models::batches::BatchListResponse,
+            api::models::batches::ListObjectType,
+            api::models::batches::ListBatchesQuery,
+            api::models::batches::BatchErrors,
+            api::models::batches::BatchError,
+        )
+    ),
+    tags(
+        (name = "files", description = "Upload and manage JSONL files for batch processing.
+
+Each line in the file should be a JSON object with:
+- `custom_id` — your identifier for tracking the request
+- `method` — HTTP method (POST)
+- `url` — endpoint path (e.g., `/v1/chat/completions`)
+- `body` — the request payload
+
+[Learn more about the JSONL file format →](https://docs.doubleword.ai/batches/jsonl-files)"),
+        (name = "batches", description = "Process large volumes of requests asynchronously.
+
+Batch processing is ideal when you:
+- Have many requests that don't need immediate responses
+- Want to process data in bulk (e.g., embeddings for a document corpus)
+- Are running offline evaluations or data pipelines
+
+Choose your completion window: 1 hour or 24 hours. You can track progress, cancel in-flight batches, and retry failed requests.
+
+[Getting started with the Batch API →](https://docs.doubleword.ai/batches/getting-started-with-batched-api)"),
+        (name = "chat", description = "Create model responses for chat conversations.
+
+Supports:
+- **Multi-turn dialogue** with conversation history
+- **System prompts** to control model behavior
+- **Tool calling** for function execution and structured outputs
+- **Streaming** for real-time token delivery
+- **Sampling parameters** like temperature, top_p, and frequency penalties"),
+        (name = "embeddings", description = "Generate vector representations of text.
+
+Use embeddings for:
+- **Semantic search** — find content by meaning, not just keywords
+- **Clustering** — group similar documents together
+- **Classification** — categorize text based on similarity to examples
+- **Recommendations** — suggest related content"),
+        (name = "models", description = "List and retrieve information about available models.
+
+Use these endpoints to discover which models you have access to and their capabilities."),
+        (name = "responses-api", description = "Create model responses with enhanced capabilities.
+
+Open Responses compatible endpoint providing advanced features:
+
+- **Reasoning models** — Control computational effort with `reasoning` parameter
+- **Stateful conversations** — Maintain context across turns with `previous_response_id`
+- **Flexible input** — Use simple strings or full message arrays
+- **Text output configuration** — Structured outputs via `text` parameter
+- **Context management** — Handle overflow with `truncation` parameter
+
+[Open Responses API Reference →](https://www.openresponses.org/reference)"),
+    ),
+    info(
+        title = "AI API",
+        version = "1.0.0",
+        description = "OpenAI-compatible API for chat completions, embeddings, and batch processing.
+
+## Authentication
+
+All endpoints require an API key passed in the `Authorization` header:
+
+```
+Authorization: Bearer YOUR_API_KEY
+```
+
+## Errors
+
+Errors follow the OpenAI format with `error.message`, `error.type`, and `error.code` fields:
+
+```json
+{
+  \"error\": {
+    \"message\": \"Invalid API key. API keys are region-bound: if you expected this key to work, check that your base URL matches the region the key was created in. See https://docs.doubleword.ai/inference-api/regional-endpoints\",
+    \"type\": \"authentication_error\",
+    \"code\": \"invalid_api_key\"
+  }
+}
+```
+
+## Streaming
+
+Chat completions support streaming responses via `\"stream\": true`. Responses are sent as server-sent events (SSE) with `data:` prefixed JSON chunks.",
+    ),
+)]
+pub struct AiApiDoc;

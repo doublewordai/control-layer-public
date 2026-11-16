@@ -1,0 +1,907 @@
+# Configuration Reference
+
+> Reference guide for configuring the Control Layer using YAML and environment variables.
+
+The Control Layer uses a YAML configuration file with environment variable overrides for all settings.
+
+## Configuration File Location
+
+The configuration file is named `config.yaml` by default. The system checks:
+
+1. Path specified via `--config` CLI flag
+2. Path in `DWCTL_CONFIG` environment variable
+3. `./config.yaml` in the current directory
+
+For Docker deployments, mount your config at `/app/config.yaml`.
+
+## Environment Variable Overrides
+
+Any setting can be overridden with environment variables prefixed with `DWCTL_`. Nested keys use double underscores:
+
+```bash
+DWCTL_PORT=8080
+DWCTL_AUTH__NATIVE__ENABLED=false
+DWCTL_DATABASE__POOL__MAX_CONNECTIONS=20
+```
+
+The special `DATABASE_URL` variable (no prefix) sets the database connection string.
+
+## Core Settings
+
+### Server
+
+```yaml
+host: "0.0.0.0"
+port: 3001
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `host` | string | `"0.0.0.0"` | Network interface to bind to. Use `127.0.0.1` for local-only access. |
+| `port` | integer | `3001` | TCP port for the HTTP server. |
+
+### Secret Key
+
+```yaml
+secret_key: "your-secret-key-here"
+```
+
+Required when native authentication is enabled. Used for JWT signing. Generate with:
+
+```bash
+openssl rand -base64 32
+```
+
+### Admin User
+
+```yaml
+admin_email: "admin@example.com"
+admin_password: "change-me-in-production"
+```
+
+Created on first startup if it doesn't exist. The admin user has the `PlatformManager` role.
+
+> **Danger**
+>
+> Change the default admin password immediately in production!
+
+### Model Provisioning
+
+```yaml
+model_provisioning:
+  enabled: true
+  directory: /app/model-provisioning.d
+  org_overlays_directory: /app/org-overlays.d
+  account_limits_directory: /app/account-limits.d
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
+| `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
+| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`targets`, which are scheduling hints and never change the class or price; `self_hosted_only`; prices). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
+| `account_limits_directory` | path | `/app/account-limits.d` | Directory containing one `.yaml` or `.yml` document per account with its own realtime in-flight limits, prices, scheduling priority and latency targets on virtual models. Applied after the model catalog and organisation overlays when `enabled` is set; limits replace every stored per-account limit, and the other settings are owned row by row. A missing directory changes nothing; an empty one clears what the files own. See [Account limits](./model-provisioning.md#account-limits). |
+
+When enabled, the directory must exist. Startup fails before any provisioning
+writes if loading, validation, or a referenced endpoint/group lookup fails.
+See [Model Provisioning](model-provisioning.md) for the document format and
+ownership rules.
+
+## Database Configuration
+
+The Control Layer requires PostgreSQL. Two modes are available:
+
+### External Database (Recommended)
+
+```yaml
+database:
+  type: external
+  url: "postgres://user:pass@localhost:5432/control_layer"
+  replica_url: "postgres://user:pass@replica:5432/control_layer"  # Optional
+  pool:
+    max_connections: 10
+    min_connections: 0
+    acquire_timeout_secs: 30
+    idle_timeout_secs: 600
+    max_lifetime_secs: 1800
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `url` | string | - | PostgreSQL connection URL. |
+| `replica_url` | string | - | Optional read replica URL. |
+| `pool.max_connections` | integer | `10` | Maximum connections in pool. |
+| `pool.min_connections` | integer | `0` | Minimum idle connections. |
+| `pool.acquire_timeout_secs` | integer | `30` | Max wait for a connection. |
+| `pool.idle_timeout_secs` | integer | `600` | Close idle connections after N seconds. |
+| `pool.max_lifetime_secs` | integer | `1800` | Maximum connection lifetime. |
+
+### Embedded Database
+
+For development or single-node deployments, use the embedded PostgreSQL database:
+
+```yaml
+database:
+  type: embedded
+  data_dir: ".dwctl_data/postgres"
+  persistent: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `data_dir` | string | - | Directory for database files. |
+| `persistent` | boolean | `false` | Persist data between restarts. |
+
+### Component Databases
+
+The batch processing system (Fusillade) and request logging (Outlet) can use separate databases or schemas:
+
+```yaml
+database:
+  # ... main database config ...
+  fusillade:
+    mode: schema      # Use schema in main database
+    name: "fusillade"
+    pool:
+      max_connections: 20
+      min_connections: 2
+  outlet:
+    mode: dedicated   # Use separate database
+    url: "postgres://user:pass@localhost:5432/outlet"
+    pool:
+      max_connections: 5
+```
+
+## Authentication Configuration
+
+At least one authentication method must be enabled.
+
+### Native Authentication
+
+Username/password authentication with session cookies:
+
+```yaml
+auth:
+  native:
+    enabled: true
+    allow_registration: false
+    password:
+      min_length: 8
+      max_length: 64
+      argon2_memory_kib: 19456
+      argon2_iterations: 2
+      argon2_parallelism: 1
+    session:
+      timeout: "24h"
+      cookie_name: "dwctl_session"
+      cookie_secure: true
+      cookie_same_site: "strict"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable native login. |
+| `allow_registration` | boolean | `false` | Allow self-registration. |
+| `password.min_length` | integer | `8` | Minimum password length. |
+| `password.max_length` | integer | `64` | Maximum password length. |
+| `password.argon2_*` | integer | - | Argon2 hashing parameters. Lower values speed up tests. |
+| `session.timeout` | duration | `"24h"` | Session expiration. |
+| `session.cookie_secure` | boolean | `true` | Require HTTPS for cookies. |
+| `session.cookie_same_site` | string | `"strict"` | SameSite attribute: `strict`, `lax`, or `none`. |
+
+### Email for Password Resets
+
+Configure email transport for password reset functionality:
+
+**File transport** (development):
+```yaml
+auth:
+  native:
+    email:
+      type: file
+      path: "./emails"
+      from_email: "noreply@example.com"
+      from_name: "Control Layer"
+      password_reset:
+        token_expiry: "30m"
+        base_url: "http://localhost:3001"
+```
+
+**SMTP transport** (production):
+```yaml
+auth:
+  native:
+    email:
+      type: smtp
+      host: "smtp.example.com"
+      port: 587
+      username: "noreply@example.com"
+      password: "smtp-password"
+      use_tls: true
+      from_email: "noreply@example.com"
+      from_name: "Control Layer"
+      password_reset:
+        token_expiry: "30m"
+        base_url: "https://app.example.com"
+```
+
+### Proxy Header Authentication
+
+For use with identity-aware proxies (SSO):
+
+```yaml
+auth:
+  proxy_header:
+    enabled: false
+    header_name: "x-doubleword-user"
+    email_header_name: "x-doubleword-email"
+    groups_field_name: "x-doubleword-user-groups"
+    provider_field_name: "x-doubleword-sso-provider"
+    auto_create_users: true
+    import_idp_groups: false
+    blacklisted_sso_groups:
+      - "external-contractors"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable proxy header auth. |
+| `header_name` | string | `"x-doubleword-user"` | Header with unique user ID. |
+| `email_header_name` | string | `"x-doubleword-email"` | Header with user email. |
+| `groups_field_name` | string | `"x-doubleword-user-groups"` | Header with comma-separated groups. |
+| `auto_create_users` | boolean | `true` | Create users automatically. |
+| `import_idp_groups` | boolean | `false` | Sync groups from IdP. |
+| `blacklisted_sso_groups` | list | `[]` | Groups to exclude from import. |
+
+### Default User Roles
+
+Roles assigned to new users (admin excluded):
+
+```yaml
+auth:
+  default_user_roles:
+    - StandardUser
+    - BatchAPIUser
+    - BackgroundInferenceUser
+```
+
+Available roles:
+- `StandardUser` - Base access (always included, cannot be removed)
+- `RequestViewer` - Read-only access to request logs
+- `BillingManager` - Credit and billing management
+- `BatchAPIUser` - Batch file and job management
+- `BackgroundInferenceUser` - Spare-capacity background inference submission
+
+### Security Settings
+
+```yaml
+auth:
+  security:
+    jwt_expiry: "24h"
+    cors:
+      allowed_origins:
+        - "https://app.example.com"
+      allow_credentials: true
+      max_age: 3600
+      exposed_headers:
+        - "location"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `jwt_expiry` | duration | `"24h"` | JWT token lifetime. Must be 5min-30days. |
+| `cors.allowed_origins` | list | `["http://localhost:3001"]` | Allowed CORS origins. Use `"*"` for any. |
+| `cors.allow_credentials` | boolean | `true` | Allow credentials. Cannot use with wildcard origin. |
+| `cors.max_age` | integer | `3600` | Preflight cache duration (seconds). |
+
+> **Warning**
+>
+> In production, ensure your frontend URL is listed in `allowed_origins`.
+
+## Credits & Payments
+
+### Initial Credits
+
+```yaml
+credits:
+  initial_credits_for_standard_users: 10.00
+```
+
+Credits given to new users on creation. Set to `0` to disable.
+
+### Payment Provider
+
+**Stripe** (production):
+```yaml
+payment:
+  stripe:
+    api_key: "sk_live_..."
+    webhook_secret: "whsec_..."
+    price_id: "price_..."
+    host_url: "https://app.example.com"
+    enable_invoice_creation: false
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `api_key` | string | Stripe secret key (starts with `sk_`). |
+| `webhook_secret` | string | Webhook signing secret (starts with `whsec_`). |
+| `price_id` | string | Stripe price ID for credit purchases (starts with `price_`). |
+| `host_url` | string | Base URL for success/cancel redirects. |
+| `enable_invoice_creation` | boolean | Create invoices for sessions. |
+
+**Dummy provider** (testing):
+```yaml
+payment:
+  dummy:
+    amount: 50.00
+    host_url: "http://localhost:3001"
+```
+
+Adds a fixed amount without real payment processing.
+
+## Batches Configuration
+
+Configure the batch inference API:
+
+```yaml
+batches:
+  enabled: true
+  allowed_completion_windows:
+    - "24h"
+    - "1h"
+    - "48h"
+  files:
+    max_file_size: 104857600        # 100 MB
+    default_expiry_seconds: 2592000 # 30 days
+    min_expiry_seconds: 3600        # 1 hour
+    max_expiry_seconds: 2592000     # 30 days
+    upload_buffer_size: 100
+    download_buffer_size: 100
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable `/ai/v1/files` and `/ai/v1/batches` endpoints. |
+| `allowed_completion_windows` | list | `["24h"]` | SLA options users can select. |
+| `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. A gzip or zstd file is decoded as it uploads, and the limit applies to its decoded size; the compressed upload itself may not exceed the limit either. |
+| `files.default_expiry_seconds` | integer | `2592000` | Lifetime of file content. Sets `expires_at` on an upload that sends no `expires_after`, and on a batch's output and error files, counted from the batch's creation. |
+| `files.min_expiry_seconds` | integer | `3600` | Smallest `expires_after[seconds]` an upload may request. |
+| `files.max_expiry_seconds` | integer | `2592000` | Largest `expires_after[seconds]` an upload may request. |
+
+The expiry settings must be positive and ordered `min_expiry_seconds <= default_expiry_seconds <= max_expiry_seconds`. They are validated even when `enabled` is `false`, and a config that breaks these rules is refused at startup.
+
+`expires_at` decides when file content stops being available:
+
+- An upload whose `expires_after[seconds]` is not an integer between `min_expiry_seconds` and `max_expiry_seconds` is rejected with 400.
+- `GET /ai/v1/files/{file_id}/content` returns 410 once the file is past its `expires_at`. File metadata stays readable after expiry.
+- `GET /ai/v1/batches/{batch_id}/results` returns 410 once the batch's output or error file is past its `expires_at`.
+- Output and error files expire `default_expiry_seconds` after the batch is created. OpenAI counts from when the batch completes instead, so here they expire up to one completion window earlier. Output and error files created before they were given an expiry are treated as expiring `default_expiry_seconds` after their creation.
+
+Stored batch content is deleted in weekly partitions by two retirement switches under `background_services.batch_daemon`, both `false` by default: `template_retirement_enabled` deletes batch inputs (request templates) and `batch_archive_retirement_enabled` deletes archived batch results. An enabled family deletes a week no earlier than `max_expiry_seconds` (rounded up to whole days) after the end of the week the content was created in. While either switch is on, a batch retry is refused with 400 once the batch or its input file is older than that period minus one day. The former `background_services.batch_daemon.batch_archive_retention_days` and `background_services.batch_daemon.template_retention_days` keys are deprecated and ignored; remove them.
+
+## Background Services
+
+### Onwards Sync
+
+Synchronizes configuration to the AI proxy routing layer:
+
+```yaml
+background_services:
+  onwards_sync:
+    enabled: true
+```
+
+> **Note**
+>
+> Disable only if you're not using the AI proxy functionality.
+
+### Probe Scheduler
+
+Runs health checks against model endpoints:
+
+```yaml
+background_services:
+  probe_scheduler:
+    enabled: true
+```
+
+Only runs on the leader instance when leader election is enabled.
+
+### Batch SLA Metrics
+
+Optional aggregate-only batch monitoring on the internal metrics endpoint:
+
+```yaml
+background_services:
+  batch_sla_metrics:
+    enabled: false
+    sample_interval: 30s
+    query_timeout: 10s
+    excluded_standard_models: []
+```
+
+Requires `enable_metrics: true`. The sampling interval must be at least 5s;
+query timeout must be positive and shorter than the interval. One replica per
+Fusillade database/schema collects a snapshot. Consumers must check collector
+health and freshness before using counts. See [metric contract and rollout](batch-sla-metrics.md).
+
+### Batch Daemon
+
+Processes batch inference jobs:
+
+```yaml
+background_services:
+  batch_daemon:
+    enabled: "leader"              # "always", "leader", or "never"
+    claim_batch_size: 100
+    default_model_concurrency: 10
+    claim_interval_ms: 1000
+    max_retries: 1000
+    timeout_ms: 600000             # 10 minutes per request
+    backoff_ms: 1000
+    backoff_factor: 2
+    max_backoff_ms: 10000
+    stop_before_deadline_ms: 900000  # 15 min safety buffer
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | string | `"leader"` | When to run: `always`, `leader`, or `never`. |
+| `claim_batch_size` | integer | `100` | Requests claimed per iteration. |
+| `default_model_concurrency` | integer | `10` | Concurrent requests per model. |
+| `max_retries` | integer | `1000` | Max retry attempts. `null` = unlimited until deadline. |
+| `timeout_ms` | integer | `600000` | Per-request timeout (10 min). |
+| `stop_before_deadline_ms` | integer | `900000` | Stop retrying before deadline (15 min buffer). |
+
+#### Model Escalation
+
+Route requests to fallback models when approaching SLA deadlines:
+
+```yaml
+background_services:
+  batch_daemon:
+    model_escalations:
+      "llama-3.1-70b":
+        escalation_model: "gpt-4o-mini"
+        escalation_api_key: "OPENAI_API_KEY"  # Environment variable name
+    sla_check_interval_seconds: 60
+    sla_thresholds:
+      - name: "warning"
+        threshold_seconds: 3600
+        action: "log"
+        allowed_states: ["pending"]
+      - name: "critical"
+        threshold_seconds: 900
+        action: "escalate"
+        allowed_states: ["pending", "claimed"]
+```
+
+### Task Retention
+
+Deletes expired Underway background tasks in bounded batches. Every task carries
+a `ttl` (14 days by default); nothing else removes finished tasks, so without this
+daemon the task table grows for the life of the installation and slows every
+task claim.
+
+```yaml
+background_services:
+  task_retention:
+    enabled: true
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 2000
+    min_age_days: 14
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the retention daemon. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
+| `min_age_days` | integer | `14` | Tasks younger than this are never considered. A task's own longer `ttl` is still honoured. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to
+one. Only `succeeded` and `failed` tasks are deleted; `pending` and `in_progress` tasks are preserved.
+Each batch has a 2-second lock timeout and a 30-second statement timeout.
+The daemon uses direct database connections for its session-level advisory lock. For a very large existing
+backlog, run `scripts/purge_underway_tasks.sh` once beforehand so the first
+sweeps stay short.
+
+### Prompt Cache Retention
+
+Deletes prompt-cache entries that expired more than a grace period ago, in bounded
+batches. Expired entries serve no request, but nothing else removes them, so without
+this daemon the prefix table keeps every prefix ever written.
+
+```yaml
+background_services:
+  prompt_cache_retention:
+    enabled: false
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 2000
+    grace_days: 7
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the retention daemon. Off by default so a deployment chooses when to start clearing an existing history. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
+| `grace_days` | integer | `7` | Days an entry is kept after it expires. Usage recompute re-derives a past request's cache split from the entries live at the time, so values below 7 are rejected. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to one.
+Entries are deleted oldest-expiry first; an entry that a request is refreshing or
+re-writing at that moment is skipped. Each batch has a 2-second lock timeout and a
+30-second statement timeout. At the default pace a sweep deletes at most about 1.8
+million entries an hour, so an installation with a long existing history clears it over
+several sweeps without a burst of write and vacuum load.
+
+### Leader Election
+
+For multi-instance deployments:
+
+```yaml
+background_services:
+  leader_election:
+    enabled: true
+```
+
+Uses PostgreSQL advisory locks. Only the leader runs probe scheduler and batch daemon (when set to `"leader"` mode).
+
+## Model Sources
+
+Seed model endpoints on first startup:
+
+```yaml
+model_sources:
+  - name: "openai"
+    url: "https://api.openai.com"
+    api_key: "sk-..."
+    sync_interval: "30s"
+    default_models:
+      - name: "gpt-4o"
+        add_to_everyone_group: true
+      - name: "gpt-4o-mini"
+        add_to_everyone_group: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | string | - | Identifier for the model source. |
+| `url` | string | - | Base URL of the OpenAI-compatible API. |
+| `api_key` | string | - | API key for authentication. |
+| `sync_interval` | duration | `"10s"` | How often to refresh model list. |
+| `default_models` | list | - | Models to auto-import on first run. |
+
+> **Note**
+>
+> Model sources are only seeded on first startup. After that, manage endpoints through the UI or API.
+
+## Metadata
+
+UI display settings:
+
+```yaml
+metadata:
+  region: "UK South"
+  organization: "ACME Corp"
+  title: "ACME AI Gateway"
+  docs_url: "https://docs.example.com"
+  docs_jsonl_url: "https://docs.example.com/jsonl"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `region` | string | - | Region displayed in UI header. |
+| `organization` | string | - | Organization name in UI header. |
+| `title` | string | - | Custom browser tab title. |
+| `docs_url` | string | `"https://doublewordai.github.io/control-layer/"` | Documentation link in header. |
+| `docs_jsonl_url` | string | - | JSONL docs link in batch upload modal. |
+
+## Realtime In-Flight Limits
+
+Each virtual model has a default number of realtime requests one account may
+have in flight on it (`realtime_inflight_limit`), and an
+[account limit file](./model-provisioning.md#account-limits) can give one
+account a different limit. Replicas share their counts through Redis:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.realtime_inflight.enforce` | `false` | Refuse requests over the limit. Off, every request is admitted, so defaults and account limits can be in place before the limit takes effect. |
+| `limits.realtime_inflight.redis_url` | unset | Redis holding the shared counts. Unset, or unreachable, each replica counts only its own requests. |
+
+`auth.rate_limits` is no longer used and is ignored if present.
+
+## Batch In-Flight Limits
+
+A virtual model's `batch_capacity` also caps how many **batch** requests may be
+in flight on it at once. Unlike the realtime limit, this is a single global
+count for the model, not a per-account one: batch traffic is dispatched by
+worker pods, so the cap has to hold across all of them. It reuses the same
+Redis as the realtime limit but has its own switch:
+
+```yaml
+limits:
+  realtime_inflight:
+    enforce: true
+    redis_url: rediss://:password@limits-redis.example:6379
+  batch_inflight:
+    enforce: true
+    default_capacity: 200
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `limits.batch_inflight.enforce` | `false` | Refuse batch requests that would exceed a virtual model's effective batch cap. Off, every batch request is admitted and no shared count is touched, so no cap applies however it was configured. |
+| `limits.batch_inflight.default_capacity` | `200` | Global batch cap for a virtual model that does not set its own positive `batch_capacity`. Set to `0` (or `null`) for no default. Must not be negative. |
+
+A virtual model's effective cap is its own `batch_capacity` when that is
+positive, otherwise `limits.batch_inflight.default_capacity`. This default only
+feeds the onwards cap: it does **not** change fusillade's per-daemon *starting*
+concurrency, which keeps using
+`background_services.batch_daemon.default_model_concurrency` for models without
+an explicit `batch_capacity`. Because an enforced default caps **every** virtual
+model that has not set its own value, raise `default_capacity` (or set it per
+model) wherever batch runs higher than 200, or the first requests past the
+default will be refused.
+
+### Why realtime and batch differ
+
+Realtime has per-account limits and no per-model cap: when a model is full,
+the downstream answers `529`, and realtime traffic may grow into whatever
+capacity exists (the per-account limit keeps one tenant from consuming it
+all). Batch instead has a per-model cap, because batch must never crowd out
+realtime and can always be processed later — a refused batch request is
+rescheduled, not lost.
+
+### `batch_capacity` means two things
+
+The same `settings.batch_capacity` value now has two roles:
+
+- fusillade's **starting** per-daemon concurrency for the model, which
+  adaptive concurrency may grow beyond, and
+- the **global** onwards cap on batch requests in flight on the alias, once
+  `limits.batch_inflight.enforce` is on.
+
+Enabling enforcement therefore turns `batch_capacity` from a per-pod starting
+point into a global ceiling. Raise the value to the intended global cap
+**before** turning enforcement on, or the first batch requests will be refused
+against the old, smaller starting point.
+
+The cap is shared by every kind of dispatched request: file batches, flex
+requests and background requests all count against the same per-model ceiling.
+
+### Behaviour over the cap
+
+The Redis connection is shared with `limits.realtime_inflight.redis_url`;
+reachability and per-replica fallback behave the same way. The two limits are
+independent and use separate key spaces, so realtime `realtime_inflight_limit`
+and batch `batch_capacity` can be enforced in any combination. A batch request
+over the cap is refused with `529` and code `batch_capacity_exceeded` (never
+`429`), naming the model and its cap, so the batch dispatcher backs off without
+spending a retry attempt and reschedules the request later.
+
+## Account Scheduling: Tolerations and Provider Fallback
+
+Two account settings influence scheduling, and they are deliberately separate.
+
+**Scheduling-toleration presets** (`scheduling.toleration_presets`) let an
+operator pin an account to a named list of Kubernetes-style tolerations that is
+written to every inference request from that account at
+`nvext.routing_constraints.tolerations`, for realtime, flex and batch traffic
+alike. A backend that honours tolerations uses them to decide which capacity may
+serve the request. The wording is backend-agnostic. Pinning restricts where an
+account's requests can be placed, and can make scheduling harder for accounts
+sharing the same capacity, depending on how the backend treats tolerations; pin
+as few accounts as possible and only when a customer requires it.
+
+```yaml
+scheduling:
+  toleration_presets:
+    # An empty list asks the backend to keep the account off any tainted
+    # capacity (e.g. overflow capacity).
+    - id: "no-overflow"
+      label: "No overflow capacity"
+      description: >-
+        Never placed on capacity the backend marks with any taint, such as
+        overflow capacity; requests may be refused when dedicated capacity is
+        full.
+      tolerations: []
+    - id: "gpu-only"
+      label: "GPU only"
+      description: "Only serve this account on GPU capacity."
+      tolerations:
+        - key: "pool"
+          operator: Equal
+          value: "gpu"
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Stable slug stored on the account (`users.toleration_preset`). Must be unique and non-empty; leading/trailing whitespace is rejected. |
+| `label` | string | Short human label for the dashboard control. Must be non-empty. |
+| `description` | string | One or two sentences of help text shown as the dashboard tooltip. Must be non-empty. |
+| `tolerations` | list | The request-field list (`{key, operator?, value?, effect?}`). `operator` defaults to `Equal` and then requires `value`; `Exists` forbids `value`; `effect` may be `NoSchedule` or `PreferNoSchedule`. May be empty; validated at config load. |
+
+An [account file](./model-provisioning.md#account-limits) can also set a
+preset for one model, or one class of a model, in place of the account's own
+preset for those requests. The more specific setting wins: class, then model,
+then the account.
+
+The `GET /admin/api/v1/config` endpoint exposes the presets (id, label,
+description) so the dashboard can render the control. An account stores only the
+preset's id; an id the config no longer defines is logged and the request path
+**fails closed** by applying the empty (most restrictive) list. A preset id that
+is not configured is rejected with a 400 on write. This setting is independent
+of `self_hosted_only`: it says nothing about which provider is chosen, only
+where the chosen backend may place an accepted request.
+
+**`self_hosted_only`** (per account: `users.self_hosted_only`,
+`organizations.self_hosted_only`) is the gateway's provider-fallback control.
+When on, onwards restricts the account's requests to the composite's
+self-hosted members — providers whose endpoint kind (`inference_endpoints.kind`)
+is not `external` — so a third-party provider is never eligible regardless of
+the attempt budget. It does not influence where the inference backend places an
+accepted request; that is the tolerations setting. The API field keeps its name;
+the dashboard labels it "No external-provider fallback (gateway)".
+
+## Observability
+
+### Metrics
+
+```yaml
+enable_metrics: true
+```
+
+Exposes Prometheus metrics at `/internal/metrics`.
+
+`dwctl_model_batch_inflight_limit` reports each virtual model's **effective**
+global batch cap: its own positive `batch_capacity`, or the configured
+`limits.batch_inflight.default_capacity` when it has none. It reports even when
+`limits.batch_inflight.enforce` is off, and a model with no effective cap (the
+default turned off and no own value) reports `0`, so a zero does not by itself
+mean the cap is enforced — check the config switch.
+
+### Request Logging
+
+```yaml
+enable_request_logging: true
+```
+
+Logs all AI proxy requests and responses to PostgreSQL. Disable if you have sensitive data.
+
+### OpenTelemetry
+
+```yaml
+enable_otel_export: false
+```
+
+Exports traces via OTLP. Configure the exporter endpoint with standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
+
+Logs and traces are filtered separately. `RUST_LOG` controls the log output.
+`OTEL_TRACES_FILTER` (a dwctl variable, not an OpenTelemetry standard one)
+uses the same directive syntax and controls what the exporter sends; it
+defaults to `info`, which exports the request, routing and provider spans and
+their info-and-above events but not repository spans or debug lines. `RUST_LOG`
+applies first, so the exporter never sees more than the logs do. For example,
+`RUST_LOG=debug` with the default exporter filter gives verbose logs and
+compact traces; `OTEL_TRACES_FILTER=debug,sqlx=warn` additionally exports
+repository spans without sqlx's per-query statement events.
+
+Exported spans omit the source location (`code.*`), thread and
+`busy_ns`/`idle_ns` attributes.
+
+When request analytics and tracing are enabled, the pair `http_analytics.trace_id`
+and `gateway_span_id` identifies the gateway span for a captured request. Follow
+its descendant `onwards.provider_attempt` spans to the downstream serving spans.
+The gateway span's `doubleword.request_id` attribute holds the logical request
+UUID for reverse lookup in request records.
+
+#### Customer attributes on spans
+
+Spans carry the account, model and error class so alerts and dashboards can be
+built from traces. Attribute names are a contract. `gen_ai.*`, `http.*` and
+`error.type` follow OpenTelemetry semantic conventions; the rest, including
+`doubleword.*`, `onwards.*`, `batch.*` and the unprefixed batch attributes,
+are our own.
+
+| Span | Attributes |
+|---|---|
+| `request` (root, AI requests) | `doubleword.account_id`, `doubleword.account_name`, `doubleword.api_key_id`, `doubleword.key_purpose`, `gen_ai.request.model`, `doubleword.traffic` (`batch` for a batch key, otherwise `realtime`), `doubleword.batch.completion_window` (batch only), `http.response.status_code`, and for 4xx/5xx `error.type`, plus `doubleword.error.source` (`gateway` or `provider`) and `doubleword.rejection.code` (gateway errors) when onwards or a dwctl inference layer produced or relayed the error |
+| `onwards.request` | `onwards.account`, `onwards.account_name`, `onwards.api_key_id`, `onwards.key_purpose`, `gen_ai.request.model`, `http.response.status_code`, and for gateway rejections `error.type` (the rejection code), `onwards.rejection.param` (when the error names one) and `onwards.rejection.reason` (for `schema_mismatch`). Strict mode refuses body errors before this span exists, so their attributes are on the enclosing gateway request span |
+| `fusillade.process_request` | `doubleword.account_id`, `completion_window`, `custom_id` (first 128 characters), `model`, `outcome` |
+| `fusillade.batch_finalized` | `batch_id`, `doubleword.account_id`, `doubleword.account_name`, `gen_ai.request.model` (every model the batch used, joined with `, `, for display), `batch.models` (the same models as a string array, for filtering), `completion_window`, `batch.total_requests`, `batch.completed_requests`, `batch.failed_requests`, `batch.canceled_requests`, `batch.outcome` (`completed`, `partially_completed` or `failed`), `batch.sample_error` (failed batches: `http_<status>`, the failure type such as `timeout`, `canceled` when every request was cancelled, or `unknown` when the failure cannot be classified), `batch.finalized_at` (when the batch finished) |
+
+The account, key and traffic attributes are recorded once the key is
+recognised, whether the request succeeds or onwards, a dwctl inference layer or
+the provider refuses it, so a request with an unknown key has none. On request
+spans, `gen_ai.request.model` is only ever a configured model alias, never
+arbitrary client input. `doubleword.account_name` is the account's display
+name, falling back to its username when it has none or it is blank, and cut to
+128 characters.
+`fusillade.batch_finalized` is a root span emitted once per batch by the batch
+notification poller when it claims the finished batch, so it appears whether
+or not email or webhooks are configured, as long as the poller runs. The span
+starts when the batch is claimed; `batch.finalized_at` records when the batch
+itself finished. Batches cancelled as a whole are not claimed and emit no span.
+Cancelled requests count against the outcome like failed ones: a batch none of
+whose requests completed is `failed`. Filter on one model with
+`{ span.batch.models = "<alias>" }`, which matches any element of the array.
+
+Trace context must be propagated on every required forwarding hop. Propagation
+does not itself enable span export: correlation also depends on the connecting
+spans being sampled, exported, and retained. Stored IDs can therefore refer to
+unavailable spans, and older analytics records may have no gateway span ID.
+
+### Log Format
+
+```yaml
+log_format: compact
+```
+
+`compact` writes human-readable text for each event; a multi-line message or
+error spans several lines. `json` writes one JSON object per event, for log
+aggregators: `timestamp`, `level`, `message` and `target`, the event's own
+fields at the top level, the innermost span under `span` and every enclosing
+span, root first, under `spans`. A multi-line error stays on one line. In
+`json` mode panics are written to stderr in the same shape, with `target` set
+to `panic` and a message that starts like Rust's default panic output
+(`thread '…' panicked at …`). They include the spans the panic happened in
+when there are any; a panic outside every span, or inside the logging
+subscriber itself, has none. The
+error `dwctl` exits with, including a configuration that fails to load, is
+logged once as `dwctl exited with an error`.
+
+Every JSON line logged while handling a request carries `x_request_id` at the
+top level: the ID dwctl mints, returns in the `X-Request-ID` header and
+forwards to providers. Other IDs are added at the top level once they are
+known: `edge_request_id` when the request arrived with its own
+`X-Request-ID` (for example from an ingress), `trace_id` when the request
+has a trace context, and `provider_request_id` on lines logged after the
+provider's response returned its own `X-Request-ID`. Analytics logs written
+after the response carry `x_request_id` too. Find every line of a request, in dwctl and in any
+provider that logs `x_request_id` the same way, with one query:
+
+```logql
+{namespace=~"<namespaces>"} |= "<id>" | json | x_request_id="<id>"
+```
+
+Queries and alerts that match text in compact lines need updating when you
+switch, since the same event reads differently in each format.
+
+## Sample Files
+
+Generate sample JSONL files for new users:
+
+```yaml
+sample_files:
+  enabled: true
+  requests_per_file: 2000
+```
+
+## Validation
+
+The system validates configuration on startup and fails if:
+
+- Native auth is enabled but `secret_key` is missing
+- No authentication method is enabled
+- `jwt_expiry` is outside 5min-30day range
+- CORS uses wildcard origin with credentials enabled
+- Database URL is invalid or unreachable
+
+Run validation without starting the server:
+
+```bash
+dwctl --config config.yaml --validate
+```

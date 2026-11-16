@@ -1,0 +1,155 @@
+use uuid::Uuid;
+
+use super::*;
+use crate::crypto::{api_key_prefix, hash_api_key};
+use crate::db::handlers::api_keys::ApiKeys;
+
+const BEFORE_BACKFILL: i64 = 20261029120030;
+const BACKFILL_VALIDATED: i64 = 20261029130020;
+
+#[sqlx::test(migrations = false)]
+async fn backfill_hashes_existing_keys_like_hash_api_key(pool: PgPool) {
+    let target = Target::main();
+    target.run_to(BEFORE_BACKFILL, &pool).await.unwrap();
+
+    let user: Uuid = sqlx::query_scalar("INSERT INTO users (username,email) VALUES ('hash-test','hash-test@example.invalid') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let unicode_secret = "sk-ünïcödé-ключ-🔑";
+    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('unicode', $1, $2, $2, 'realtime')")
+        .bind(unicode_secret)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (name, secret, user_id, created_by, purpose)
+         SELECT 'bulk-' || n, 'sk-bulk-' || n || '-' || md5(n::text), $1, $1, 'realtime'
+         FROM generate_series(1, 12001) AS n",
+    )
+    .bind(user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (name, secret, secret_hash, secret_prefix, user_id, created_by, purpose)
+         VALUES ('already-hashed', 'sk-already-hashed', $1, 'keep-me!', $2, $2, 'realtime')",
+    )
+    .bind(&hash_api_key("sk-already-hashed")[..])
+    .bind(user)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    target.run_to(BACKFILL_VALIDATED, &pool).await.unwrap();
+
+    let rows: Vec<(Uuid, String, Option<Vec<u8>>, Option<String>)> =
+        sqlx::query_as("SELECT id, secret, secret_hash, secret_prefix FROM api_keys")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 12004, "system key + unicode + bulk + already hashed");
+    assert!(rows.iter().any(|(id, ..)| id.is_nil()), "the seeded system key is included");
+    for (id, secret, hash, prefix) in &rows {
+        assert_eq!(
+            hash.as_deref(),
+            Some(&hash_api_key(secret)[..]),
+            "{id}: SQL hash differs from hash_api_key"
+        );
+        let expected_prefix = if secret == "sk-already-hashed" {
+            "keep-me!".to_string()
+        } else {
+            api_key_prefix(secret)
+        };
+        assert_eq!(prefix.as_deref(), Some(expected_prefix.as_str()), "{id}");
+    }
+
+    let mut conn = pool.acquire().await.unwrap();
+    let mut keys = ApiKeys::new(&mut conn);
+    assert_eq!(keys.get_user_id_by_secret(unicode_secret).await.unwrap(), Some(user));
+    assert_eq!(
+        keys.get_user_id_by_secret("sk-bulk-7-8f14e45fceea167a5a36dedd4bea2543")
+            .await
+            .unwrap(),
+        Some(user)
+    );
+    let info = keys.get_user_info_by_hash(&hash_api_key(unicode_secret)).await.unwrap().unwrap();
+    assert_eq!(info.0, user);
+    assert_eq!(keys.get_user_id_by_secret("sk-not-a-key").await.unwrap(), None);
+    drop(conn);
+
+    let validated: bool = sqlx::query_scalar("SELECT convalidated FROM pg_constraint WHERE conname = 'api_keys_secret_hash_not_null'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(validated);
+    let error = sqlx::query(
+        "INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('no-hash', 'sk-no-hash', $1, $1, 'realtime')",
+    )
+    .bind(user)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23514"));
+
+    apply(&target, &pool).await.unwrap();
+    let plaintext_columns: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'api_keys' AND column_name = 'secret'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(plaintext_columns, 0);
+    let error = sqlx::query("INSERT INTO api_keys (name, user_id, created_by, purpose) VALUES ('no-hash', $1, $1, 'realtime')")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23502"));
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(
+        ApiKeys::new(&mut conn).get_user_id_by_secret(unicode_secret).await.unwrap(),
+        Some(user)
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn api_keys_notify_fires_on_secret_hash_not_metadata(pool: PgPool) {
+    let key: Uuid = sqlx::query_scalar(
+        "INSERT INTO api_keys (name, secret_hash, secret_prefix, user_id, created_by, purpose)
+         VALUES ('notify', sha256('sk-notify'::bytea), 'sk-notif', $1, $1, 'realtime') RETURNING id",
+    )
+    .bind(Uuid::nil())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+    let mut next_payload = async || {
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+            .await
+            .expect("notification")
+            .unwrap()
+            .payload()
+            .to_string()
+    };
+
+    sqlx::query("UPDATE api_keys SET description = 'metadata only' WHERE id = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_notify('auth_config_changed', 'marker')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_keys SET secret_hash = sha256('sk-rotated'::bytea) WHERE id = $1")
+        .bind(key)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(next_payload().await, "marker", "a metadata-only update must not notify");
+    assert!(next_payload().await.starts_with("api_keys:"), "a hash change notifies");
+}

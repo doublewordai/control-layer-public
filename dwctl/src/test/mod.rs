@@ -1,0 +1,2731 @@
+pub mod ai_models;
+pub mod anthropic;
+pub mod api_key_hash_auth;
+pub mod api_key_last_used;
+pub mod batch_trace_attributes;
+pub mod cache_classifier;
+pub mod databases;
+pub mod internal_credential;
+pub mod modalities;
+pub mod nvext_billing;
+pub mod rejections;
+pub mod request_log_credentials;
+pub mod responses;
+pub mod serving_classes;
+pub mod sigterm_drain;
+pub mod sla;
+pub mod strict_mode;
+pub mod template;
+pub mod toleration_presets;
+pub mod utils;
+pub mod zdr_sentinel;
+
+use crate::tasks::TaskState;
+use crate::{AppState, create_initial_admin_user};
+use crate::{
+    api::models::{groups::GroupResponse, users::Role},
+    auth::password,
+    db::handlers::Users,
+    openapi::{AdminApiDoc, AiApiDoc},
+    request_logging::{AiRequest, AiResponse},
+};
+use axum_test::TestServer;
+use outlet_postgres::RequestFilter;
+use sqlx::PgPool;
+use sqlx_pool_router::{DbPools, PoolProvider};
+use tracing::info;
+use utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use uuid::Uuid;
+use wiremock::matchers::{body_partial_json, method, path};
+
+struct StreamingFixture {
+    server: TestServer,
+    bg_services: crate::BackgroundServices,
+    admin_headers: Vec<(String, String)>,
+    regular_user_id: Uuid,
+    api_key: String,
+    group_id: Uuid,
+}
+
+async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+    config.enable_request_logging = true;
+    config.onwards.strict_mode = true;
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("test-group-{}", Uuid::new_v4()),
+            "description": "Test group for streaming E2E"
+        }))
+        .await;
+    assert_eq!(group_response.status_code(), 201, "Failed to create group");
+    let group: GroupResponse = group_response.json();
+
+    let add_user_response = server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+
+    let credits_response = server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": regular_user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id,
+            "description": "Test credits for streaming E2E"
+        }))
+        .await;
+    assert_eq!(credits_response.status_code(), 201, "Failed to grant credits");
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("Mock Endpoint {}", alias),
+            "url": mock_endpoint_url,
+            "description": "Mock OpenAI-compatible endpoint for streaming E2E"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let deployment_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": model_name,
+            "alias": alias,
+            "description": "Test model deployment",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "batch",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.003",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await;
+    assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
+    let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+    let add_deployment_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Inference Key",
+            "description": "API key for streaming E2E",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    bg_services.sync_onwards_config(pool).await.expect("Failed to sync onwards config");
+    wait_for_model(&server, &api_key.key, alias).await;
+
+    StreamingFixture {
+        server,
+        bg_services,
+        admin_headers,
+        regular_user_id: regular_user.id,
+        api_key: api_key.key,
+        group_id: group.id,
+    }
+}
+
+async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
+    let poll_start = std::time::Instant::now();
+    let mut status = 404;
+    let mut attempts = 0;
+
+    for i in 0..50 {
+        attempts = i + 1;
+        let test_response = server
+            .get("/ai/v1/models")
+            .add_header("authorization", format!("Bearer {}", api_key))
+            .await;
+
+        status = test_response.status_code().as_u16();
+        if status == 200 {
+            let models: serde_json::Value = test_response.json();
+            if let Some(data) = models["data"].as_array()
+                && data.iter().any(|m| m["id"].as_str() == Some(alias))
+            {
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    println!(
+        "Polled for {:?} over {} attempts, final status: {}",
+        poll_start.elapsed(),
+        attempts,
+        status
+    );
+    assert_eq!(status, 200, "Model should be available in onwards config after polling");
+}
+
+async fn create_standard_model_for_test(
+    server: &TestServer,
+    admin_headers: &[(String, String)],
+    endpoint_id: Uuid,
+    alias: &str,
+    traffic_routing_rules: Option<serde_json::Value>,
+) -> crate::api::models::deployments::DeployedModelResponse {
+    let mut body = serde_json::json!({
+        "type": "standard",
+        "model_name": alias,
+        "alias": alias,
+        "hosted_on": endpoint_id
+    });
+
+    if let Some(traffic_routing_rules) = traffic_routing_rules {
+        body["traffic_routing_rules"] = traffic_routing_rules;
+    }
+
+    let response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&body)
+        .await;
+    assert_eq!(response.status_code(), 200, "Failed to create model: {body}");
+    response.json()
+}
+
+#[dwctl_test_macros::test]
+async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("zero-balance-models-{}", Uuid::new_v4()),
+            "description": "Models list access for zero-balance users"
+        }))
+        .await;
+    assert_eq!(group_response.status_code(), 201, "Failed to create group");
+    let group: GroupResponse = group_response.json();
+
+    let add_user_response = server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("Zero Balance Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for zero-balance model list test"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let alias = format!("paid-model-visible-{}", Uuid::new_v4());
+    let deployment_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "paid-model",
+            "alias": alias.clone(),
+            "description": "Paid model visible with zero credits",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "realtime",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.001",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await;
+    assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
+    let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+    let add_deployment_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Zero Balance Realtime Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let models_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(models_response.status_code(), 200);
+    let models: serde_json::Value = models_response.json();
+    assert!(
+        models["data"]
+            .as_array()
+            .is_some_and(|data| data.iter().any(|model| model["id"].as_str() == Some(alias.as_str()))),
+        "Models list should include group-accessible paid models even without credits: {models}"
+    );
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    let completion_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .json(&serde_json::json!({
+            "model": alias.clone(),
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .await;
+    let status = completion_response.status_code().as_u16();
+    assert!(
+        status == 404 || status == 402,
+        "Zero-credit key must not dispatch (got {status}): {}",
+        completion_response.text()
+    );
+}
+
+#[dwctl_test_macros::test]
+async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_one_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-one-{}", Uuid::new_v4()),
+            "description": "First AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_one_response.status_code(), 201, "Failed to create first group");
+    let group_one: GroupResponse = group_one_response.json();
+
+    let group_two_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-two-{}", Uuid::new_v4()),
+            "description": "Second AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_two_response.status_code(), 201, "Failed to create second group");
+    let group_two: GroupResponse = group_two_response.json();
+
+    for group_id in [group_one.id, group_two.id] {
+        let add_user_response = server
+            .post(&format!("/admin/api/v1/groups/{}/users/{}", group_id, regular_user.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+    }
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("AI Model Filters Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for AI model filter tests",
+            "reasoning_translation": {
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }]
+                }
+            }
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let allowed_alias = format!("ai-filter-allowed-{}", Uuid::new_v4());
+    let denied_alias = format!("ai-filter-denied-{}", Uuid::new_v4());
+    let redirected_alias = format!("ai-filter-redirected-{}", Uuid::new_v4());
+    let redirect_target_alias = format!("ai-filter-target-{}", Uuid::new_v4());
+    let other_group_alias = format!("ai-filter-other-{}", Uuid::new_v4());
+
+    create_standard_model_for_test(&server, &admin_headers, endpoint.id, &redirect_target_alias, None).await;
+    let allowed_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &allowed_alias, None).await;
+    let denied_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &denied_alias,
+        Some(serde_json::json!([{ "api_key_purpose": "realtime", "action": { "type": "deny" } }])),
+    )
+    .await;
+    let redirected_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &redirected_alias,
+        Some(serde_json::json!([{
+            "api_key_purpose": "realtime",
+            "action": { "type": "redirect", "target": redirect_target_alias }
+        }])),
+    )
+    .await;
+    let other_group_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &other_group_alias, None).await;
+
+    for deployment_id in [allowed_model.id, denied_model.id, redirected_model.id] {
+        let add_model_response = server
+            .post(&format!("/admin/api/v1/groups/{}/models/{}", group_one.id, deployment_id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_model_response.status_code(), 204, "Failed to add model to first group");
+    }
+
+    let add_other_model_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_two.id, other_group_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_other_model_response.status_code(), 204, "Failed to add model to second group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "AI Models Filter Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let extract_ids = |models: serde_json::Value| -> Vec<String> {
+        models["data"]
+            .as_array()
+            .expect("models response data should be an array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id should be a string").to_string())
+            .collect()
+    };
+
+    let default_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(default_response.status_code(), 200);
+    let default_models: serde_json::Value = default_response.json();
+    assert!(
+        default_models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model.get("supported_reasoning_efforts").is_none()),
+        "default model objects must retain the OpenAI schema: {default_models}"
+    );
+    let default_ids = extract_ids(default_models);
+    assert!(default_ids.contains(&allowed_alias));
+    assert!(default_ids.contains(&denied_alias));
+    assert!(default_ids.contains(&redirected_alias));
+    assert!(default_ids.contains(&other_group_alias));
+
+    let group_response = server
+        .get(&format!("/ai/v1/models?group={}", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(group_response.status_code(), 200);
+    let group_ids = extract_ids(group_response.json());
+    assert!(group_ids.contains(&allowed_alias));
+    assert!(group_ids.contains(&denied_alias));
+    assert!(group_ids.contains(&redirected_alias));
+    assert!(!group_ids.contains(&other_group_alias));
+
+    let realtime_response = server
+        .get(&format!("/ai/v1/models?group={}&available_for_realtime=true", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(realtime_response.status_code(), 200);
+    let realtime_ids = extract_ids(realtime_response.json());
+    assert!(realtime_ids.contains(&allowed_alias));
+    assert!(realtime_ids.contains(&redirected_alias));
+    assert!(!realtime_ids.contains(&denied_alias));
+    assert!(!realtime_ids.contains(&other_group_alias));
+
+    let capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=true")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(capabilities_response.status_code(), 200);
+    let capabilities: serde_json::Value = capabilities_response.json();
+    let allowed = capabilities["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == allowed_alias)
+        .unwrap();
+    assert_eq!(
+        allowed["supported_reasoning_efforts"]["chat_completions"],
+        serde_json::json!(["none", "low", "medium", "high"])
+    );
+    assert!(allowed["supported_reasoning_efforts"].get("responses").is_none());
+
+    let invalid_capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=sometimes")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(invalid_capabilities_response.status_code(), 400);
+}
+
+#[dwctl_test_macros::test]
+async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .await;
+    assert_eq!(response.status_code(), 401);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["message"], crate::errors::INVALID_API_KEY_MESSAGE);
+
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+}
+
+async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
+    let mut tries = 0;
+    let (usage_tx, balance) = loop {
+        let transactions_response = fixture
+            .server
+            .get(&format!("/admin/api/v1/transactions?user_id={}", fixture.regular_user_id))
+            .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+            .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
+            .await;
+
+        assert_eq!(transactions_response.status_code(), 200, "Should fetch transactions");
+        let transactions: serde_json::Value = transactions_response.json();
+        info!("Received {:?}", serde_json::to_string(&transactions));
+
+        let usage_tx = transactions["data"]
+            .as_array()
+            .and_then(|x| x.iter().find(|tx| tx["transaction_type"] == "usage"));
+
+        if let Some(tx) = usage_tx {
+            let page_start_balance: f64 = transactions["page_start_balance"].as_str().unwrap().parse().unwrap();
+            break (tx.clone(), page_start_balance);
+        }
+
+        tries += 1;
+        if tries >= 100 {
+            panic!("Usage transaction not found after {} attempts", tries);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(usage_tx["transaction_type"], "usage", "Should be usage transaction");
+    let amount: f64 = usage_tx["amount"].as_str().unwrap().parse().unwrap();
+    assert!(amount > 0.0, "Usage amount should be positive (absolute value), got: {}", amount);
+    assert!(
+        balance < 1000.0,
+        "Balance should be less than initial 1000 due to credit deduction, got: {}",
+        balance
+    );
+
+    let requests_response = fixture
+        .server
+        .get(&format!("/admin/api/v1/requests?user_id={}&limit=1", fixture.regular_user_id))
+        .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+        .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
+        .await;
+
+    assert_eq!(requests_response.status_code(), 200, "Should fetch logged requests");
+    let requests: serde_json::Value = requests_response.json();
+    let logged_entry = &requests["entries"][0];
+
+    assert_eq!(logged_entry["method"], "POST");
+    assert_eq!(logged_entry["uri"], expected_uri);
+    assert_eq!(logged_entry["status_code"], 200);
+    assert_eq!(logged_entry["prompt_tokens"], prompt_tokens);
+    assert_eq!(logged_entry["completion_tokens"], completion_tokens);
+    assert_eq!(logged_entry["total_tokens"], prompt_tokens + completion_tokens);
+}
+
+async fn cleanup_fixture(fixture: StreamingFixture) {
+    let delete_group_response = fixture
+        .server
+        .delete(&format!("/admin/api/v1/groups/{}", fixture.group_id))
+        .add_header(&fixture.admin_headers[0].0, &fixture.admin_headers[0].1)
+        .add_header(&fixture.admin_headers[1].0, &fixture.admin_headers[1].1)
+        .await;
+    assert_eq!(delete_group_response.status_code(), 204, "Should delete test group");
+    fixture.bg_services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_usage_and_ids(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = concat!(
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-upstream\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    for stream_options in [None, Some(false), Some(true)] {
+        let mut body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        });
+        if let Some(include_usage) = stream_options {
+            body["stream_options"] = serde_json::json!({ "include_usage": include_usage });
+        }
+        let response = fixture
+            .server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", fixture.api_key))
+            .json(&body)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200, "{stream_options:?}");
+
+        let text = response.text();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{stream_options:?}: {text}");
+        let chunks: Vec<serde_json::Value> = text
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+
+        let id = chunks[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("resp_"), "{stream_options:?}: {id}");
+        assert!(chunks.iter().all(|chunk| chunk["id"] == id), "{stream_options:?}: {text}");
+
+        if stream_options == Some(true) {
+            assert_eq!(chunks.len(), 3, "{text}");
+            assert!(
+                chunks[..2].iter().all(|chunk| chunk.get("usage") == Some(&serde_json::Value::Null)),
+                "{text}"
+            );
+            assert_eq!(chunks[2]["choices"], serde_json::json!([]));
+            assert_eq!(chunks[2]["usage"]["total_tokens"], 21);
+        } else {
+            assert_eq!(chunks.len(), 2, "{stream_options:?}: {text}");
+            assert!(
+                chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+                "{stream_options:?}: {text}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| chunk["choices"][0].is_object()),
+                "{stream_options:?}: {text}"
+            );
+        }
+
+        if stream_options.is_none() {
+            assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+        }
+    }
+
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello! How can I help you today?\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("cache-control", "no-cache")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    let request_id = uuid::Uuid::new_v4();
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", request_id.to_string())
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}]
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
+    assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\"Hello world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("cache-control", "no-cache")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
+
+    let request_id = uuid::Uuid::new_v4();
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", request_id.to_string())
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "prompt": "Hello from E2E test"
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(
+        assembled["id"],
+        format!("resp_{request_id}"),
+        "the batch result carries the request's id"
+    );
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
+    assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
+    cleanup_fixture(fixture).await;
+}
+
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_traffic_routing_rules(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-routing-test",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-3.5-turbo",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Routed successfully"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group: GroupResponse = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "routing-test-group",
+            "description": "Group for traffic routing test"
+        }))
+        .await
+        .json();
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": regular_user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id,
+            "description": "Credits for routing test"
+        }))
+        .await;
+
+    let mock_endpoint_url = format!("{}/v1", mock_server.uri());
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Routing Test Endpoint",
+            "url": mock_endpoint_url,
+        }))
+        .await
+        .json();
+
+    let source_model: crate::api::models::deployments::DeployedModelResponse = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "traffic-src-model",
+            "alias": "traffic-src",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "default",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.003",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await
+        .json();
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    let realtime_key: crate::api::models::api_keys::ApiKeyResponse = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Realtime Key",
+            "purpose": "realtime"
+        }))
+        .await
+        .json();
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    let chat_body = serde_json::json!({
+        "model": "traffic-src",
+        "messages": [{"role": "user", "content": "test"}]
+    });
+
+    let mut baseline_status = 0u16;
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", realtime_key.key))
+            .json(&chat_body)
+            .await;
+        baseline_status = resp.status_code().as_u16();
+        if baseline_status == 200 {
+            break;
+        }
+        assert!(
+            matches!(baseline_status, 403 | 404),
+            "Unexpected baseline status while waiting for routing config: {baseline_status}"
+        );
+        assert!(i < 49, "Model never became available after polling, last status: {baseline_status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(baseline_status, 200, "Baseline request should succeed");
+
+
+    let hidden_key_id = sqlx::query_scalar!(
+        "SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true",
+        regular_user.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Batch hidden key should exist");
+    let batch_key_secret = crate::test::utils::bearer_for_key(&pool, hidden_key_id).await;
+
+    let patch_resp = server
+        .patch(&format!("/admin/api/v1/models/{}", source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "traffic_routing_rules": [
+                { "api_key_purpose": "batch", "action": { "type": "deny" } }
+            ]
+        }))
+        .await;
+    assert_eq!(patch_resp.status_code(), 200, "Should update model with deny rule");
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut deny_status = 0u16;
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", batch_key_secret))
+            .json(&chat_body)
+            .await;
+        deny_status = resp.status_code().as_u16();
+        if deny_status == 403 {
+            break;
+        }
+        assert!(i < 49, "Deny rule never took effect, last status: {deny_status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(deny_status, 403, "Batch key should be denied");
+
+    let realtime_resp = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", realtime_key.key))
+        .json(&chat_body)
+        .await;
+    assert_eq!(
+        realtime_resp.status_code().as_u16(),
+        200,
+        "Realtime key should still work despite batch deny rule"
+    );
+
+
+    let target_model: crate::api::models::deployments::DeployedModelResponse = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "traffic-redirect-target-model",
+            "alias": "traffic-redirect-target",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "default",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.003",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await
+        .json();
+
+    server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, target_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+
+    let hidden_key_id = sqlx::query_scalar!(
+        "SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'playground' AND hidden = true",
+        regular_user.id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("Playground hidden key should exist");
+    let playground_key_secret = crate::test::utils::bearer_for_key(&pool, hidden_key_id).await;
+
+    let patch_resp = server
+        .patch(&format!("/admin/api/v1/models/{}", source_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "traffic_routing_rules": [
+                { "api_key_purpose": "batch", "action": { "type": "deny" } },
+                { "api_key_purpose": "playground", "action": { "type": "redirect", "target": "traffic-redirect-target" } }
+            ]
+        }))
+        .await;
+    assert_eq!(patch_resp.status_code(), 200, "Should update model with redirect rule");
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    for i in 0..50 {
+        let resp = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", playground_key_secret))
+            .json(&chat_body)
+            .await;
+        let status = resp.status_code().as_u16();
+        if status == 200 {
+            break;
+        }
+        assert!(i < 49, "Redirect never took effect, last status: {status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let delete_resp = server
+        .delete(&format!("/admin/api/v1/groups/{}", group.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(delete_resp.status_code(), 204, "Should delete test group");
+
+    bg_services.shutdown().await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_database_seeding_behavior(pool: PgPool) {
+    use crate::config::ModelSource;
+    use crate::crypto::hash_api_key;
+    use url::Url;
+    use uuid::Uuid;
+
+    let sources = vec![
+        ModelSource {
+            name: "test-endpoint-1".to_string(),
+            url: Url::parse("http://localhost:8001").unwrap(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(10),
+            default_models: None,
+        },
+        ModelSource {
+            name: "test-endpoint-2".to_string(),
+            url: Url::parse("http://localhost:8002").unwrap(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(10),
+            default_models: None,
+        },
+    ];
+
+    let system_api_key_id = Uuid::nil();
+    let original_secret = "original_test_secret";
+    sqlx::query!(
+        "INSERT INTO api_keys (id, name, secret_hash, secret_prefix, purpose, user_id, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE SET secret_hash = $3, secret_prefix = $4",
+        system_api_key_id,
+        "System API Key",
+        &hash_api_key(original_secret)[..],
+        &original_secret[..8],
+        "batch",
+        system_api_key_id,
+        system_api_key_id,
+    )
+    .execute(&pool)
+    .await
+    .expect("Should be able to create system API key");
+
+    let initial_seeded = sqlx::query_scalar!("SELECT value FROM system_config WHERE key = 'endpoints_seeded'")
+        .fetch_optional(&pool)
+        .await
+        .expect("Should be able to query system_config");
+    assert_eq!(initial_seeded, Some(false), "Initial seeded flag should be false");
+
+    super::seed_database(&sources, &pool).await.expect("First seeding should succeed");
+
+    let endpoint_count =
+        sqlx::query_scalar!("SELECT COUNT(*) FROM inference_endpoints WHERE name IN ('test-endpoint-1', 'test-endpoint-2')")
+            .fetch_one(&pool)
+            .await
+            .expect("Should be able to count endpoints");
+    assert_eq!(endpoint_count, Some(2), "Should have created 2 endpoints");
+
+    let stored = sqlx::query!("SELECT secret_hash, secret_prefix FROM api_keys WHERE id = $1", system_api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to get API key hash");
+    let updated_hash = stored.secret_hash;
+    assert_ne!(
+        updated_hash,
+        hash_api_key(original_secret),
+        "API key secret should have been updated"
+    );
+    assert_eq!(updated_hash.len(), 32, "Seeded system key must store a SHA-256 hash");
+    assert!(stored.secret_prefix.is_some_and(|prefix| prefix.starts_with("sk-")));
+
+    let seeded_after_first = sqlx::query_scalar!("SELECT value FROM system_config WHERE key = 'endpoints_seeded'")
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to query seeded flag");
+    assert!(seeded_after_first, "Seeded flag should be true after first run");
+
+    sqlx::query!("UPDATE inference_endpoints SET url = 'http://modified-url:9999' WHERE name = 'test-endpoint-1'")
+        .execute(&pool)
+        .await
+        .expect("Should be able to update endpoint");
+
+    let manual_secret = "manually_set_secret";
+    sqlx::query!(
+        "UPDATE api_keys SET secret_hash = $1, secret_prefix = $2 WHERE id = $3",
+        &hash_api_key(manual_secret)[..],
+        &manual_secret[..8],
+        system_api_key_id
+    )
+    .execute(&pool)
+    .await
+    .expect("Should be able to update API key");
+
+    super::seed_database(&sources, &pool)
+        .await
+        .expect("Second seeding should succeed but skip");
+
+    let preserved_url = sqlx::query_scalar!("SELECT url FROM inference_endpoints WHERE name = 'test-endpoint-1'")
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to get endpoint URL");
+    assert_eq!(preserved_url, "http://modified-url:9999", "Manual URL change should be preserved");
+
+    let preserved_hash = sqlx::query_scalar!("SELECT secret_hash FROM api_keys WHERE id = $1", system_api_key_id)
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to get API key hash");
+    assert_eq!(
+        preserved_hash,
+        hash_api_key(manual_secret).to_vec(),
+        "Manual API key change should be preserved"
+    );
+
+    let final_count = sqlx::query_scalar!("SELECT COUNT(*) FROM inference_endpoints WHERE name IN ('test-endpoint-1', 'test-endpoint-2')")
+        .fetch_one(&pool)
+        .await
+        .expect("Should be able to count endpoints");
+    assert_eq!(final_count, Some(2), "Should still have 2 endpoints");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_request_logging_enabled(pool: PgPool) {
+    let mut config = crate::test::utils::create_test_config();
+    config.enable_request_logging = true;
+    config.background_services.leader_election.enabled = false;
+
+    let app = crate::Application::new_with_pool(config, Some(pool), None)
+        .await
+        .expect("Failed to create application");
+
+    let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
+
+    let (server, _drop_guard) = app.into_test_server();
+
+    let _ = server.get("/ai/v1/models").await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result = loop {
+        let result = repository
+            .query(RequestFilter {
+                method: Some("GET".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("Should be able to query requests");
+
+        if result.len() == 1 || tokio::time::Instant::now() >= deadline {
+            break result;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    assert_eq!(result.len(), 1, "Request should be logged after async write-through completes");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
+    use bytes::Bytes;
+    use outlet::{RequestData, RequestHandler, ResponseData};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    for migration in outlet_postgres::migrator().iter() {
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply outlet migration");
+    }
+
+    let handler = outlet_postgres::PostgresHandler::<sqlx::PgPool, serde_json::Value, serde_json::Value>::from_pool_provider(pool.clone())
+        .await
+        .expect("build PostgresHandler");
+    let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
+
+    fn request(correlation_id: u64, zdr: bool) -> RequestData {
+        let mut headers = HashMap::new();
+        if zdr {
+            headers.insert(crate::inference::zdr::ZDR_MARKER_HEADER.to_string(), vec![Bytes::from_static(b"1")]);
+        }
+        RequestData {
+            correlation_id,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/ai/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: Some(Bytes::from_static(br#"{"secret":"prompt"}"#)),
+            trace_id: None,
+            span_id: None,
+        }
+    }
+    fn response(correlation_id: u64) -> ResponseData {
+        ResponseData {
+            extensions: Default::default(),
+            correlation_id,
+            timestamp: SystemTime::now(),
+            status: axum::http::StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from_static(br#"{"secret":"reply"}"#)),
+            duration_to_first_byte: Duration::from_millis(1),
+            duration: Duration::from_millis(2),
+        }
+    }
+
+    handler.handle_request(request(1, true)).await;
+    handler.handle_response(request(1, true), response(1)).await;
+    handler.handle_request(request(2, false)).await;
+    handler.handle_response(request(2, false), response(2)).await;
+
+    let body_of = |table: &str, id: i64| {
+        let sql = format!("SELECT body FROM {table} WHERE correlation_id = $1");
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(&sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("query body")
+        }
+    };
+
+    assert!(body_of("http_requests", 1).await.is_none(), "ZDR request body must not be logged");
+    assert!(body_of("http_responses", 1).await.is_none(), "ZDR response body must not be logged");
+    assert!(body_of("http_requests", 2).await.is_some(), "non-ZDR request body should be logged");
+    assert!(
+        body_of("http_responses", 2).await.is_some(),
+        "non-ZDR response body should be logged"
+    );
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_request_logging_disabled(pool: PgPool) {
+    let mut config = crate::test::utils::create_test_config();
+    config.enable_request_logging = false;
+    config.enable_analytics = false;
+
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
+    let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
+        config: shared_config.clone(),
+        encryption_key: None,
+        ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(
+            pool.clone(),
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
+                response_writer_batch_size: 0,
+            },
+        )
+        .await
+        .expect("Failed to create task runner"),
+    );
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let mut app_state = AppState::builder()
+        .db(DbPools::new(pool.clone()))
+        .config(shared_config)
+        .request_manager(request_manager)
+        .task_runner(task_runner)
+        .limiters(limiters)
+        .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
+        .build();
+    let onwards_router = axum::Router::new();
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
+        .await
+        .expect("Failed to build router");
+
+    let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+    let response = server.get("/healthz").await;
+    assert_eq!(response.status_code().as_u16(), 200);
+    assert_eq!(response.text(), "OK");
+
+    tokio::task::yield_now().await;
+
+    let schema_exists =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'outlet'")
+            .fetch_one(&pool)
+            .await
+            .expect("Should be able to query information_schema");
+
+    if schema_exists.unwrap_or(0) == 0 {
+        return;
+    } else {
+        panic!("Outlet schema should not exist when request logging is disabled");
+    }
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_dedicated_databases_for_components(pool: PgPool) {
+    use crate::config::{ComponentDb, PoolSettings};
+    use crate::test::databases::TestDatabases;
+
+    let test_dbs = TestDatabases::new(&pool, "dedicated_components")
+        .await
+        .expect("Failed to create test databases");
+
+    let mut config = crate::test::utils::create_test_config();
+    config.enable_request_logging = true;
+    config.batches.enabled = true;
+    config.background_services.leader_election.enabled = false;
+
+    config.database = crate::config::DatabaseConfig::External {
+        pooled_url: None,
+        direct_pool: crate::config::default_direct_pool(),
+        url: "ignored".to_string(),
+        replica_url: None,
+        pool: PoolSettings::default(),
+        replica_pool: None,
+        fusillade: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
+            url: test_dbs.fusillade_url.clone(),
+            replica_url: None,
+            pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 0,
+                ..Default::default()
+            },
+            replica_pool: None,
+        },
+        outlet: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
+            url: test_dbs.outlet_url.clone(),
+            replica_url: None,
+            pool: PoolSettings {
+                max_connections: 4,
+                min_connections: 0,
+                ..Default::default()
+            },
+            replica_pool: None,
+        },
+        underway_pool: crate::config::default_underway_pool(),
+    };
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application with dedicated databases");
+
+    let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&test_dbs.fusillade_url)
+        .await
+        .expect("Should connect to fusillade database");
+    let fusillade_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+    )
+    .fetch_all(&fusillade_pool)
+    .await
+    .expect("Should list fusillade tables");
+    assert!(
+        fusillade_tables.iter().any(|(name,)| name == "batches"),
+        "Fusillade dedicated database should have batches table after migrations"
+    );
+
+    let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
+
+    let outlet_tables: Vec<(String,)> = sqlx::query_as(
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+    )
+    .fetch_all(outlet_pool.read())
+    .await
+    .expect("Should list outlet tables");
+    assert!(
+        outlet_tables.iter().any(|(name,)| name == "http_requests"),
+        "Outlet database should have http_requests table after migration"
+    );
+
+    let outlet_schema_in_main: Option<i64> =
+        sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'outlet'")
+            .fetch_one(&pool)
+            .await
+            .expect("Should query main db");
+    assert_eq!(
+        outlet_schema_in_main,
+        Some(0),
+        "Main database should not have outlet schema when using dedicated database"
+    );
+
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
+
+    let (server, bg_services) = app.into_test_server();
+
+    let _ = server.get("/ai/v1/models").await;
+
+    let result = {
+        let mut attempt = 0u32;
+        loop {
+            let rows = repository
+                .query(RequestFilter {
+                    method: Some("GET".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("Should be able to query requests from dedicated outlet db");
+            if !rows.is_empty() || attempt >= 50 {
+                break rows;
+            }
+            attempt += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    assert_eq!(result.len(), 1, "Request should be logged to dedicated outlet database");
+
+    use crate::api::models::users::Role;
+    use crate::test::utils::{
+        add_auth_headers, add_deployment_to_group, create_test_endpoint, create_test_model, create_test_user_with_roles,
+    };
+    use axum::http::StatusCode;
+    use axum_test::multipart::MultipartForm;
+
+    let batch_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+    let auth_headers = add_auth_headers(&batch_user);
+
+    let endpoint_id = create_test_endpoint(&pool, "test-endpoint", batch_user.id).await;
+    let deployment_id = create_test_model(&pool, "test-model", "test-model", endpoint_id, batch_user.id).await;
+    add_deployment_to_group(&pool, deployment_id, uuid::Uuid::nil(), batch_user.id).await;
+
+    let jsonl_content = r#"{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "test-model", "messages": [{"role": "user", "content": "Test"}]}}"#;
+    let multipart = MultipartForm::new().add_text("purpose", "batch").add_text("file", jsonl_content);
+
+    let file_response = server
+        .post("/ai/v1/files")
+        .add_header(&auth_headers[0].0, &auth_headers[0].1)
+        .add_header(&auth_headers[1].0, &auth_headers[1].1)
+        .multipart(multipart)
+        .await;
+    file_response.assert_status(StatusCode::CREATED);
+    let file: crate::api::models::files::FileResponse = file_response.json();
+
+    let create_batch_json = serde_json::json!({
+        "input_file_id": file.id,
+        "endpoint": "/v1/chat/completions",
+        "completion_window": "24h"
+    });
+    let batch_response = server
+        .post("/ai/v1/batches")
+        .add_header(&auth_headers[0].0, &auth_headers[0].1)
+        .add_header(&auth_headers[1].0, &auth_headers[1].1)
+        .json(&create_batch_json)
+        .await;
+    batch_response.assert_status(StatusCode::CREATED);
+    let batch: crate::api::models::batches::BatchResponse = batch_response.json();
+
+    let batch_count: Option<i64> = sqlx::query_scalar("SELECT COUNT(*) FROM batches WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&batch.id).unwrap())
+        .fetch_one(&fusillade_pool)
+        .await
+        .expect("Should query fusillade database");
+    assert_eq!(batch_count, Some(1), "Batch should be stored in dedicated fusillade database");
+
+    fusillade_pool.close().await;
+    bg_services.shutdown().await;
+    test_dbs.cleanup().await.expect("Failed to cleanup test databases");
+}
+
+#[dwctl_test_macros::test]
+async fn test_create_initial_admin_user_new_user(pool: PgPool) {
+    let test_email = "new-admin@example.com";
+
+    let mut user_conn = pool.acquire().await.unwrap();
+    let mut users_repo = Users::new(&mut user_conn);
+    let initial_user = users_repo.get_user_by_email(test_email).await;
+    assert!(initial_user.is_err() || initial_user.unwrap().is_none());
+
+    let user_id = create_initial_admin_user(
+        test_email,
+        None,
+        password::Argon2Params {
+            memory_kib: 128,
+            iterations: 1,
+            parallelism: 1,
+        },
+        &pool,
+    )
+    .await
+    .expect("Should create admin user successfully");
+
+    let created_user = users_repo
+        .get_user_by_email(test_email)
+        .await
+        .expect("Should be able to query user")
+        .expect("User should exist");
+
+    assert_eq!(created_user.id, user_id);
+    assert_eq!(created_user.email, test_email);
+    assert_eq!(created_user.username, test_email);
+    assert!(created_user.is_admin);
+    assert_eq!(created_user.auth_source, "system");
+    assert!(created_user.roles.contains(&Role::PlatformManager));
+}
+
+#[dwctl_test_macros::test]
+async fn test_create_initial_admin_user_existing_user(pool: PgPool) {
+    let test_email = "existing-admin@example.com";
+
+    let existing_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let existing_user_id = existing_user.id;
+
+    sqlx::query!("UPDATE users SET email = $1 WHERE id = $2", test_email, existing_user_id)
+        .execute(&pool)
+        .await
+        .expect("Should update user email");
+
+    let returned_user_id = create_initial_admin_user(
+        test_email,
+        None,
+        password::Argon2Params {
+            memory_kib: 128,
+            iterations: 1,
+            parallelism: 1,
+        },
+        &pool,
+    )
+    .await
+    .expect("Should handle existing user successfully");
+
+    assert_eq!(returned_user_id, existing_user_id);
+
+    let mut user_conn2 = pool.acquire().await.unwrap();
+    let mut users_repo = Users::new(&mut user_conn2);
+    let user = users_repo
+        .get_user_by_email(test_email)
+        .await
+        .expect("Should be able to query user")
+        .expect("User should still exist");
+
+    assert_eq!(user.id, existing_user_id);
+    assert!(user.is_admin);
+    assert!(user.roles.contains(&Role::PlatformManager));
+}
+
+#[tokio::test]
+async fn test_openapi_specs_serialize() {
+    use utoipa::OpenApi;
+
+    let admin_spec = serde_json::to_string(&AdminApiDoc::openapi()).expect("admin spec serializes");
+    assert!(admin_spec.contains("\"openapi\""));
+    assert!(admin_spec.contains("Admin API"));
+
+    let ai_spec = serde_json::to_string(&AiApiDoc::openapi()).expect("ai spec serializes");
+    assert!(ai_spec.contains("\"openapi\""));
+    assert!(ai_spec.contains("AI API"));
+    assert!(ai_spec.contains("/chat/completions"));
+    assert!(ai_spec.contains("/embeddings"));
+}
+
+#[test]
+fn ai_models_openapi_documents_reasoning_capabilities_query_parameter() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AiApiDoc::openapi()).expect("AI spec serializes");
+    let parameter = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "include_reasoning_capabilities")
+        })
+        .expect("GET /models should document include_reasoning_capabilities");
+
+    assert_eq!(parameter["in"], "query");
+    assert_eq!(parameter["schema"]["type"], "boolean");
+    assert!(
+        spec["components"]["schemas"]["ModelObject"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "ModelObject should document supported_reasoning_efforts"
+    );
+}
+
+#[test]
+fn admin_models_openapi_documents_reasoning_capabilities_include() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AdminApiDoc::openapi()).expect("admin spec serializes");
+    let include = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| parameters.iter().find(|parameter| parameter["name"] == "include"))
+        .expect("GET /models should document the include query parameter");
+    let description = include["description"].as_str().expect("include should have a description");
+
+    assert!(
+        description.contains("reasoning_capabilities"),
+        "include description should advertise reasoning_capabilities: {description}"
+    );
+    assert!(
+        spec["components"]["schemas"]["DeployedModelResponse"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "DeployedModelResponse should document supported_reasoning_efforts"
+    );
+}
+
+mod openapi_access_control {
+    use super::*;
+    use crate::{
+        api::models::api_keys::ApiKeyCreate,
+        db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        },
+    };
+
+    async fn make_app_with_admin_docs(pool: PgPool, admin_enabled: bool) -> (TestServer, crate::BackgroundServices) {
+        let mut config = crate::test::utils::create_test_config();
+        config.openapi.admin_enabled = admin_enabled;
+        config.openapi.ai_enabled = true;
+        crate::test::utils::create_test_app_with_config(pool, config, false).await
+    }
+
+    async fn create_api_key(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        repo.create(&ApiKeyCreateDBRequest::new(
+            user_id,
+            user_id,
+            ApiKeyCreate {
+                name: format!("{purpose:?} key"),
+                description: None,
+                purpose,
+                member_id: None,
+                spend_limit: None,
+                spend_limit_interval: None,
+            },
+        ))
+        .await
+        .expect("create api key")
+        .secret
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_returns_404_when_disabled(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 404);
+
+        let response = server
+            .get("/admin/docs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 404);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_rejects_unauthenticated(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        let response = server.get("/admin/openapi.json").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let response = server.get("/admin/docs").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_rejects_inference_api_key(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_api_key(&pool, user.id, ApiKeyPurpose::Realtime).await;
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header("authorization", format!("Bearer {key}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+
+        let response = server.get("/admin/docs").add_header("authorization", format!("Bearer {key}")).await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_rejects_standard_user_session(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_rejects_request_viewer(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 403);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_allows_platform_manager_session(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+
+        let response = server
+            .get("/admin/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body = response.text();
+        assert!(body.contains("Admin API"));
+
+        let response = server
+            .get("/admin/docs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn admin_spec_platform_keys_require_platform_manager_role(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        for legacy_admin in [false, true] {
+            for role in [Role::StandardUser, Role::PlatformManager] {
+                let user = if legacy_admin {
+                    create_test_admin_user(&pool, role.clone()).await
+                } else {
+                    crate::test::utils::create_test_user(&pool, role.clone()).await
+                };
+                let key = create_api_key(&pool, user.id, ApiKeyPurpose::Platform).await;
+                let response = server
+                    .get("/admin/openapi.json")
+                    .add_header("authorization", format!("Bearer {key}"))
+                    .await;
+                let expected = if role == Role::PlatformManager { 200 } else { 403 };
+                assert_eq!(response.status_code().as_u16(), expected, "{role:?}, legacy_admin={legacy_admin}");
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn ai_spec_rejects_unauthenticated(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+        let response = server.get("/ai/openapi.json").await;
+        assert_eq!(response.status_code().as_u16(), 401);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", "Bearer not-a-real-key")
+            .await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
+        );
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        let realtime = create_api_key(&pool, user.id, ApiKeyPurpose::Realtime).await;
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", format!("Bearer {realtime}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let platform = create_api_key(&pool, admin.id, ApiKeyPurpose::Platform).await;
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", format!("Bearer {platform}"))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+    }
+}
+
+#[dwctl_test_macros::test]
+async fn test_build_router_with_metrics_disabled(pool: PgPool) {
+    let mut config = create_test_config();
+    config.enable_metrics = false;
+    config.enable_analytics = false;
+
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
+    let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = crate::tasks::TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
+        config: shared_config.clone(),
+        encryption_key: None,
+        ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(
+            pool.clone(),
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
+                response_writer_batch_size: 0,
+            },
+        )
+        .await
+        .expect("Failed to create task runner"),
+    );
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let mut app_state = AppState::builder()
+        .db(DbPools::new(pool))
+        .config(shared_config)
+        .request_manager(request_manager)
+        .task_runner(task_runner)
+        .limiters(limiters)
+        .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
+        .build();
+
+    let onwards_router = axum::Router::new();
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
+        .await
+        .expect("Failed to build router");
+    let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+    let metrics_response = server.get("/internal/metrics").await;
+    let metrics_content = metrics_response.text();
+    assert!(!metrics_content.contains("# HELP") && !metrics_content.contains("# TYPE"));
+}
+
+#[dwctl_test_macros::test]
+async fn test_build_router_with_metrics_enabled(pool: PgPool) {
+    let mut config = create_test_config();
+    config.enable_metrics = true;
+    config.enable_analytics = false;
+
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+        DbPools::new(pool.clone()),
+        Default::default(),
+    ));
+    let limiters = crate::limits::Limiters::new(&config.limits);
+    let shared_config = crate::SharedConfig::new(config);
+    underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
+    let task_state = TaskState {
+        request_manager: request_manager.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
+        config: shared_config.clone(),
+        encryption_key: None,
+        ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let task_runner = std::sync::Arc::new(
+        crate::tasks::TaskRunner::new(
+            pool.clone(),
+            task_state,
+            &crate::config::TaskWorkersConfig {
+                create_batch_workers: 0,
+                cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
+                response_writer_batch_size: 0,
+            },
+        )
+        .await
+        .expect("Failed to create task runner"),
+    );
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let mut app_state = AppState::builder()
+        .db(DbPools::new(pool))
+        .config(shared_config)
+        .request_manager(request_manager)
+        .task_runner(task_runner)
+        .limiters(limiters)
+        .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .key_policy_cache(crate::sync::key_policy::KeyPolicyCache::empty())
+        .build();
+
+    let onwards_router = axum::Router::new();
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
+        .await
+        .expect("Failed to build router");
+    let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+
+    let metrics_response = server.get("/internal/metrics").await;
+    assert_eq!(metrics_response.status_code().as_u16(), 200);
+
+    let metrics_content = metrics_response.text();
+    assert!(!metrics_content.trim().is_empty());
+}
+
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_create_composite_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "test-composite",
+            "alias": "Test Composite Model",
+            "description": "A composite model for testing",
+            "lb_strategy": "weighted_random",
+            "fallback_enabled": true
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "Should create composite model");
+    let model: serde_json::Value = response.json();
+    assert_eq!(model["alias"], "Test Composite Model");
+    assert_eq!(model["is_composite"], true);
+    assert!(model["hosted_on"].is_null(), "Composite models should not have hosted_on");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_add_component_to_composite_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "alias": "GPT-4 Provider",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(component_response.status_code(), 200);
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt",
+            "alias": "Multi-Provider GPT"
+        }))
+        .await;
+    assert_eq!(composite_response.status_code(), 200);
+    let composite: serde_json::Value = composite_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50,
+            "enabled": true
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200, "Should add component");
+
+    let added: serde_json::Value = add_response.json();
+    assert_eq!(added["weight"], 50);
+    assert_eq!(added["enabled"], true);
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_cannot_add_composite_as_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let composite1_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "composite-1"
+        }))
+        .await;
+    assert_eq!(composite1_response.status_code(), 200);
+    let composite1: serde_json::Value = composite1_response.json();
+
+    let composite2_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "composite-2"
+        }))
+        .await;
+    assert_eq!(composite2_response.status_code(), 200);
+    let composite2: serde_json::Value = composite2_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite1["id"].as_str().unwrap(),
+            composite2["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Should not allow composite as component");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let model1_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "model-1",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(model1_response.status_code(), 200);
+    let model1: serde_json::Value = model1_response.json();
+
+    let model2_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "model-2",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    assert_eq!(model2_response.status_code(), 200);
+    let model2: serde_json::Value = model2_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            model1["id"].as_str().unwrap(),
+            model2["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(
+        add_response.status_code(),
+        400,
+        "Should not allow adding components to standard model"
+    );
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_update_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50,
+            "enabled": true
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200);
+
+    let update_response = server
+        .patch(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 75,
+            "enabled": false
+        }))
+        .await;
+    assert_eq!(update_response.status_code(), 200, "Should update component");
+
+    let updated: serde_json::Value = update_response.json();
+    assert_eq!(updated["weight"], 75);
+    assert_eq!(updated["enabled"], false);
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_remove_component(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 50
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200);
+
+    let remove_response = server
+        .delete(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(remove_response.status_code(), 200, "Should remove component");
+
+    let list_response = server
+        .get(&format!("/admin/api/v1/models/{}/components", composite["id"].as_str().unwrap()))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(list_response.status_code(), 200);
+    let components: Vec<serde_json::Value> = list_response.json();
+    assert!(components.is_empty(), "Component list should be empty after removal");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_component_weight_validation(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let component_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "gpt-4",
+            "hosted_on": endpoint["id"]
+        }))
+        .await;
+    let component: serde_json::Value = component_response.json();
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "multi-gpt"
+        }))
+        .await;
+    let composite: serde_json::Value = composite_response.json();
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 0
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Weight 0 should be rejected");
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 101
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 400, "Weight 101 should be rejected");
+
+    let add_response = server
+        .post(&format!(
+            "/admin/api/v1/models/{}/components/{}",
+            composite["id"].as_str().unwrap(),
+            component["id"].as_str().unwrap()
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "weight": 100
+        }))
+        .await;
+    assert_eq!(add_response.status_code(), 200, "Weight 100 should be accepted");
+}
+
+#[dwctl_test_macros::test]
+async fn test_read_pool_enforces_readonly(pool: PgPool) {
+    let db_pools = sqlx_pool_router::TestDbPools::new(pool).await.unwrap();
+
+    let result = sqlx::query("CREATE TEMPORARY TABLE test_readonly_violation (id INT)")
+        .execute(db_pools.read())
+        .await;
+
+    assert!(result.is_err(), "Write operation on read pool should fail with read-only error");
+
+    let error = result.unwrap_err();
+    let error_msg = error.to_string();
+    assert!(
+        error_msg.contains("read-only") || error_msg.contains("cannot execute"),
+        "Error should indicate read-only violation, got: {}",
+        error_msg
+    );
+
+    let result = sqlx::query("CREATE TEMPORARY TABLE test_write_ok (id INT)")
+        .execute(db_pools.write())
+        .await;
+
+    assert!(result.is_ok(), "Write operation on write pool should succeed");
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    let add = async |member: &str, body: serde_json::Value| {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{member}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+    };
+
+    let plain = add(&members[2], serde_json::json!({"weight": 50})).await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem = add(&members[0], serde_json::json!({"weight": 50})).await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
+    let on_prem_completions: serde_json::Value = on_prem_completions.json();
+    assert_eq!(on_prem_completions["pool"], "completions");
+    assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
+
+    let validated = add(&members[1], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(validated.status_code(), 200);
+    let validated_body: serde_json::Value = validated.json();
+    assert_eq!(validated_body["pool"], "completions");
+    assert_eq!(validated_body["sort_order"], 1);
+
+    let bogus = add(&members[1], serde_json::json!({"weight": 50, "pool": "chat"})).await;
+    assert!(
+        bogus.status_code().is_client_error(),
+        "unknown pool names must not reach the database: {}",
+        bogus.status_code()
+    );
+
+    let moved = server
+        .patch(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[1]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"sort_order": 0}))
+        .await;
+    assert_eq!(moved.status_code(), 200);
+    assert_eq!(moved.json::<serde_json::Value>()["sort_order"], 0);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let pools: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["pool"].as_str().unwrap()).collect();
+    assert_eq!(pools.iter().filter(|p| **p == "completions").count(), 2);
+    assert_eq!(pools.iter().filter(|p| **p == "default").count(), 2);
+
+    let removed = server
+        .delete(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[0]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(removed.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let remaining: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["pool"].as_str().unwrap()))
+        .collect();
+    assert!(
+        remaining.contains(&(members[0].as_str(), "default")),
+        "the default-pool membership survives: {remaining:?}"
+    );
+    assert!(!remaining.contains(&(members[0].as_str(), "completions")));
+}

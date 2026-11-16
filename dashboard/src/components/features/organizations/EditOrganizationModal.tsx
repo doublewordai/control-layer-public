@@ -1,0 +1,230 @@
+import { useState, useEffect } from "react";
+import { useUpdateOrganization, useOrganization, useConfig } from "@/api/control-layer/hooks";
+import type { Organization } from "@/api/control-layer/types";
+import { SchedulingTolerations } from "@/components/features/scheduling/SchedulingTolerations";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
+import { AlertBox } from "@/components/ui/alert-box";
+import { describeWaitingOn } from "./pendingEmailChange";
+import { toast } from "sonner";
+
+interface EditOrganizationModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  organization: Organization | null;
+  canEditZdr?: boolean;
+  supportOnly?: boolean;
+  canEditServing?: boolean;
+}
+
+export function EditOrganizationModal({
+  isOpen,
+  onClose,
+  organization,
+  canEditZdr = false,
+  supportOnly = false,
+  canEditServing = false,
+}: EditOrganizationModalProps) {
+  const [email, setEmail] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [zeroDataRetention, setZeroDataRetention] = useState(false);
+  const [selfHostedOnly, setSelfHostedOnly] = useState(false);
+  const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
+  const updateOrg = useUpdateOrganization();
+  const { data: config } = useConfig();
+  const { data: detail } = useOrganization(
+    organization?.id ?? "",
+    { enabled: isOpen && !!organization },
+  );
+
+  useEffect(() => {
+    if (isOpen && organization) {
+      setEmail(organization.email || "");
+      setDisplayName(organization.display_name || "");
+      setZeroDataRetention(organization.zero_data_retention ?? false);
+      setSelfHostedOnly(organization.self_hosted_only ?? false);
+      setTolerationPreset(organization.toleration_preset ?? null);
+    }
+  }, [organization, isOpen]);
+
+  useEffect(() => {
+    if (isOpen && detail) {
+      setTolerationPreset(detail.toleration_preset ?? null);
+    }
+  }, [detail, isOpen]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!organization) return;
+
+    const requestedEmail = email.trim();
+    const emailChangeRequested =
+      requestedEmail !== "" &&
+      requestedEmail.toLowerCase() !==
+        (organization.email ?? "").toLowerCase();
+
+    try {
+      const updated = await updateOrg.mutateAsync({
+        id: organization.id,
+        data: supportOnly ? { zero_data_retention: true } : {
+          display_name: displayName || undefined,
+          email: requestedEmail || undefined,
+          ...(canEditZdr
+            ? { zero_data_retention: zeroDataRetention }
+            : {}),
+          ...(canEditServing
+            ? {
+                self_hosted_only: selfHostedOnly,
+                toleration_preset: tolerationPreset,
+              }
+            : {}),
+        },
+      });
+      if (emailChangeRequested && updated.pending_email_change) {
+        const { new_email, expires_at } = updated.pending_email_change;
+        toast.info("Email change pending verification", {
+          description: `Confirmation links were sent to ${organization.email} and ${new_email}. The contact email will only update once both are confirmed (links expire ${new Date(expires_at).toLocaleString()}).`,
+          duration: 12000,
+        });
+      } else {
+        toast.success("Organization updated successfully");
+      }
+      onClose();
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : "Failed to update organization",
+      );
+    }
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      { }
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col gap-0 p-0 overflow-hidden">
+        <DialogHeader className="px-6 pt-6 pb-4 border-b">
+          <DialogTitle>Edit Organization</DialogTitle>
+          <DialogDescription>
+            Update organization details for {organization?.username}.
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          id="edit-organization-form"
+          onSubmit={handleSubmit}
+          className="flex-1 min-h-0 overflow-y-auto px-6 py-4"
+          data-testid="edit-organization-form-body"
+        >
+          <div className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-2 sm:items-start" hidden={supportOnly}>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-email">Email</Label>
+                <Input
+                  id="edit-email"
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Changing the email sends a verification link to both the
+                  current and the new address. The change only takes effect once
+                  both are confirmed.
+                </p>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-displayName">Display Name</Label>
+                <Input
+                  id="edit-displayName"
+                  value={displayName}
+                  onChange={(e) => setDisplayName(e.target.value)}
+                />
+              </div>
+            </div>
+            {organization?.pending_email_change && (
+              <AlertBox variant="warning">
+                A change to{" "}
+                <strong>{organization.pending_email_change.new_email}</strong>{" "}
+                is pending —{" "}
+                {describeWaitingOn(
+                  organization.pending_email_change,
+                  organization.email,
+                )}{" "}
+                (expires{" "}
+                {new Date(
+                  organization.pending_email_change.expires_at,
+                ).toLocaleString()}
+                ). Saving a different email restarts the verification.
+              </AlertBox>
+            )}
+            {canEditZdr && (
+              <div className="flex items-center justify-between gap-4">
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-zdr">Zero Data Retention</Label>
+                  <p className="text-sm text-muted-foreground">
+                    Applies to every API key owned by the organization.
+                  </p>
+                </div>
+                <Switch
+                  id="edit-zdr"
+                  disabled={supportOnly && !!organization?.zero_data_retention}
+                  checked={zeroDataRetention}
+                  onCheckedChange={setZeroDataRetention}
+                  aria-label="Toggle zero data retention"
+                />
+              </div>
+            )}
+            {canEditServing && (
+              <div className="grid gap-4 border-t pt-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="grid gap-1">
+                    <Label htmlFor="edit-self-hosted-only">
+                      No external-provider fallback (gateway)
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      Never fall over to a third-party (external) provider for
+                      this organisation's requests. Does not change where the
+                      inference backend places a request — that is the
+                      scheduling-tolerations setting below.
+                    </p>
+                  </div>
+                  <Switch
+                    id="edit-self-hosted-only"
+                    checked={selfHostedOnly}
+                    onCheckedChange={setSelfHostedOnly}
+                    aria-label="Toggle no external-provider fallback"
+                  />
+                </div>
+                <SchedulingTolerations
+                  preset={tolerationPreset}
+                  presets={config?.scheduling_toleration_presets}
+                  canEdit={canEditServing}
+                  onChange={setTolerationPreset}
+                />
+              </div>
+            )}
+          </div>
+        </form>
+        <DialogFooter className="px-6 py-4 border-t">
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="edit-organization-form"
+            disabled={updateOrg.isPending || (supportOnly && (!zeroDataRetention || !!organization?.zero_data_retention))}
+          >
+            {updateOrg.isPending ? "Saving..." : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

@@ -1,0 +1,494 @@
+"use client";
+
+import * as React from "react";
+import {
+  type ColumnDef,
+  type ColumnFiltersState,
+  type SortingState,
+  type VisibilityState,
+  flexRender,
+  getCoreRowModel,
+  getFilteredRowModel,
+  getPaginationRowModel,
+  getSortedRowModel,
+  useReactTable,
+} from "@tanstack/react-table";
+import { Search } from "lucide-react";
+
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "./table";
+import { Button } from "./button";
+import { Input } from "./input";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "./dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "./select";
+import { TablePagination } from "./table-pagination";
+import { CursorPagination } from "./cursor-pagination";
+
+interface ServerPagination {
+  page: number;
+  pageSize: number;
+  totalItems?: number;
+  onPageChange: (page: number) => void;
+  onPageSizeChange?: (pageSize: number) => void;
+}
+
+interface ServerCursorPagination {
+  page: number;
+  pageSize: number;
+  onNextPage: (lastItemId: string) => void;
+  onPrevPage: () => void;
+  onFirstPage?: () => void;
+  onPageSizeChange?: (pageSize: number) => void;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+}
+
+interface DataTableProps<TData, TValue> {
+  columns: ColumnDef<TData, TValue>[];
+  data: TData[];
+  searchPlaceholder?: string;
+  searchColumn?: string;
+  showColumnToggle?: boolean;
+  pageSize?: number;
+  totalItems?: number;
+  minRows?: number;
+  rowHeight?: string;
+  onSelectionChange?: (selectedRows: TData[]) => void;
+  actionBar?: React.ReactNode;
+  headerActions?: React.ReactNode;
+  initialColumnVisibility?: VisibilityState;
+  onRowClick?: (row: TData) => void;
+
+  paginationMode?: "client" | "server" | "server-cursor";
+
+  serverPagination?: ServerPagination | ServerCursorPagination;
+
+  externalSearch?: {
+    value: string;
+    onChange: (value: string) => void;
+  };
+
+  isLoading?: boolean;
+
+  emptyState?: React.ReactNode;
+
+  showPageSizeSelector?: boolean;
+
+  pageSizeOptions?: number[];
+}
+
+export function DataTable<TData, TValue>({
+  columns,
+  data,
+  searchPlaceholder = "Search...",
+  searchColumn,
+  showColumnToggle = true,
+  pageSize = 10,
+  totalItems,
+  minRows,
+  rowHeight = "53px",
+  onSelectionChange,
+  actionBar,
+  headerActions,
+  initialColumnVisibility = {},
+  onRowClick,
+  paginationMode = "client",
+  serverPagination,
+  externalSearch,
+  isLoading = false,
+  emptyState,
+  showPageSizeSelector = false,
+  pageSizeOptions = [10, 20, 50, 100],
+}: DataTableProps<TData, TValue>) {
+  const searchInputRef = React.useRef<HTMLInputElement>(null);
+
+  const prevDataRef = React.useRef(data);
+  React.useLayoutEffect(() => {
+    const dataChanged = prevDataRef.current !== data;
+    prevDataRef.current = data;
+
+    if (
+      externalSearch &&
+      dataChanged &&
+      externalSearch.value &&
+      searchInputRef.current
+    ) {
+      searchInputRef.current.focus();
+      const len = externalSearch.value.length;
+      searchInputRef.current.setSelectionRange(len, len);
+    }
+  }, [data, externalSearch]);
+
+  const [sorting, setSorting] = React.useState<SortingState>([]);
+  const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
+    [],
+  );
+  const [columnVisibility, setColumnVisibility] =
+    React.useState<VisibilityState>(initialColumnVisibility);
+  const [rowSelection, setRowSelection] = React.useState({});
+  const [globalFilter, setGlobalFilter] = React.useState("");
+
+  const isServerMode = paginationMode !== "client";
+
+  const currentPageSize = serverPagination?.pageSize ?? pageSize;
+
+  const table = useReactTable({
+    data,
+    columns,
+    onSortingChange: setSorting,
+    onColumnFiltersChange: setColumnFilters,
+    onGlobalFilterChange: setGlobalFilter,
+    getCoreRowModel: getCoreRowModel(),
+    getPaginationRowModel: isServerMode ? undefined : getPaginationRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    onColumnVisibilityChange: setColumnVisibility,
+    onRowSelectionChange: setRowSelection,
+    manualPagination: isServerMode,
+    manualSorting: false,
+    manualFiltering: false,
+    state: {
+      sorting,
+      columnFilters,
+      columnVisibility,
+      rowSelection,
+      globalFilter,
+    },
+    initialState: {
+      pagination: {
+        pageSize: currentPageSize,
+      },
+    },
+  });
+
+  const selectedRows = table.getFilteredSelectedRowModel().rows;
+
+  React.useEffect(() => {
+    table.setPageSize(currentPageSize);
+  }, [currentPageSize, table]);
+
+  React.useEffect(() => {
+    if (onSelectionChange) {
+      const selectedData = selectedRows.map((row) => row.original);
+      onSelectionChange(selectedData);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowSelection, onSelectionChange]);
+
+  const currentPageRows = table.getRowModel().rows;
+  const emptyRowsCount = minRows
+    ? Math.max(0, minRows - currentPageRows.length)
+    : 0;
+
+  const showPagination = (() => {
+    if (paginationMode === "server") {
+      const offsetPagination = serverPagination as ServerPagination | undefined;
+      return (
+        !!offsetPagination?.totalItems &&
+        offsetPagination.totalItems > offsetPagination.pageSize
+      );
+    }
+    if (paginationMode === "server-cursor") {
+      const cursorPagination = serverPagination as
+        | ServerCursorPagination
+        | undefined;
+      return !!(cursorPagination?.hasNextPage || cursorPagination?.hasPrevPage);
+    }
+    return data.length > currentPageSize;
+  })();
+
+  return (
+    <div className="space-y-4">
+      {actionBar && selectedRows.length > 0 && actionBar}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-2 w-full sm:w-auto">
+          <div className="relative w-full sm:w-auto">
+            <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input
+              ref={searchInputRef}
+              placeholder={searchPlaceholder}
+              aria-label={searchPlaceholder || "Search table"}
+              value={
+                externalSearch
+                  ? externalSearch.value
+                  : searchColumn
+                    ? ((table
+                        .getColumn(searchColumn)
+                        ?.getFilterValue() as string) ?? "")
+                    : globalFilter
+              }
+              onChange={(event) => {
+                const value = event.target.value;
+                if (externalSearch) {
+                  externalSearch.onChange(value);
+                } else if (searchColumn) {
+                  table.getColumn(searchColumn)?.setFilterValue(value);
+                } else {
+                  setGlobalFilter(value);
+                }
+              }}
+              className="pl-8 w-full sm:w-[300px]"
+              disabled={isLoading}
+            />
+          </div>
+          {selectedRows.length > 0 && (
+            <div className="text-sm text-muted-foreground">
+              {selectedRows.length} of {table.getFilteredRowModel().rows.length}{" "}
+              row(s) selected
+            </div>
+          )}
+        </div>
+        <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+          {showPageSizeSelector && serverPagination?.onPageSizeChange && (
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">Show</span>
+              <Select
+                value={String(currentPageSize)}
+                onValueChange={(value) =>
+                  serverPagination.onPageSizeChange?.(Number(value))
+                }
+              >
+                <SelectTrigger className="w-[70px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {pageSizeOptions.map((size) => (
+                    <SelectItem key={size} value={String(size)}>
+                      {size}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          {headerActions}
+          {showColumnToggle && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  Columns
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-[150px]">
+                {table
+                  .getAllColumns()
+                  .filter((column) => column.getCanHide())
+                  .map((column) => {
+                    return (
+                      <DropdownMenuCheckboxItem
+                        key={column.id}
+                        className="capitalize"
+                        checked={column.getIsVisible()}
+                        onCheckedChange={(value) =>
+                          column.toggleVisibility(!!value)
+                        }
+                      >
+                        {column.id.replace(/_/g, " ")}
+                      </DropdownMenuCheckboxItem>
+                    );
+                  })}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      </div>
+      <div className="rounded-md border max-w-full overflow-x-auto">
+        <Table>
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <TableRow key={headerGroup.id}>
+                {headerGroup.headers.map((header) => {
+                  return (
+                    <TableHead
+                      key={header.id}
+                      className={
+                        header.column.id === "select"
+                          ? "pl-6 w-[50px]"
+                          : header.index === 0
+                            ? "pl-6"
+                            : ""
+                      }
+                    >
+                      {header.isPlaceholder
+                        ? null
+                        : flexRender(
+                            header.column.columnDef.header,
+                            header.getContext(),
+                          )}
+                    </TableHead>
+                  );
+                })}
+              </TableRow>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {isLoading ? (
+              Array.from({ length: minRows || currentPageSize }).map(
+                (_, index) => (
+                  <TableRow
+                    key={`skeleton-${index}`}
+                    className="hover:bg-transparent"
+                    style={{ height: rowHeight }}
+                  >
+                    {columns.map((_, cellIndex) => (
+                      <TableCell
+                        key={`skeleton-${index}-${cellIndex}`}
+                        className={cellIndex === 0 ? "pl-6" : ""}
+                      >
+                        <div className="h-4 bg-muted animate-pulse rounded" />
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ),
+              )
+            ) : table.getRowModel().rows?.length ? (
+              <>
+                {table.getRowModel().rows.map((row) => {
+                  const isExpandedRow = (row.original as any)?._isExpandedRow;
+
+                  if (isExpandedRow) {
+                    const visibleColumns = row.getVisibleCells();
+                    const firstCell = visibleColumns[0];
+
+                    return (
+                      <TableRow key={row.id} className="hover:bg-transparent">
+                        <TableCell
+                          colSpan={visibleColumns.length}
+                          className="p-0 whitespace-normal"
+                        >
+                          {flexRender(
+                            firstCell.column.columnDef.cell,
+                            firstCell.getContext(),
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    );
+                  }
+
+                  return (
+                    <TableRow
+                      key={row.id}
+                      data-state={row.getIsSelected() && "selected"}
+                      className={onRowClick ? "group cursor-pointer" : "group"}
+                      style={{ height: rowHeight }}
+                      onClick={() => onRowClick?.(row.original)}
+                    >
+                      {row.getVisibleCells().map((cell, index, cells) => (
+                        <TableCell
+                          key={cell.id}
+                          className={
+                            cell.column.id === "select"
+                              ? "pl-6 w-[50px]"
+                              : cell.column.getIndex() === 0
+                                ? "pl-6"
+                                : index === cells.length - 1
+                                  ? "pr-0"
+                                  : ""
+                          }
+                        >
+                          {flexRender(
+                            cell.column.columnDef.cell,
+                            cell.getContext(),
+                          )}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  );
+                })}
+                { }
+                {emptyRowsCount > 0 &&
+                  Array.from({ length: emptyRowsCount }).map((_, index) => (
+                    <TableRow
+                      key={`empty-${index}`}
+                      className="hover:bg-transparent"
+                      style={{ height: rowHeight }}
+                    >
+                      {columns.map((_, cellIndex) => (
+                        <TableCell
+                          key={`empty-${index}-${cellIndex}`}
+                          className={cellIndex === 0 ? "pl-6" : ""}
+                          style={{ height: rowHeight }}
+                        >
+                          { }
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))}
+              </>
+            ) : (
+              <TableRow>
+                <TableCell
+                  colSpan={columns.length}
+                  className={emptyState ? "p-0" : "h-24 text-center"}
+                >
+                  {emptyState || "No results."}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
+      </div>
+      {showPagination && (
+        <>
+          {paginationMode === "server-cursor" &&
+          serverPagination &&
+          "hasNextPage" in serverPagination ? (
+            <CursorPagination
+              currentPage={serverPagination.page}
+              itemsPerPage={serverPagination.pageSize}
+              onNextPage={() => {
+                if (data.length > 0) {
+                  const lastItem = data[data.length - 1] as any;
+                  const lastItemId =
+                    lastItem.id || lastItem._id || lastItem.key;
+                  serverPagination.onNextPage(lastItemId);
+                }
+              }}
+              onPrevPage={serverPagination.onPrevPage}
+              onFirstPage={serverPagination.onFirstPage}
+              hasNextPage={serverPagination.hasNextPage}
+              hasPrevPage={serverPagination.hasPrevPage}
+              currentPageItemCount={data.length}
+              itemName="results"
+            />
+          ) : paginationMode === "server" &&
+            serverPagination &&
+            "onPageChange" in serverPagination ? (
+            <TablePagination
+              currentPage={serverPagination.page}
+              itemsPerPage={serverPagination.pageSize}
+              onPageChange={serverPagination.onPageChange}
+              totalItems={serverPagination.totalItems ?? 0}
+              itemName="results"
+            />
+          ) : (
+            <TablePagination
+              currentPage={table.getState().pagination.pageIndex + 1}
+              itemsPerPage={table.getState().pagination.pageSize}
+              onPageChange={(page) => table.setPageIndex(page - 1)}
+              totalItems={totalItems ?? data.length}
+              itemName="results"
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}

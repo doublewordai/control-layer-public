@@ -1,0 +1,1045 @@
+import { useState, useEffect, useRef } from "react";
+import * as React from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  Upload,
+  Play,
+  Box,
+  FileInput,
+  FileCheck,
+  AlertCircle,
+  Users,
+  ChevronsUpDown,
+  Check,
+  Filter,
+  Code,
+} from "lucide-react";
+import { Button } from "../../../ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../../ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../../ui/select";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "../../../ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "../../../ui/command";
+import { Switch } from "../../../ui/switch";
+import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
+import { DataTable } from "../../../ui/data-table";
+import { createFileColumns } from "../FilesTable/columns";
+import { createBatchColumns } from "../BatchesTable/columns";
+import {
+  useFiles,
+  useBatches,
+  useOrganizationMembers,
+  useConfig,
+} from "../../../../api/control-layer/hooks";
+import { dwctlApi } from "../../../../api/control-layer/client";
+import type { FileObject, Batch } from "../types";
+import type {
+  BatchStatus,
+} from "../../../../api/control-layer/types";
+import { useServerCursorPagination } from "../../../../hooks/useServerCursorPagination";
+import { useDebounce } from "../../../../hooks/useDebounce";
+import { usePersistedFilter } from "../../../../hooks/usePersistedFilter";
+import { useAuthorization } from "../../../../utils/authorization";
+import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
+import { ApiExamples } from "../../../modals";
+import { cn } from "@/lib/utils";
+
+const BATCH_COMPLETION_WINDOW = "24h";
+const BACKGROUND_COMPLETION_WINDOW = "background";
+const DEFAULT_COMPLETION_WINDOWS: string[] = [
+  BATCH_COMPLETION_WINDOW,
+  BACKGROUND_COMPLETION_WINDOW,
+];
+
+const PERSIST_SCOPE = "batches";
+
+interface BatchesProps {
+  onOpenUploadModal: (file?: File) => void;
+  onOpenCreateBatchModal: (file?: File | FileObject) => void;
+  onOpenDownloadModal: (resource: {
+    type: "file" | "batch-results";
+    id: string;
+    filename?: string;
+    isPartial?: boolean;
+  }) => void;
+  onOpenDeleteDialog: (file: FileObject) => void;
+  onOpenDeleteBatchDialog: (batch: Batch) => void;
+  onOpenCancelDialog: (batch: Batch) => void;
+  onBatchCreatedCallback?: (callback: () => void) => void;
+}
+
+export function Batches({
+  onOpenUploadModal,
+  onOpenCreateBatchModal,
+  onOpenDownloadModal,
+  onOpenDeleteDialog,
+  onOpenDeleteBatchDialog,
+  onOpenCancelDialog,
+  onBatchCreatedCallback,
+}: BatchesProps) {
+  const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const queryClient = useQueryClient();
+  const { userRoles, hasPermission } = useAuthorization();
+  const { isOrgContext, activeOrganizationId } = useOrganizationContext();
+  const { data: appConfig } = useConfig();
+  const asyncCompletionWindow =
+    appConfig?.batches?.async_requests?.completion_window ?? "1h";
+
+  const isPlatformManager = userRoles.includes("PlatformManager");
+  const showUserColumn = isOrgContext;
+  const showContextColumn = false;
+  const showSourceColumn = hasPermission("connections");
+
+  const showMemberFilter = isOrgContext;
+  const { data: orgMembers } = useOrganizationMembers(activeOrganizationId || "");
+  const memberList = React.useMemo(
+    () =>
+      isOrgContext
+        ? (orgMembers ?? [])
+            .filter((member) => member.status === "active" && member.user)
+            .map((member) => ({ id: member.user!.id, email: member.user!.email }))
+        : [],
+    [isOrgContext, orgMembers],
+  );
+
+  const [selectedMemberId, setSelectedMemberId] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "member",
+    "",
+  );
+  const [memberPopoverOpen, setMemberPopoverOpen] = useState(false);
+
+  const [statusFilter, setStatusFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "status",
+    "all",
+  );
+  const [completionWindowFilter, setCompletionWindowFilter] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "window",
+    DEFAULT_COMPLETION_WINDOWS,
+  );
+  const [sortActiveFirstStr, setSortActiveFirstStr] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "activeFirst",
+    "true",
+  );
+  const sortActiveFirst = sortActiveFirstStr !== "false";
+  const setSortActiveFirst = (next: boolean) =>
+    setSortActiveFirstStr(next ? "true" : "false");
+  const [dateRange, setDateRange] = useState<
+    { from: Date; to: Date } | undefined
+  >(undefined);
+
+  const isInitialOrgMount = useRef(true);
+  useEffect(() => {
+    if (isInitialOrgMount.current) {
+      isInitialOrgMount.current = false;
+      return;
+    }
+    setSelectedMemberId("");
+    setStatusFilter("all");
+    setDateRange(undefined);
+    filesPagination.handleFirstPage();
+    batchesPagination.handleFirstPage();
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      params.delete("fileFilter");
+      return params;
+    }, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeOrganizationId]);
+
+  const [dragActive, setDragActive] = useState(false);
+
+  const [fileSearchQuery, setFileSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "fileSearch",
+    "",
+  );
+  const [batchSearchQuery, setBatchSearchQuery] = usePersistedFilter(
+    PERSIST_SCOPE,
+    "batchSearch",
+    "",
+  );
+  const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
+  const debouncedBatchSearch = useDebounce(batchSearchQuery, 300);
+
+  const updateURL = (
+    tab: "files" | "batches",
+    fileFilter: string | null,
+    fileType?: "input" | "output" | "error",
+  ) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", tab);
+    if (fileFilter) {
+      params.set("fileFilter", fileFilter);
+    } else {
+      params.delete("fileFilter");
+    }
+    if (fileType && fileType !== "input") {
+      params.set("fileType", fileType);
+    } else {
+      params.delete("fileType");
+    }
+    setSearchParams(params, { replace: false });
+  };
+
+  const handleBatchCreated = () => {
+    updateURL("batches", null);
+  };
+
+  useEffect(() => {
+    if (onBatchCreatedCallback) {
+      onBatchCreatedCallback(handleBatchCreated);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onBatchCreatedCallback]);
+
+  const activeTab =
+    (searchParams.get("tab") as "files" | "batches") || "batches";
+  const batchFileFilter = searchParams.get("fileFilter");
+  const fileTypeFilter =
+    (searchParams.get("fileType") as "input" | "output" | "error") || "input";
+
+  const filesPagination = useServerCursorPagination({
+    paramPrefix: "files",
+    defaultPageSize: 10,
+  });
+
+  const batchesPagination = useServerCursorPagination({
+    paramPrefix: "batches",
+    defaultPageSize: 10,
+  });
+
+  const filePurpose =
+    fileTypeFilter === "input"
+      ? "batch"
+      : fileTypeFilter === "output"
+        ? "batch_output"
+        : "batch_error";
+
+  const memberKnown =
+    !selectedMemberId || memberList.some((m) => m.id === selectedMemberId);
+  const memberIdFilter =
+    selectedMemberId && (!isOrgContext || memberKnown)
+      ? selectedMemberId
+      : undefined;
+  const resolvedMemberEmail = memberList.find(
+    (m) => m.id === selectedMemberId,
+  )?.email;
+
+  const { data: filesResponse, isLoading: filesLoading } = useFiles({
+    purpose: filePurpose,
+    search: debouncedFileSearch.trim() || undefined,
+    member_id: memberIdFilter,
+    ...filesPagination.queryParams,
+    enabled: activeTab === "files" || !!batchFileFilter,
+  });
+
+  const allowedWindowFilter = isPlatformManager
+    ? completionWindowFilter
+    : completionWindowFilter.filter((w) => w !== "background");
+  const completionWindowParam =
+    allowedWindowFilter.length > 0
+      ? allowedWindowFilter.join(",")
+      : undefined;
+
+  const {
+    data: batchesResponse,
+    isLoading: batchesLoading,
+    error: batchesError,
+  } = useBatches({
+    search: debouncedBatchSearch.trim() || undefined,
+    include: "analytics",
+    member_id: memberIdFilter,
+    status:
+      statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
+    created_after: dateRange?.from.toISOString(),
+    created_before: dateRange?.to.toISOString(),
+    active_first: sortActiveFirst || undefined,
+    completion_window: completionWindowParam,
+    ...batchesPagination.queryParams,
+  });
+
+  const batchesData = batchesResponse?.data || [];
+  const batchesHasMore = batchesData.length > batchesPagination.pageSize;
+  const batches = batchesHasMore
+    ? batchesData.slice(0, batchesPagination.pageSize)
+    : batchesData;
+
+  const filesData = filesResponse?.data || [];
+  const filesHasMore = filesData.length > filesPagination.pageSize;
+  const filesForDisplay = filesHasMore
+    ? filesData.slice(0, filesPagination.pageSize)
+    : filesData;
+
+  const files = filesForDisplay;
+
+  const filteredBatches = React.useMemo(() => {
+    let result = batches;
+
+    if (batchFileFilter) {
+      result = result.filter((b) => b.input_file_id === batchFileFilter);
+    }
+
+    return result;
+  }, [batches, batchFileFilter]);
+
+  useEffect(() => {
+    if (filesHasMore && files.length > 0 && filesPagination.page > 0) {
+      const lastFile = files[files.length - 1];
+      const nextCursor = lastFile.id;
+
+      const prefetchOptions = {
+        purpose: filePurpose,
+        search: debouncedFileSearch.trim() || undefined,
+        member_id: memberIdFilter,
+        limit: filesPagination.pageSize + 1,
+        after: nextCursor,
+      };
+
+      queryClient.prefetchQuery({
+        queryKey: ["files", "list", prefetchOptions],
+        queryFn: () => dwctlApi.files.list(prefetchOptions),
+      });
+    }
+  }, [
+    files,
+    filesHasMore,
+    filesPagination.page,
+    filesPagination.pageSize,
+    filePurpose,
+    debouncedFileSearch,
+    memberIdFilter,
+    queryClient,
+  ]);
+
+  useEffect(() => {
+    if (batchesHasMore && batches.length > 0 && batchesPagination.page > 0) {
+      const lastBatch = batches[batches.length - 1];
+      const nextCursor = lastBatch.id;
+
+      const prefetchOptions = {
+        search: debouncedBatchSearch.trim() || undefined,
+        include: "analytics" as const,
+        member_id: memberIdFilter,
+        status:
+          statusFilter !== "all" ? (statusFilter as BatchStatus) : undefined,
+        created_after: dateRange?.from.toISOString(),
+        created_before: dateRange?.to.toISOString(),
+        active_first: sortActiveFirst || undefined,
+        completion_window: completionWindowParam,
+        limit: batchesPagination.pageSize + 1,
+        after: nextCursor,
+      };
+
+      queryClient.prefetchQuery({
+        queryKey: ["batches", "list", prefetchOptions],
+        queryFn: () => dwctlApi.batches.list(prefetchOptions),
+      });
+    }
+  }, [
+    batches,
+    batchesHasMore,
+    batchesPagination.page,
+    batchesPagination.pageSize,
+    completionWindowParam,
+    debouncedBatchSearch,
+    memberIdFilter,
+    statusFilter,
+    dateRange,
+    sortActiveFirst,
+    queryClient,
+  ]);
+
+  const getBatchFiles = (batch: Batch) => {
+    const files: Array<{ id: string; purpose: string }> = [];
+    if (batch.output_file_id) {
+      files.push({ id: batch.output_file_id, purpose: "batch_output" });
+    }
+    if (batch.error_file_id) {
+      files.push({ id: batch.error_file_id, purpose: "batch_error" });
+    }
+    return files;
+  };
+
+  const handleViewFileRequests = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams
+      ? `/batches?${currentParams}`
+      : `/batches?tab=${activeTab}`;
+    navigate(
+      `/batches/files/${file.id}/content?from=${encodeURIComponent(fromUrl)}`,
+    );
+  };
+
+  const handleDeleteFile = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
+    onOpenDeleteDialog(file);
+  };
+
+  const handleDownloadFileCode = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
+
+    const isPartial =
+      (file.purpose === "batch_output" || file.purpose === "batch_error") &&
+      batches.some(
+        (b) =>
+          (b.output_file_id === file.id || b.error_file_id === file.id) &&
+          ["validating", "in_progress", "finalizing"].includes(b.status),
+      );
+
+    onOpenDownloadModal({
+      type: "file",
+      id: file.id,
+      filename: file.filename,
+      isPartial,
+    });
+  };
+
+  const handleTriggerBatch = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
+    onOpenCreateBatchModal(file);
+  };
+
+  const handleFileClick = (file: FileObject) => {
+    if ((file as any)._isEmpty) return;
+    updateURL("batches", file.id);
+  };
+
+  const handleCancelBatch = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    onOpenCancelDialog(batch);
+  };
+
+  const handleDeleteBatch = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    onOpenDeleteBatchDialog(batch);
+  };
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const file = e.dataTransfer.files[0];
+      if (file.name.endsWith(".jsonl")) {
+        if (activeTab === "batches") {
+          onOpenCreateBatchModal(file);
+        } else if (activeTab === "files") {
+          onOpenUploadModal(file);
+        }
+      }
+    }
+  };
+
+  const getInputFile = (batch: Batch) => {
+    if (!batch.input_file_id) return undefined;
+    return { id: batch.input_file_id, purpose: "batch" };
+  };
+
+  const isFileInProgress = React.useCallback(
+    (file: FileObject) => {
+      if (file.purpose !== "batch_output" && file.purpose !== "batch_error") {
+        return false;
+      }
+
+      const batch = batches.find(
+        (b) => b.output_file_id === file.id || b.error_file_id === file.id,
+      );
+
+      if (!batch) return false;
+
+      const activeStatuses: string[] = [
+        "validating",
+        "in_progress",
+        "finalizing",
+      ];
+      return activeStatuses.includes(batch.status);
+    },
+    [batches],
+  );
+
+  const fileColumns = createFileColumns({
+    onView: handleViewFileRequests,
+    onDelete: handleDeleteFile,
+    onDownloadCode: handleDownloadFileCode,
+    onTriggerBatch: handleTriggerBatch,
+    onViewBatches: handleFileClick,
+    isFileInProgress,
+    showUserColumn,
+    showContextColumn,
+    showSourceColumn,
+  });
+
+  const handleBatchClick = (batch: Batch) => {
+    if ((batch as any)._isEmpty) return;
+    const currentParams = searchParams.toString();
+    const fromUrl = currentParams ? `/batches?${currentParams}` : "/batches";
+    navigate(`/batches/${batch.id}?from=${encodeURIComponent(fromUrl)}`);
+  };
+
+  const batchColumns = createBatchColumns({
+    onCancel: handleCancelBatch,
+    onDelete: handleDeleteBatch,
+    getBatchFiles,
+    onViewFile: handleViewFileRequests,
+    getInputFile,
+    onRowClick: handleBatchClick,
+    showUserColumn,
+    showTypeColumn: true,
+    asyncCompletionWindow,
+  });
+
+  const displayedMemberEmail = resolvedMemberEmail;
+  const memberLabel =
+    !selectedMemberId
+      ? "All members"
+      : displayedMemberEmail || "Selected member";
+  const showMemberCombobox = showMemberFilter && memberList.length > 0;
+  const memberFilterCombobox = showMemberCombobox && (
+    <Popover open={memberPopoverOpen} onOpenChange={setMemberPopoverOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="outline"
+          role="combobox"
+          aria-expanded={memberPopoverOpen}
+          className="w-[220px] h-9 justify-between font-normal"
+        >
+          <div className="flex items-center gap-1.5 truncate">
+            <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+            <span className="truncate">{memberLabel}</span>
+          </div>
+          <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-[280px] p-0" align="start">
+        <Command>
+          <CommandInput placeholder="Search by email..." />
+          <CommandList>
+            <CommandEmpty>No members found.</CommandEmpty>
+            <CommandGroup>
+              <CommandItem
+                value="all-members"
+                onSelect={() => {
+                  setSelectedMemberId("");
+                  setMemberPopoverOpen(false);
+                  batchesPagination.handleFirstPage();
+                  filesPagination.handleFirstPage();
+                }}
+              >
+                <Check
+                  className={cn(
+                    "mr-2 h-4 w-4",
+                    !selectedMemberId ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                All members
+              </CommandItem>
+              {memberList.map((member) => (
+                <CommandItem
+                  key={member.id}
+                  value={member.email}
+                  onSelect={() => {
+                    setSelectedMemberId(member.id);
+                    setMemberPopoverOpen(false);
+                    batchesPagination.handleFirstPage();
+                    filesPagination.handleFirstPage();
+                  }}
+                >
+                  <Check
+                    className={cn(
+                      "mr-2 h-4 w-4",
+                      selectedMemberId === member.id
+                        ? "opacity-100"
+                        : "opacity-0",
+                    )}
+                  />
+                  <span className="truncate">{member.email}</span>
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+
+  const [showApiExamples, setShowApiExamples] = useState(false);
+
+  return (
+    <div
+      className="py-4 px-6"
+      onDragEnter={handleDrag}
+      onDragLeave={handleDrag}
+      onDragOver={handleDrag}
+      onDrop={handleDrop}
+    >
+      <Tabs
+        value={activeTab}
+        onValueChange={(v) => updateURL(v as "files" | "batches", null)}
+        className="space-y-4"
+      >
+        { }
+        <div className="mb-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+          { }
+          <div>
+            <h1 className="text-3xl font-bold text-doubleword-neutral-900">
+              {activeTab === "batches" ? "Batches" : "Batch Files"}
+            </h1>
+            <p className="text-doubleword-neutral-600 mt-1">
+              {activeTab === "batches"
+                ? "Create and manage batch requests"
+                : "Upload and manage files for batch processing"}
+            </p>
+          </div>
+
+          { }
+          <div className="flex items-center gap-2">
+            { }
+            {activeTab === "batches" ? (
+              <Button
+                onClick={() => onOpenCreateBatchModal()}
+                variant="outline"
+              >
+                <Play className="w-4 h-4 mr-2" />
+                Create Batch
+              </Button>
+            ) : (
+              <Button
+                onClick={() => onOpenUploadModal()}
+                variant="outline"
+                className={`transition-all duration-200 ${
+                  dragActive ? "border-blue-500 bg-blue-50 text-blue-700" : ""
+                }`}
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Upload File
+              </Button>
+            )}
+
+            { }
+            <Button variant="outline" onClick={() => setShowApiExamples(true)}>
+              <Code className="h-4 w-4" />
+              API
+            </Button>
+
+            { }
+            <TabsList>
+              <TabsTrigger
+                value="batches"
+                className="flex items-center gap-2"
+              >
+                <Box className="w-4 h-4" />
+                Batches
+              </TabsTrigger>
+              <TabsTrigger
+                value="files"
+                className="flex items-center gap-2"
+              >
+                <FileInput className="w-4 h-4" />
+                Files
+              </TabsTrigger>
+            </TabsList>
+          </div>
+        </div>
+
+        { }
+        <TabsContent value="batches" className="space-y-4">
+          { }
+          {batchFileFilter && (
+            <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <FileInput className="w-4 h-4 text-blue-600" />
+              <span className="text-sm text-blue-900">
+                Showing batches for file:{" "}
+                <span className="font-mono">
+                  {files.find((f) => f.id === batchFileFilter)?.filename ||
+                    batchFileFilter}
+                </span>
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => updateURL("batches", null)}
+                className="ml-auto h-auto py-1 px-2 text-blue-600 hover:text-blue-800 hover:bg-blue-100"
+              >
+                Clear filter
+              </Button>
+            </div>
+          )}
+          <DataTable
+            columns={batchColumns}
+            data={filteredBatches}
+            searchPlaceholder="Search batches..."
+            externalSearch={{
+              value: batchSearchQuery,
+              onChange: (value) => {
+                setBatchSearchQuery(value);
+                batchesPagination.handleFirstPage();
+              },
+            }}
+            showColumnToggle={true}
+            pageSize={batchesPagination.pageSize}
+            minRows={batchesPagination.pageSize}
+            rowHeight="40px"
+            initialColumnVisibility={{ batch_id: false, input_file_id: false, completion_window: false }}
+            onRowClick={handleBatchClick}
+            isLoading={batchesLoading}
+            emptyState={
+              batchesError ? (
+                <div className="text-center py-12" role="alert">
+                  <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                    Couldn't load batches
+                  </h3>
+                  <p className="text-doubleword-neutral-600 mb-4">
+                    {(batchesError as Error)?.message ||
+                      "The batches request failed. Adjust any active filters or try again."}
+                  </p>
+                </div>
+              ) : (
+              <div className="text-center py-12">
+                <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                  <Box className="w-8 h-8 text-doubleword-neutral-600" />
+                </div>
+                <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                  No batches found
+                </h3>
+                <p className="text-doubleword-neutral-600 mb-4">
+                  {batchSearchQuery
+                    ? "Try a different search term"
+                    : "Create a batch from an uploaded file to start processing requests"}
+                </p>
+                {!batchSearchQuery && (
+                  <Button
+                    onClick={() => {
+                      const file = batchFileFilter
+                        ? files.find((f) => f.id === batchFileFilter)
+                        : undefined;
+                      onOpenCreateBatchModal(file);
+                    }}
+                  >
+                    <Play className="w-4 h-4 mr-2" />
+                    {batchFileFilter ? "Create Batch" : "Create First Batch"}
+                  </Button>
+                )}
+              </div>
+              )
+            }
+            headerActions={
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="active-first"
+                    checked={sortActiveFirst}
+                    onCheckedChange={(checked) => {
+                      setSortActiveFirst(checked);
+                      batchesPagination.handleFirstPage();
+                    }}
+                  />
+                  <label
+                    htmlFor="active-first"
+                    className="text-sm text-gray-600 cursor-pointer select-none"
+                  >
+                    Active first
+                  </label>
+                </div>
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className="h-9 justify-between font-normal"
+                    >
+                      <div className="flex items-center gap-1.5 truncate">
+                        <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
+                        <span className="truncate">
+                          {completionWindowFilter.length === 0
+                            ? "All windows"
+                            : completionWindowFilter
+                                .map((w) =>
+                                  w === asyncCompletionWindow
+                                    ? "Async"
+                                    : w === BACKGROUND_COMPLETION_WINDOW
+                                      ? "Background"
+                                    : w === BATCH_COMPLETION_WINDOW
+                                      ? "Batch"
+                                      : w,
+                                )
+                                .join(", ")}
+                        </span>
+                      </div>
+                      <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[160px] p-2" align="start">
+                    {(
+                      [
+                        { window: BATCH_COMPLETION_WINDOW, label: "Batch" },
+                        {
+                          window: BACKGROUND_COMPLETION_WINDOW,
+                          label: "Background",
+                        },
+                        { window: asyncCompletionWindow, label: "Async" },
+                      ] as const
+                    ).map(({ window, label }) => (
+                      <label
+                        key={window}
+                        className="flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer rounded hover:bg-gray-50"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={completionWindowFilter.includes(window)}
+                          onChange={() => {
+                            setCompletionWindowFilter(
+                              completionWindowFilter.includes(window)
+                                ? completionWindowFilter.filter(
+                                    (w) => w !== window,
+                                  )
+                                : [...completionWindowFilter, window],
+                            );
+                            batchesPagination.handleFirstPage();
+                          }}
+                          className="rounded border-gray-300"
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </PopoverContent>
+                </Popover>
+                {memberFilterCombobox}
+                <Select
+                  value={statusFilter}
+                  onValueChange={(v) => {
+                    setStatusFilter(v);
+                    batchesPagination.handleFirstPage();
+                  }}
+                >
+                  <SelectTrigger className="w-[140px] h-9">
+                    <div className="flex items-center gap-1.5">
+                      <Filter className="w-3.5 h-3.5 text-gray-500" />
+                      <SelectValue />
+                    </div>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">All statuses</SelectItem>
+                    <SelectItem value="in_progress">In Progress</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="failed">Failed</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                    {isPlatformManager && (
+                      <SelectItem value="expired">Expired (SLA)</SelectItem>
+                    )}
+                  </SelectContent>
+                </Select>
+                <DateTimeRangeSelector
+                  value={dateRange}
+                  onChange={(range) => {
+                    setDateRange(range);
+                    batchesPagination.handleFirstPage();
+                  }}
+                />
+                <span className="text-sm text-gray-600">Rows:</span>
+                <Select
+                  value={batchesPagination.pageSize.toString()}
+                  onValueChange={(value) =>
+                    batchesPagination.handlePageSizeChange(Number(value))
+                  }
+                >
+                  <SelectTrigger className="w-20 h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                    <SelectItem value="100">100</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            }
+            paginationMode="server-cursor"
+            serverPagination={{
+              page: batchesPagination.page,
+              pageSize: batchesPagination.pageSize,
+              onNextPage: () => {
+                const lastBatch = batches[batches.length - 1];
+                if (lastBatch) {
+                  batchesPagination.handleNextPage(lastBatch.id);
+                }
+              },
+              onPrevPage: batchesPagination.handlePrevPage,
+              onFirstPage: batchesPagination.handleFirstPage,
+              hasNextPage: batchesHasMore,
+              hasPrevPage: batchesPagination.hasPrevPage,
+            }}
+          />
+        </TabsContent>
+
+        <TabsContent value="files" className="space-y-4">
+          <DataTable
+            columns={fileColumns}
+            data={files}
+            searchPlaceholder="Search files..."
+            externalSearch={{
+              value: fileSearchQuery,
+              onChange: (value) => {
+                setFileSearchQuery(value);
+                filesPagination.handleFirstPage();
+              },
+            }}
+            showColumnToggle={true}
+            pageSize={filesPagination.pageSize}
+            minRows={filesPagination.pageSize}
+            rowHeight="40px"
+            initialColumnVisibility={{}}
+            isLoading={filesLoading}
+            emptyState={
+              <div className="text-center py-12">
+                <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+                  <FileInput className="w-8 h-8 text-doubleword-neutral-600" />
+                </div>
+                <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                  {fileSearchQuery ? "No matching files" : "No files uploaded"}
+                </h3>
+                <p className="text-doubleword-neutral-600 mb-4">
+                  {fileSearchQuery
+                    ? "No files match your search. Try a different search term."
+                    : "Upload a .jsonl file to get started with batch processing"}
+                </p>
+                {!fileSearchQuery && (
+                  <Button onClick={() => onOpenUploadModal()}>
+                    <Upload className="w-4 h-4 mr-2" />
+                    Upload First File
+                  </Button>
+                )}
+              </div>
+            }
+            headerActions={
+              <div className="flex items-center gap-2 flex-wrap">
+                {memberFilterCombobox}
+                <div className="inline-flex h-9 items-center justify-center rounded-md bg-muted p-1 text-muted-foreground">
+                  {(["input", "output", "error"] as const).map((type) => {
+                    const Icon =
+                      type === "input"
+                        ? FileInput
+                        : type === "output"
+                          ? FileCheck
+                          : AlertCircle;
+                    const label = type.charAt(0).toUpperCase() + type.slice(1);
+
+                    return (
+                      <button
+                        key={type}
+                        type="button"
+                        title={`${label} files`}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setSearchParams(
+                            (prev) => {
+                              const params = new URLSearchParams(prev);
+                              params.set("tab", activeTab);
+                              if (batchFileFilter) {
+                                params.set("fileFilter", batchFileFilter);
+                              } else {
+                                params.delete("fileFilter");
+                              }
+                              if (type !== "input") {
+                                params.set("fileType", type);
+                              } else {
+                                params.delete("fileType");
+                              }
+                              params.set("filesPage", "1");
+                              params.delete("filesAfter");
+                              return params;
+                            },
+                            { replace: false },
+                          );
+                        }}
+                        className={`inline-flex items-center justify-center whitespace-nowrap rounded-sm px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ${
+                          fileTypeFilter === type
+                            ? "bg-background text-foreground shadow-sm"
+                            : "hover:bg-background/50"
+                        }`}
+                      >
+                        <Icon className="w-4 h-4" />
+                      </button>
+                    );
+                  })}
+                </div>
+                <span className="text-sm text-gray-600">Rows:</span>
+                <Select
+                  value={filesPagination.pageSize.toString()}
+                  onValueChange={(value) =>
+                    filesPagination.handlePageSizeChange(Number(value))
+                  }
+                >
+                  <SelectTrigger className="w-20 h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10</SelectItem>
+                    <SelectItem value="20">20</SelectItem>
+                    <SelectItem value="50">50</SelectItem>
+                    <SelectItem value="100">100</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            }
+            paginationMode="server-cursor"
+            serverPagination={{
+              page: filesPagination.page,
+              pageSize: filesPagination.pageSize,
+              onNextPage: () => {
+                const lastFile = files[files.length - 1];
+                if (lastFile) {
+                  filesPagination.handleNextPage(lastFile.id);
+                }
+              },
+              onPrevPage: filesPagination.handlePrevPage,
+              onFirstPage: filesPagination.handleFirstPage,
+              hasNextPage: filesHasMore,
+              hasPrevPage: filesPagination.hasPrevPage,
+            }}
+          />
+        </TabsContent>
+      </Tabs>
+
+      <ApiExamples
+        isOpen={showApiExamples}
+        onClose={() => setShowApiExamples(false)}
+        defaultTab="batch"
+      />
+    </div>
+  );
+}

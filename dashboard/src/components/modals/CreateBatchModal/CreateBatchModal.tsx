@@ -1,0 +1,833 @@
+import { useState, useEffect, useCallback } from "react";
+import {
+  Play,
+  AlertCircle,
+  X,
+  Upload,
+  ExternalLink,
+  Info,
+  AlertTriangle,
+} from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogDescription,
+} from "../../ui/dialog";
+import { Button } from "../../ui/button";
+import { Label } from "../../ui/label";
+import { Input } from "../../ui/input";
+import { Combobox } from "../../ui/combobox";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
+import {
+  useCreateBatch,
+  useFiles,
+  useUploadFileWithProgress,
+  useConfig,
+  useFileCostEstimate,
+  useApiKeys,
+  useUser,
+} from "../../../api/control-layer/hooks";
+import { useOrganizationContext } from "../../../contexts";
+import { formatCredits } from "../../features/api-keys/ApiKeys/spendCap";
+import { dwctlApi } from "../../../api/control-layer/client";
+import { useDebounce } from "../../../hooks/useDebounce";
+import { toast } from "sonner";
+import type { FileObject } from "../../features/batches/types";
+import { AlertBox } from "@/components/ui/alert-box";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { validateBatchFile, FILE_SIZE_LIMITS } from "../../../utils/files";
+
+import { formatBytes } from "../../../utils/formatters";
+
+const ACCOUNT_DEFAULT_KEY = "__account_default__";
+
+interface CreateBatchModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess?: () => void;
+  preselectedFile?: FileObject;
+  preselectedFileToUpload?: File;
+}
+
+export function CreateBatchModal({
+  isOpen,
+  onClose,
+  onSuccess,
+  preselectedFile,
+  preselectedFileToUpload,
+}: CreateBatchModalProps) {
+  const [selectedFileId, setSelectedFileId] = useState<string | null>(
+    preselectedFile?.id || null,
+  );
+  const [fileToUpload, setFileToUpload] = useState<File | null>(
+    preselectedFileToUpload || null,
+  );
+  const [expirationSeconds, setExpirationSeconds] = useState<number>(2592000);
+  const [endpoint, setEndpoint] = useState<string>("/v1/chat/completions");
+  const completionWindow = "24h";
+  const [description, setDescription] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [filename, setFilename] = useState<string>("");
+  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
+  const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
+  const [hasLoadedFiles, setHasLoadedFiles] = useState(false);
+  const [selectedApiKeyId, setSelectedApiKeyId] = useState<string>("");
+
+  const createBatchMutation = useCreateBatch();
+  const uploadMutation = useUploadFileWithProgress();
+
+  const { data: config } = useConfig();
+
+  const { activeOrganizationId, isOrgContext, activeOrganization } =
+    useOrganizationContext();
+  const { data: currentUser } = useUser("current");
+  const { data: apiKeysResponse } = useApiKeys(
+    activeOrganizationId ?? "current",
+    { limit: 100 },
+  );
+
+  const selectableApiKeys = (apiKeysResponse?.data || []).filter(
+    (key) => key.purpose === "realtime" && key.created_by === currentUser?.id,
+  );
+
+  const apiKeyRequired =
+    isOrgContext && activeOrganization?.can_manage_keys === false;
+
+  const { data: filesResponse } = useFiles({
+    purpose: "batch",
+    limit: 20,
+    search: debouncedFileSearch.trim() || undefined,
+    own: true,
+    enabled: isOpen,
+  });
+
+  const availableFiles = filesResponse?.data || [];
+
+  useEffect(() => {
+    if (availableFiles.length > 0 && !hasLoadedFiles) {
+      setHasLoadedFiles(true);
+    }
+  }, [availableFiles.length, hasLoadedFiles]);
+
+  const { data: costEstimate, isLoading: isLoadingCost } = useFileCostEstimate(
+    selectedFileId || undefined,
+    completionWindow,
+  );
+
+
+  const detectEndpointFromJsonl = useCallback((text: string): string => {
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as { url?: string };
+        if (parsed.url) return parsed.url;
+      } catch {
+      }
+    }
+    return "/v1/chat/completions";
+  }, []);
+
+  useEffect(() => {
+    if (!fileToUpload) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result;
+      if (typeof text === "string") {
+        setEndpoint(detectEndpointFromJsonl(text));
+      }
+    };
+    reader.readAsText(fileToUpload);
+  }, [fileToUpload, detectEndpointFromJsonl]);
+
+  useEffect(() => {
+    if (!selectedFileId) return;
+    let cancelled = false;
+    dwctlApi.files
+      .getFileContent(selectedFileId, { limit: 1 })
+      .then(({ content }) => {
+        if (!cancelled) setEndpoint(detectEndpointFromJsonl(content));
+      })
+      .catch(() => {
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFileId, detectEndpointFromJsonl]);
+
+  useEffect(() => {
+    if (preselectedFile) {
+      setSelectedFileId(preselectedFile.id);
+      setFileToUpload(null);
+    }
+  }, [preselectedFile]);
+
+  useEffect(() => {
+    if (preselectedFileToUpload) {
+      setFileToUpload(preselectedFileToUpload);
+      setSelectedFileId(null);
+    }
+  }, [preselectedFileToUpload]);
+
+  const handleUploadProgress = useCallback((percent: number) => {
+    const cappedPercent = Math.min(percent, 95);
+    setUploadProgress(cappedPercent);
+
+    if (cappedPercent >= 95) {
+      setIsProcessing(true);
+    }
+  }, []);
+
+  const handleDrag = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.type === "dragenter" || e.type === "dragover") {
+      setDragActive(true);
+    } else if (e.type === "dragleave") {
+      setDragActive(false);
+    }
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      const droppedFile = e.dataTransfer.files[0];
+      const validation = validateBatchFile(droppedFile);
+      if (validation.isValid) {
+        setFileToUpload(droppedFile);
+        setFilename(droppedFile.name);
+        setSelectedFileId(null);
+        setError(null);
+      } else {
+        setError(validation.error);
+      }
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      const validation = validateBatchFile(file);
+      if (validation.isValid) {
+        setFileToUpload(file);
+        setFilename(file.name);
+        setSelectedFileId(null);
+        setError(null);
+      } else {
+        setError(validation.error);
+      }
+    }
+  };
+
+  const handleRemoveFile = () => {
+    setFileToUpload(null);
+    setSelectedFileId(null);
+    setFilename("");
+  };
+
+  const handleSubmit = async () => {
+    let finalFileId = selectedFileId;
+
+    if (fileToUpload) {
+      setIsUploading(true);
+      setUploadProgress(0);
+      setIsProcessing(false);
+      try {
+        const uploadedFile = await uploadMutation.mutateAsync({
+          data: {
+            file: fileToUpload,
+            purpose: "batch",
+            filename: filename || undefined,
+            expires_after: {
+              anchor: "created_at",
+              seconds: expirationSeconds,
+            },
+          },
+          onProgress: handleUploadProgress,
+        });
+        finalFileId = uploadedFile.id;
+        toast.success(
+          `File "${filename || fileToUpload.name}" uploaded successfully`,
+        );
+      } catch (error) {
+        console.error("Failed to upload file:", error);
+        setError(
+          error instanceof Error
+            ? error.message
+            : "Failed to upload file. Please try again.",
+        );
+        setIsUploading(false);
+        setUploadProgress(0);
+        setIsProcessing(false);
+        return;
+      } finally {
+        setIsUploading(false);
+        setUploadProgress(0);
+        setIsProcessing(false);
+      }
+    }
+
+    if (!finalFileId) {
+      setError("Please select or upload a file");
+      return;
+    }
+
+    try {
+      const metadata: Record<string, string> = {};
+      if (description) {
+        metadata.batch_description = description;
+      }
+
+      await createBatchMutation.mutateAsync({
+        input_file_id: finalFileId,
+        endpoint,
+        completion_window: completionWindow,
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        ...(isOrgContext && selectedApiKeyId
+          ? { api_key_id: selectedApiKeyId }
+          : {}),
+      });
+
+      const fileName =
+        fileToUpload?.name ||
+        availableFiles.find((f) => f.id === finalFileId)?.filename ||
+        "file";
+      toast.success(`Batch created successfully from "${fileName}"`);
+
+      setSelectedFileId(null);
+      setFileToUpload(null);
+      setEndpoint("/v1/chat/completions");
+      setDescription("");
+      setExpirationSeconds(2592000);
+      setFilename("");
+      setSelectedApiKeyId("");
+      setUploadProgress(0);
+      setIsProcessing(false);
+      setError(null);
+      onSuccess?.();
+      onClose();
+    } catch (error) {
+      console.error("Failed to create batch:", error);
+      const message =
+        error instanceof Error ? error.message : "An unexpected error occurred";
+      setError(message);
+    }
+  };
+
+  const handleClose = () => {
+    setSelectedFileId(preselectedFile?.id || null);
+    setFileToUpload(null);
+    setEndpoint("/v1/chat/completions");
+    setDescription("");
+    setExpirationSeconds(2592000);
+    setFilename("");
+    setSelectedApiKeyId("");
+    setUploadProgress(0);
+    setIsProcessing(false);
+    setFileSearchQuery("");
+    setHasLoadedFiles(false);
+    setError(null);
+    onClose();
+  };
+
+  const selectedFile = selectedFileId
+    ? availableFiles.find((f) => f.id === selectedFileId)
+    : null;
+
+  useEffect(() => {
+    if (selectedFile && fileToUpload) {
+      setFileToUpload(null);
+    }
+  }, [selectedFile, fileToUpload]);
+
+  const fileOptions = availableFiles.map((file) => ({
+    value: file.id,
+    label: file.filename,
+  }));
+
+  const isPending = createBatchMutation.isPending || isUploading;
+
+  const isMissingRequiredApiKey = apiKeyRequired && !selectedApiKeyId;
+
+  const isLargeFile =
+    fileToUpload &&
+    fileToUpload.size > FILE_SIZE_LIMITS.LARGE_FILE_WARNING_BYTES;
+
+  return (
+    <Dialog open={isOpen} onOpenChange={handleClose}>
+      <DialogContent className="sm:max-w-lg max-h-[90vh] overflow-hidden flex flex-col">
+        <DialogHeader>
+          <DialogTitle>Create New Batch</DialogTitle>
+          <DialogDescription>
+            Select or upload a{" "}
+            {config?.docs_jsonl_url ? (
+              <a
+                href={config.docs_jsonl_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-600 hover:text-blue-700 hover:underline inline-flex items-center gap-1"
+              >
+                JSONL file
+                <ExternalLink className="w-3 h-3" />
+              </a>
+            ) : (
+              "JSONL file"
+            )}{" "}
+            to create a batch.{" "}
+            <span className="font-semibold text-gray-900">
+              Maximum file size: {FILE_SIZE_LIMITS.MAX_FILE_SIZE_MB}MB
+            </span>
+          </DialogDescription>
+        </DialogHeader>
+
+        <AlertBox variant="error" className="mb-4">
+          {error}
+        </AlertBox>
+
+        <div className="flex-1 overflow-y-auto modal-scrollbar">
+          <div className="space-y-6">
+            { }
+            <div className="space-y-2">
+              <Label>File Selection</Label>
+
+              { }
+              {selectedFile || fileToUpload ? (
+                <div className="bg-gray-50 rounded-lg p-3 space-y-1 relative">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-gray-900 truncate">
+                        {fileToUpload?.name || selectedFile?.filename}
+                      </p>
+                      <div className="flex gap-4 text-xs text-gray-600">
+                        {fileToUpload ? (
+                          <>
+                            <span>Size: {formatBytes(fileToUpload.size)}</span>
+                            <span className="text-blue-600">
+                              {isUploading ? "Uploading..." : "Ready to upload"}
+                            </span>
+                          </>
+                        ) : (
+                          selectedFile && (
+                            <>
+                              <span>
+                                Size: {formatBytes(selectedFile.bytes)}
+                              </span>
+                              <span>ID: {selectedFile.id}</span>
+                            </>
+                          )
+                        )}
+                      </div>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleRemoveFile}
+                      className="h-8 w-8 p-0 text-gray-500 hover:text-red-600 hover:bg-red-50 shrink-0"
+                      disabled={isPending}
+                    >
+                      <X className="w-4 h-4" />
+                    </Button>
+                  </div>
+                  { }
+                  {isUploading && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-gray-600">
+                          {isProcessing
+                            ? "Processing on server..."
+                            : "Uploading..."}
+                        </span>
+                        {!isProcessing && (
+                          <span className="text-gray-900 font-medium">
+                            {uploadProgress}%
+                          </span>
+                        )}
+                      </div>
+                      <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-150 ease-out bg-blue-600"
+                          style={{
+                            width: `${uploadProgress}%`,
+                            ...(isProcessing && {
+                              animation: "gentlePulse 3s ease-in-out infinite",
+                            }),
+                          }}
+                        />
+                      </div>
+                      {isProcessing && (
+                        <p className="text-xs text-gray-600 text-center">
+                          Upload complete. Server is processing the file...
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <>
+                  { }
+                  {(availableFiles.length > 0 || hasLoadedFiles) && (
+                    <div className="space-y-2">
+                      <Combobox
+                        options={fileOptions}
+                        value={selectedFileId || ""}
+                        onValueChange={(value) => {
+                          setSelectedFileId(value);
+                          setFileToUpload(null);
+                          setError(null);
+                        }}
+                        onSearchChange={setFileSearchQuery}
+                        placeholder="Select an existing file..."
+                        searchPlaceholder="Search files..."
+                        emptyMessage="No files found."
+                        className="w-full"
+                      />
+                      <p className="text-xs text-gray-500">
+                        Choose from your uploaded batch files
+                      </p>
+                    </div>
+                  )}
+
+                  { }
+                  {(availableFiles.length > 0 || hasLoadedFiles) && (
+                    <div className="relative py-2">
+                      <div className="absolute inset-0 flex items-center">
+                        <span className="w-full border-t" />
+                      </div>
+                      <div className="relative flex justify-center text-xs uppercase">
+                        <span className="bg-white px-2 text-muted-foreground">
+                          Or
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  { }
+                  <div
+                    className={`relative border-2 border-dashed rounded-lg p-6 text-center transition-colors ${
+                      dragActive
+                        ? "border-blue-500 bg-blue-50"
+                        : "border-gray-300 hover:border-gray-400"
+                    }`}
+                    onDragEnter={handleDrag}
+                    onDragLeave={handleDrag}
+                    onDragOver={handleDrag}
+                    onDrop={handleDrop}
+                  >
+                    <input
+                      type="file"
+                      id="file-upload-batch"
+                      accept=".jsonl"
+                      onChange={handleFileChange}
+                      className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                      disabled={isPending}
+                    />
+
+                    <div className="space-y-2 pointer-events-none">
+                      <Upload className="w-10 h-10 mx-auto text-gray-400" />
+                      <div>
+                        <p className="font-medium text-gray-700 text-sm">
+                          Drop a .jsonl file here
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          or click to browse
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            { }
+            {isLargeFile && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+                <div className="flex gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                  <div className="text-sm text-amber-800">
+                    <p className="font-medium mb-1">Large File Detected</p>
+                    <p className="text-amber-700">
+                      This file is over {FILE_SIZE_LIMITS.LARGE_FILE_WARNING_MB}
+                      MB. Large files may take a while to upload depending on
+                      your connection speed. Please be patient and keep this
+                      window open until the upload completes.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            { }
+            {fileToUpload && (
+              <div className="space-y-2">
+                <Label htmlFor="filename">
+                  New filename <span className="text-gray-400">(optional)</span>
+                </Label>
+                <Input
+                  id="filename"
+                  value={filename}
+                  onChange={(e) => setFilename(e.target.value)}
+                  placeholder={fileToUpload.name}
+                  disabled={isPending}
+                />
+              </div>
+            )}
+
+            { }
+            <div className="space-y-2">
+              <Label htmlFor="description">
+                Description <span className="text-gray-400">(optional)</span>
+              </Label>
+              <Input
+                id="description"
+                placeholder="e.g., Data generation task"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !isPending &&
+                    !isMissingRequiredApiKey &&
+                    (selectedFileId || fileToUpload)
+                  ) {
+                    e.preventDefault();
+                    handleSubmit();
+                  }
+                }}
+                maxLength={512}
+                disabled={isPending}
+              />
+              <p className="text-xs text-gray-500">
+                Add a description to help identify this batch later
+              </p>
+            </div>
+
+            { }
+            {isOrgContext && (
+              <div className="space-y-2">
+                <Label htmlFor="bill-to-api-key">
+                  Bill to API key{" "}
+                  {!apiKeyRequired && (
+                    <span className="text-gray-400">(optional)</span>
+                  )}
+                </Label>
+                <Select
+                  value={
+                    selectedApiKeyId ||
+                    (apiKeyRequired ? "" : ACCOUNT_DEFAULT_KEY)
+                  }
+                  onValueChange={(value) => {
+                    setSelectedApiKeyId(
+                      value === ACCOUNT_DEFAULT_KEY ? "" : value,
+                    );
+                    setError(null);
+                  }}
+                  disabled={isPending}
+                >
+                  <SelectTrigger
+                    id="bill-to-api-key"
+                    className="w-full"
+                    aria-label="Bill to API key"
+                  >
+                    <SelectValue placeholder="Select an API key..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {!apiKeyRequired && (
+                      <SelectItem value={ACCOUNT_DEFAULT_KEY}>
+                        Account default
+                      </SelectItem>
+                    )}
+                    {selectableApiKeys.map((key) => (
+                      <SelectItem key={key.id} value={key.id}>
+                        {key.name}
+                        {key.spend_limit != null && (
+                          <span className="text-xs text-gray-500 ml-2">
+                            {formatCredits(key.spend)} of{" "}
+                            {formatCredits(key.spend_limit)} used
+                          </span>
+                        )}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-gray-500">
+                  {apiKeyRequired
+                    ? "Your organization requires selecting one of your issued API keys."
+                    : "Spend is attributed to the selected key and its holder; the account default bills the batch to you."}
+                </p>
+              </div>
+            )}
+
+            { }
+            {(selectedFileId || fileToUpload) && (
+              <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-medium text-gray-900">
+                      Cost Estimate
+                    </p>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info className="w-3.5 h-3.5 text-gray-400 cursor-help" />
+                      </TooltipTrigger>
+                      <TooltipContent side="top" className="max-w-[250px]">
+                        Based on priority pricing and average output tokens for
+                        the requested model(s). Actual cost may vary.
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
+                  {selectedFileId ? (
+                    isLoadingCost ? (
+                      <div className="flex items-center gap-2 text-sm text-gray-600">
+                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-gray-600"></div>
+                        Calculating...
+                      </div>
+                    ) : costEstimate ? (
+                      <div className="space-y-1.5">
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600">Total Requests:</span>
+                          <span className="font-medium text-gray-900">
+                            {costEstimate.total_requests.toLocaleString()}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-gray-600">Estimated Cost:</span>
+                          <span className="font-semibold text-gray-900">
+                            $
+                            {parseFloat(
+                              costEstimate.total_estimated_cost,
+                            ).toFixed(4)}
+                          </span>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500">
+                        Cost estimate unavailable
+                      </p>
+                    )
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!fileToUpload || isPending) return;
+                        setIsUploading(true);
+                        setUploadProgress(0);
+                        setIsProcessing(false);
+                        try {
+                          const uploadedFile = await uploadMutation.mutateAsync(
+                            {
+                              data: {
+                                file: fileToUpload,
+                                purpose: "batch",
+                                filename: filename || undefined,
+                                expires_after: {
+                                  anchor: "created_at",
+                                  seconds: expirationSeconds,
+                                },
+                              },
+                              onProgress: handleUploadProgress,
+                            },
+                          );
+                          setSelectedFileId(uploadedFile.id);
+                          toast.success(
+                            `File "${filename || fileToUpload.name}" uploaded successfully`,
+                          );
+                        } catch (err) {
+                          console.error("Failed to upload file:", err);
+                          setError(
+                            err instanceof Error
+                              ? err.message
+                              : "Failed to upload file. Please try again.",
+                          );
+                        } finally {
+                          setIsUploading(false);
+                          setUploadProgress(0);
+                          setIsProcessing(false);
+                        }
+                      }}
+                      disabled={isPending}
+                      className={`text-xs text-blue-600 hover:text-blue-700 hover:underline disabled:opacity-50 flex items-center gap-1 ${isPending ? "cursor-not-allowed" : "cursor-pointer"}`}
+                    >
+                      <Upload className="w-3 h-3" />
+                      Complete file upload to generate inference cost estimate
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            { }
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+              <div className="flex gap-2">
+                <AlertCircle className="w-4 h-4 text-blue-600 mt-0.5 shrink-0" />
+                <div className="text-sm text-blue-800">
+                  <p className="font-medium mb-1">Batch Processing</p>
+                  <p className="text-blue-700">
+                    {fileToUpload
+                      ? "The file will be uploaded and the batch will process all requests. "
+                      : "The batch will process all requests in the selected file. "}
+                    You can track progress and download results once completed.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <DialogFooter className="mt-4">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleClose}
+            disabled={isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={handleSubmit}
+            disabled={
+              (!selectedFileId && !fileToUpload) ||
+              isPending ||
+              isMissingRequiredApiKey
+            }
+            className="group"
+          >
+            {isPending ? (
+              <>
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                {isUploading ? "Uploading..." : "Creating..."}
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4 mr-2 transition-transform group-hover:translate-x-px" />
+                Create Batch
+              </>
+            )}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}

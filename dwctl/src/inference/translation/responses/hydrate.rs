@@ -1,0 +1,123 @@
+
+use serde_json::Value;
+
+use crate::inference::response_store::ResponseStore;
+
+use super::types::{Input, Item, MessageContent, MessageItem, ResponsesRequest, ResponsesResponse};
+
+pub enum HydrationError {
+    NotFound(String),
+    Internal(String),
+}
+
+pub async fn hydrate_previous_response(store: &dyn ResponseStore, owner: &str, request_value: &mut Value) -> Result<(), HydrationError> {
+    let mut req: ResponsesRequest =
+        serde_json::from_value(request_value.clone()).map_err(|e| HydrationError::Internal(format!("parsing Responses request: {e}")))?;
+
+    let Some(prev_id) = req.previous_response_id.clone() else {
+        return Ok(());
+    };
+
+    let context = store
+        .get_context(&prev_id, owner)
+        .await
+        .map_err(|e| HydrationError::Internal(format!("reading previous response {prev_id}: {e}")))?
+        .ok_or_else(|| HydrationError::NotFound(prev_id.clone()))?;
+    let mut response = context.response;
+    if let Value::Object(object) = &mut response {
+        super::types::backfill_responses_response_fields(object, &req.model, &prev_id);
+    }
+
+    let prior: ResponsesResponse =
+        serde_json::from_value(response).map_err(|e| HydrationError::Internal(format!("deserialising previous response: {e}")))?;
+
+    let prior_input: Input =
+        serde_json::from_value(context.input).map_err(|e| HydrationError::Internal(format!("deserialising previous input: {e}")))?;
+
+    let into_items = |input| match input {
+        Input::Text(text) => vec![Item::Message(MessageItem {
+            id: None,
+            role: "user".to_string(),
+            content: MessageContent::Text(text),
+            status: None,
+        })],
+        Input::Items(items) => items,
+    };
+    let current_items = into_items(std::mem::replace(&mut req.input, Input::Items(Vec::new())));
+
+    let mut items = into_items(prior_input);
+    items.extend(prior.output);
+    items.extend(current_items);
+    req.input = Input::Items(items);
+
+    *request_value = serde_json::to_value(&req).map_err(|e| HydrationError::Internal(format!("re-serialising hydrated request: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::inference::response_store::{ResponseContext, StoreError};
+
+    struct StaticResponseStore(ResponseContext);
+
+    #[async_trait]
+    impl ResponseStore for StaticResponseStore {
+        async fn store(&self, _response: &Value) -> Result<String, StoreError> {
+            unreachable!("the hydration path only reads from the response store")
+        }
+
+        async fn get_context(&self, _response_id: &str, owner: &str) -> Result<Option<ResponseContext>, StoreError> {
+            assert_eq!(owner, "test-owner");
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrates_output_from_partial_retrieval_shape() {
+        let store = StaticResponseStore(ResponseContext {
+            input: json!("first question"),
+            response: json!({
+                "id": "resp_previous",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-4o",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_previous",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "previous answer",
+                        "annotations": [],
+                        "logprobs": []
+                    }],
+                    "status": "completed"
+                }]
+            }),
+        });
+        let mut request = json!({
+            "model": "gpt-4o",
+            "input": "next question",
+            "previous_response_id": "resp_previous"
+        });
+
+        let result = hydrate_previous_response(&store, "test-owner", &mut request).await;
+        assert!(
+            result.is_ok(),
+            "partial retrieval response should provide enough context to hydrate"
+        );
+
+        let input = request["input"].as_array().expect("hydrated input should be an item array");
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "first question");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "previous answer");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"], "next question");
+    }
+}

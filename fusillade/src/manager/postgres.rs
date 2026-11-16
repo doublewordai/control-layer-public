@@ -1,0 +1,252 @@
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::daemon::{Daemon, DaemonConfig, DaemonMode, LeakConfig, RetentionMaintenanceConfig};
+use crate::http::{HttpClient, ReqwestHttpClient};
+use crate::processor::RequestProcessor;
+
+type PostgresStore<P> = fusillade_arsenal::PostgresRequestManager<P>;
+
+pub struct PostgresDaemon<P, H = ReqwestHttpClient>
+where
+    P: fusillade_arsenal::PoolProvider,
+    H: HttpClient,
+{
+    storage: Arc<PostgresStore<P>>,
+    http_client: Arc<H>,
+    config: DaemonConfig,
+    retention_maintenance: RetentionMaintenanceConfig,
+    leak_config: Option<LeakConfig>,
+    processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
+}
+
+impl From<&DaemonConfig> for fusillade_arsenal::PostgresStorageConfig {
+    fn from(config: &DaemonConfig) -> Self {
+        Self {
+            pending_request_counts_timeout_ms: config.pending_request_counts_timeout_ms,
+            max_concurrent_state_writes: config.max_concurrent_state_writes,
+            batch_metadata_fields: config.batch_metadata_fields.clone(),
+            claim_timeout_ms: config.claim_timeout_ms,
+            processing_timeout_ms: config.processing_timeout_ms,
+            stale_daemon_threshold_ms: config.stale_daemon_threshold_ms,
+            unclaim_batch_size: config.unclaim_batch_size,
+            service_tier_completion_windows_ms: config.service_tier_completion_windows_ms.clone(),
+            default_completion_window_ms: config.default_completion_window_ms,
+            claim_ramp_exponent: config.claim_ramp_exponent,
+            urgency_weight: config.urgency_weight,
+            batch_claim_require_live: config.batch_claim_require_live,
+            background_concurrency_limit: config.background_concurrency_limit,
+            leaks_per_window: config.leaks_per_window,
+            model_filters_keep_per_model: config.model_filters_keep_per_model,
+            model_filters_retention_ms: config.model_filters_retention_ms,
+        }
+    }
+}
+
+impl<P> PostgresDaemon<P, ReqwestHttpClient>
+where
+    P: fusillade_arsenal::PoolProvider,
+{
+    pub fn from_store(storage: Arc<PostgresStore<P>>, config: DaemonConfig) -> Self {
+        let http_client = Arc::new(
+            ReqwestHttpClient::new(
+                Duration::from_millis(config.first_chunk_timeout_ms),
+                Duration::from_millis(config.chunk_timeout_ms),
+                Duration::from_millis(config.body_timeout_ms),
+            )
+            .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms))
+            .with_upload_chunk_bytes(config.upload_chunk_bytes)
+            .with_upload_stall_poll_interval(Duration::from_millis(config.upload_stall_poll_ms)),
+        );
+        Self::new(storage, http_client, config)
+    }
+
+    pub fn from_pools(pools: P, config: DaemonConfig) -> Self {
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into()).with_maintenance_query_timeout(
+                Duration::from_millis(config.claim_query_timeout_ms),
+            ),
+        );
+        Self::from_store(storage, config)
+    }
+
+    pub fn try_from_pools_with_retention(
+        pools: P,
+        config: DaemonConfig,
+        retention: RetentionMaintenanceConfig,
+    ) -> crate::Result<Self> {
+        retention.policy().validate().map_err(|error| {
+            crate::FusilladeError::ValidationError(format!(
+                "invalid retention configuration: {error}"
+            ))
+        })?;
+        let fence_seconds = retention.policy().max_late_writer_seconds;
+        let retention_bounds = retention.policy().batchless_retention_bounds_seconds();
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into())
+                .with_maintenance_query_timeout(Duration::from_millis(
+                    config.claim_query_timeout_ms,
+                ))
+                .with_retained_response_fence_seconds(fence_seconds)
+                .with_retained_response_retention_bounds_seconds(retention_bounds)
+                .with_retry_age_limit(retention.retry_age_limit()),
+        );
+        Ok(Self::from_store(storage, config).with_retention_maintenance(retention))
+    }
+}
+
+impl<P, H> PostgresDaemon<P, H>
+where
+    P: fusillade_arsenal::PoolProvider,
+    H: HttpClient + 'static,
+{
+    pub fn new(storage: Arc<PostgresStore<P>>, http_client: Arc<H>, config: DaemonConfig) -> Self {
+        Self {
+            storage,
+            http_client,
+            config,
+            retention_maintenance: RetentionMaintenanceConfig::default(),
+            leak_config: None,
+            processor: OnceLock::new(),
+        }
+    }
+
+    pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
+        self.retention_maintenance = config;
+        self
+    }
+
+    pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
+        self.leak_config = Some(config);
+        self
+    }
+
+    pub fn with_processor(self, processor: Arc<dyn RequestProcessor<PostgresStore<P>, H>>) -> Self {
+        let _ = self.processor.set(processor);
+        self
+    }
+
+    pub fn set_processor(
+        &self,
+        processor: Arc<dyn RequestProcessor<PostgresStore<P>, H>>,
+    ) -> std::result::Result<(), &'static str> {
+        self.processor
+            .set(processor)
+            .map_err(|_| "processor already set")
+    }
+
+    pub fn set_response_transformer(
+        &self,
+        transformer: Arc<dyn crate::transform::ResponseTransformer>,
+    ) -> std::result::Result<(), &'static str> {
+        self.storage
+            .set_response_transformer(Arc::new(ResponseTransformerAdapter(transformer)))
+    }
+
+    pub fn storage(&self) -> &Arc<PostgresStore<P>> {
+        &self.storage
+    }
+
+    pub fn http_client(&self) -> &Arc<H> {
+        &self.http_client
+    }
+
+    pub fn config(&self) -> &DaemonConfig {
+        &self.config
+    }
+
+    pub fn processor(&self) -> Option<&Arc<dyn RequestProcessor<PostgresStore<P>, H>>> {
+        self.processor.get()
+    }
+
+    pub fn run(
+        self: Arc<Self>,
+        shutdown_token: CancellationToken,
+    ) -> crate::Result<JoinHandle<crate::Result<()>>> {
+        let mode = self.config.mode;
+        self.run_with_mode(shutdown_token, mode)
+    }
+
+    pub fn run_with_mode(
+        self: Arc<Self>,
+        shutdown_token: CancellationToken,
+        mode: DaemonMode,
+    ) -> crate::Result<JoinHandle<crate::Result<()>>> {
+        tracing::info!(?mode, "Starting PostgreSQL scheduling daemon");
+
+        let mut daemon = Daemon::new(
+            self.storage.clone(),
+            self.http_client.clone(),
+            self.config.clone(),
+            shutdown_token,
+        )
+        .with_retention_maintenance(self.retention_maintenance.clone());
+        if let Some(config) = &self.leak_config {
+            daemon = daemon.with_leak_config(config.clone());
+        }
+        if let Some(processor) = self.processor.get().cloned() {
+            daemon = daemon.with_processor(processor);
+        }
+        if mode != DaemonMode::RequestOnly
+            && !self
+                .retention_maintenance
+                .policy()
+                .batchless_seconds_by_service_tier
+                .is_empty()
+            && self.storage.retained_response_fence_seconds()
+                != self.retention_maintenance.policy().max_late_writer_seconds
+        {
+            return Err(crate::FusilladeError::ValidationError(
+                "PostgreSQL late-writer fence does not match retained-response policy".to_string(),
+            ));
+        }
+        let daemon = Arc::new(daemon);
+        daemon.validate_startup(mode)?;
+
+        let handle = tokio::spawn(async move { daemon.run_with_mode(mode).await });
+
+        tracing::info!("PostgreSQL scheduling daemon spawned successfully");
+
+        Ok(handle)
+    }
+}
+
+#[async_trait]
+impl<P, H> super::DaemonExecutor<H> for PostgresDaemon<P, H>
+where
+    P: fusillade_arsenal::PoolProvider,
+    H: HttpClient + 'static,
+{
+    fn http_client(&self) -> &Arc<H> {
+        self.http_client()
+    }
+
+    fn config(&self) -> &DaemonConfig {
+        self.config()
+    }
+
+    fn run_with_mode(
+        self: Arc<Self>,
+        shutdown_token: CancellationToken,
+        mode: DaemonMode,
+    ) -> crate::Result<JoinHandle<crate::Result<()>>> {
+        PostgresDaemon::run_with_mode(self, shutdown_token, mode)
+    }
+}
+
+struct ResponseTransformerAdapter(Arc<dyn crate::transform::ResponseTransformer>);
+
+#[async_trait]
+impl fusillade_arsenal::ResponseTransformer for ResponseTransformerAdapter {
+    async fn transform(
+        &self,
+        request: &crate::request::RequestData,
+        body: &str,
+    ) -> crate::Result<String> {
+        self.0.transform(request, body).await
+    }
+}

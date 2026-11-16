@@ -1,0 +1,4853 @@
+
+use crate::api::models::deployments::{ModelSortField, SortDirection};
+use crate::db::handlers::model_provisioning::classes::{lock_model_names, validate_model_name};
+use crate::db::models::api_keys::ApiKeyPurpose;
+use crate::db::{
+    errors::{DbError, Result},
+    handlers::repository::Repository,
+    models::deployments::{
+        AffinityConfig, AimdConfig, DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse,
+        DeploymentCreateDBRequest, DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType,
+        ProviderPricing, ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
+    },
+};
+use crate::reasoning::{ModelReasoningPolicy, resolve_reasoning_translation};
+use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
+use sqlx::{Connection, FromRow, PgConnection, Row, query_builder::QueryBuilder};
+use std::collections::HashMap;
+use tracing::instrument;
+
+#[derive(Debug, Default)]
+pub struct BatchModelInfo {
+    pub throughputs: HashMap<String, f32>,
+    pub allowed_windows: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeploymentFilter {
+    pub skip: i64,
+    pub limit: i64,
+    pub endpoint_id: Option<InferenceEndpointId>,
+    pub statuses: Option<Vec<ModelStatus>>,
+    pub deleted: Option<bool>,
+    pub accessible_to: Option<UserId>,
+    pub group_ids: Option<Vec<crate::types::GroupId>>,
+    pub aliases: Option<Vec<String>>,
+    pub search: Option<String>,
+    pub is_composite: Option<bool>,
+    pub provider: Option<String>,
+    pub model_type: Option<ModelType>,
+    pub capability: Option<String>,
+    pub available_for_realtime: Option<bool>,
+    pub pricing_account: Option<UserId>,
+    pub sort_field: Option<ModelSortField>,
+    pub sort_direction: Option<SortDirection>,
+}
+
+impl DeploymentFilter {
+    pub fn new(skip: i64, limit: i64) -> Self {
+        Self {
+            skip,
+            limit,
+            endpoint_id: None,
+            statuses: None,
+            deleted: None,
+            accessible_to: None,
+            group_ids: None,
+            aliases: None,
+            search: None,
+            is_composite: None,
+            provider: None,
+            model_type: None,
+            capability: None,
+            available_for_realtime: None,
+            pricing_account: None,
+            sort_field: None,
+            sort_direction: None,
+        }
+    }
+
+    pub fn with_endpoint(mut self, endpoint_id: InferenceEndpointId) -> Self {
+        self.endpoint_id = Some(endpoint_id);
+        self
+    }
+
+    pub fn with_deleted(mut self, deleted: bool) -> Self {
+        self.deleted = Some(deleted);
+        self
+    }
+
+    pub fn with_accessible_to(mut self, user_id: UserId) -> Self {
+        self.accessible_to = Some(user_id);
+        self
+    }
+
+    pub fn with_groups(mut self, group_ids: Vec<crate::types::GroupId>) -> Self {
+        self.group_ids = Some(group_ids);
+        self
+    }
+
+    pub fn with_statuses(mut self, statuses: Vec<ModelStatus>) -> Self {
+        self.statuses = Some(statuses);
+        self
+    }
+
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = Some(aliases);
+        self
+    }
+
+    pub fn with_search(mut self, search: String) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    pub fn with_composite(mut self, is_composite: bool) -> Self {
+        self.is_composite = Some(is_composite);
+        self
+    }
+
+    pub fn with_provider(mut self, provider: String) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub fn with_model_type(mut self, model_type: ModelType) -> Self {
+        self.model_type = Some(model_type);
+        self
+    }
+
+    pub fn with_capability(mut self, capability: String) -> Self {
+        self.capability = Some(capability);
+        self
+    }
+
+    pub fn with_realtime_availability(mut self, available: bool) -> Self {
+        self.available_for_realtime = Some(available);
+        self
+    }
+
+    pub fn with_sort(mut self, field: ModelSortField, direction: Option<SortDirection>) -> Self {
+        self.sort_field = Some(field);
+        self.sort_direction = direction;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct DeploymentAccessInfo {
+    pub deployment_id: DeploymentId,
+    pub deployment_alias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+struct DeployedModel {
+    pub id: DeploymentId,
+    pub model_name: String,
+    pub alias: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub r#type: Option<String>,
+    pub capabilities: Option<Vec<String>>,
+    pub created_by: UserId,
+    pub hosted_on: Option<InferenceEndpointId>,
+    pub status: String,
+    pub last_sync: Option<DateTime<Utc>>,
+    pub deleted: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub realtime_inflight_limit: i32,
+    pub batch_capacity: Option<i32>,
+    pub throughput: Option<f32>,
+    pub downstream_pricing_mode: Option<String>,
+    pub downstream_input_price_per_token: Option<Decimal>,
+    pub downstream_output_price_per_token: Option<Decimal>,
+    pub downstream_hourly_rate: Option<Decimal>,
+    pub downstream_input_token_cost_ratio: Option<Decimal>,
+    pub is_composite: bool,
+    pub lb_strategy: Option<String>,
+    pub fallback_enabled: Option<bool>,
+    pub fallback_on_rate_limit: Option<bool>,
+    pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Vec<i32>,
+    pub fallback_with_replacement: Option<bool>,
+    pub fallback_max_attempts: Option<i32>,
+    pub backoff_enabled: bool,
+    pub backoff_initial_ms: i32,
+    pub backoff_max_ms: i32,
+    pub backoff_factor: f64,
+    pub backoff_jitter: String,
+    pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<Json<AimdConfig>>,
+    pub affinity: Option<Json<AffinityConfig>>,
+    pub sanitize_responses: bool,
+    pub trusted: bool,
+    pub reasoning_translation_overrides: Option<serde_json::Value>,
+    pub allowed_batch_completion_windows: Option<Vec<String>>,
+    pub metadata: serde_json::Value,
+    pub provisioning_source: Option<String>,
+}
+
+pub struct Deployments<'c> {
+    db: &'c mut PgConnection,
+}
+
+impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
+    fn from((model_type, m): (Option<ModelType>, DeployedModel)) -> Self {
+        let provider_pricing = ProviderPricing::from_flat_fields(ProviderPricingFields {
+            mode: m.downstream_pricing_mode,
+            input_price_per_token: m.downstream_input_price_per_token,
+            output_price_per_token: m.downstream_output_price_per_token,
+            hourly_rate: m.downstream_hourly_rate,
+            input_token_cost_ratio: m.downstream_input_token_cost_ratio,
+        });
+
+        let lb_strategy = m
+            .lb_strategy
+            .as_deref()
+            .and_then(LoadBalancingStrategy::try_parse)
+            .unwrap_or_default();
+
+        Self {
+            id: m.id,
+            model_name: m.model_name,
+            alias: m.alias,
+            display_name: m.display_name,
+            description: m.description,
+            model_type,
+            capabilities: m.capabilities,
+            created_by: m.created_by,
+            hosted_on: m.hosted_on,
+            status: ModelStatus::from_db_string(&m.status),
+            last_sync: m.last_sync,
+            deleted: m.deleted,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            realtime_inflight_limit: m.realtime_inflight_limit,
+            batch_capacity: m.batch_capacity,
+            throughput: m.throughput,
+            provider_pricing,
+            is_composite: m.is_composite,
+            lb_strategy,
+            fallback_enabled: m.fallback_enabled.unwrap_or(true),
+            fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: m.fallback_realtime_on_status,
+            fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
+            fallback_max_attempts: m.fallback_max_attempts,
+            backoff_enabled: m.backoff_enabled,
+            backoff_initial_ms: m.backoff_initial_ms,
+            backoff_max_ms: m.backoff_max_ms,
+            backoff_factor: m.backoff_factor,
+            backoff_jitter: m.backoff_jitter,
+            backoff_max_total_ms: m.backoff_max_total_ms,
+            first_token_timeout_ms: m.first_token_timeout_ms,
+            aimd: m.aimd.map(|v| v.0),
+            affinity: m.affinity.map(|v| v.0),
+            sanitize_responses: m.sanitize_responses,
+            trusted: m.trusted,
+            reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
+                serde_json::from_value(value)
+                    .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
+                    .ok()
+            }),
+            allowed_batch_completion_windows: m.allowed_batch_completion_windows,
+            metadata: m.metadata,
+            provisioning_source: m.provisioning_source,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<'c> Repository for Deployments<'c> {
+    type CreateRequest = DeploymentCreateDBRequest;
+    type UpdateRequest = DeploymentUpdateDBRequest;
+    type Response = DeploymentDBResponse;
+    type Created = DeploymentDBResponse;
+    type Id = DeploymentId;
+    type Filter = DeploymentFilter;
+
+    #[instrument(level = "debug", skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
+    async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Created> {
+        let mut tx = self.db.begin().await?;
+        lock_model_names(&mut tx).await?;
+        validate_model_name(&mut tx, None, request.alias.trim()).await?;
+        let created_at = Utc::now();
+        let updated_at = created_at;
+
+        let model_name = request.model_name.trim();
+        let alias = request.alias.trim();
+        if model_name.is_empty() {
+            return Err(DbError::InvalidModelField { field: "model_name" });
+        }
+        if alias.is_empty() {
+            return Err(DbError::InvalidModelField { field: "alias" });
+        }
+
+        let model_type_str = request.model_type.as_ref().map(|t| match t {
+            ModelType::Chat => "CHAT",
+            ModelType::Embeddings => "EMBEDDINGS",
+            ModelType::Reranker => "RERANKER",
+        });
+
+        let pricing_fields = request.provider_pricing.as_ref().map(|p| p.to_flat_fields()).unwrap_or_default();
+
+        let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+
+        let model = sqlx::query_as::<_, DeployedModel>(
+            r#"
+            INSERT INTO deployed_models (
+                model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
+                batch_capacity, throughput,
+                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,
+                downstream_hourly_rate, downstream_input_token_cost_ratio,
+                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
+                fallback_with_replacement, fallback_max_attempts,
+                sanitize_responses, trusted, allowed_batch_completion_windows,
+                metadata,
+                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
+                reasoning_translation_overrides, first_token_timeout_ms, aimd, fallback_realtime_on_status, affinity
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, COALESCE($38, '{}'), $39)
+            RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
+            "#,
+        )
+        .bind(request.model_name.trim())
+        .bind(request.alias.trim())
+        .bind(request.display_name.as_deref())
+        .bind(request.description.as_deref())
+        .bind(model_type_str)
+        .bind(request.capabilities.as_deref())
+        .bind(request.created_by)
+        .bind(request.hosted_on)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(request.batch_capacity)
+        .bind(request.throughput)
+        .bind(pricing_fields.mode)
+        .bind(pricing_fields.input_price_per_token)
+        .bind(pricing_fields.output_price_per_token)
+        .bind(pricing_fields.hourly_rate)
+        .bind(pricing_fields.input_token_cost_ratio)
+        .bind(request.is_composite)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts)
+        .bind(request.sanitize_responses)
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.as_deref())
+        .bind(
+            request
+                .metadata
+                .as_ref()
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_str())
+        .bind(request.backoff_max_total_ms)
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms)
+        .bind(request.aimd.as_ref().map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
+        .bind(request.affinity.as_ref().map(Json))
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let mut model = model;
+        if let Some(limit) = request.realtime_inflight_limit {
+            sqlx::query("UPDATE deployed_models SET realtime_inflight_limit = $1 WHERE id = $2")
+                .bind(limit)
+                .bind(model.id)
+                .execute(&mut *tx)
+                .await?;
+            model.realtime_inflight_limit = limit;
+        }
+
+        let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
+            "CHAT" => Some(ModelType::Chat),
+            "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
+            _ => None,
+        });
+
+        tx.commit().await?;
+        Ok(DeploymentDBResponse::from((model_type, model)))
+    }
+
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
+        let model = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
+        )
+            .bind(id)
+            .fetch_optional(&mut *self.db)
+            .await?;
+
+        let model_type = model.as_ref().and_then(|m| {
+            m.r#type.as_ref().and_then(|s| match s.as_str() {
+                "CHAT" => Some(ModelType::Chat),
+                "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
+                _ => None,
+            })
+        });
+
+        Ok(model.map(|m| DeploymentDBResponse::from((model_type, m))))
+    }
+
+    #[instrument(level = "debug", skip(self, ids), fields(count = ids.len()), err)]
+    async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<std::collections::HashMap<Self::Id, DeploymentDBResponse>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let deployments = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, realtime_inflight_limit, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
+        )
+            .bind(ids.as_slice())
+            .fetch_all(&mut *self.db)
+            .await?;
+
+        let mut result = std::collections::HashMap::new();
+
+        for deployment in deployments {
+            let model_type = deployment.r#type.as_ref().and_then(|s| match s.as_str() {
+                "CHAT" => Some(ModelType::Chat),
+                "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
+                _ => None,
+            });
+            result.insert(deployment.id, DeploymentDBResponse::from((model_type, deployment)));
+        }
+
+        Ok(result)
+    }
+
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    async fn delete(&mut self, id: Self::Id) -> Result<bool> {
+        let result = sqlx::query!("DELETE FROM deployed_models WHERE id = $1", id)
+            .execute(&mut *self.db)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[instrument(level = "debug", skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
+    async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        let mut tx = self.db.begin().await?;
+        if let Some(alias) = &request.alias {
+            lock_model_names(&mut tx).await?;
+            validate_model_name(&mut tx, Some(id), alias.trim()).await?;
+        }
+        if let Some(model_name) = &request.model_name
+            && model_name.trim().is_empty()
+        {
+            return Err(DbError::InvalidModelField { field: "model_name" });
+        }
+        if let Some(alias) = &request.alias
+            && alias.trim().is_empty()
+        {
+            return Err(DbError::InvalidModelField { field: "alias" });
+        }
+
+        let model_type_str: Option<&str> = request.model_type.as_ref().and_then(|inner| {
+            inner.as_ref().map(|t| match t {
+                ModelType::Chat => "CHAT",
+                ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
+            })
+        });
+
+        let status_str: Option<String> = request.status.as_ref().map(|s| s.to_db_string().to_string());
+
+        let capabilities_slice: Option<&[String]> = request.capabilities.as_ref().and_then(|inner| inner.as_ref().map(|v| v.as_slice()));
+
+        let pricing_params = request.provider_pricing.as_ref().map(|p| p.to_update_params()).unwrap_or_default();
+
+        let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+
+        let model = sqlx::query_as::<_, DeployedModel>(
+            r#"
+        UPDATE deployed_models SET
+            model_name   = COALESCE($2, model_name),
+            alias        = COALESCE($3, alias),
+            description  = CASE
+                WHEN $4 THEN $5
+                ELSE description
+            END,
+
+            -- Three-state update for model_type
+            type = CASE
+                WHEN $6 THEN $7
+                ELSE type
+            END,
+
+            -- Three-state update for capabilities
+            capabilities = CASE
+                WHEN $8 THEN $9
+                ELSE capabilities
+            END,
+
+            status     = COALESCE($10, status),
+            last_sync  = CASE
+                WHEN $11 THEN $12
+                ELSE last_sync
+            END,
+            deleted    = COALESCE($13, deleted),
+
+            realtime_inflight_limit = COALESCE($14, realtime_inflight_limit),
+            batch_capacity = CASE
+                WHEN $15 THEN $16
+                ELSE batch_capacity
+            END,
+
+            -- Three-state update for throughput
+            throughput = CASE
+                WHEN $32 THEN $33
+                ELSE throughput
+            END,
+
+            -- Individual field updates for provider/downstream pricing
+            downstream_pricing_mode = CASE
+                WHEN $17 THEN $18
+                ELSE downstream_pricing_mode
+            END,
+            downstream_input_price_per_token = CASE
+                WHEN $19 THEN $20
+                ELSE downstream_input_price_per_token
+            END,
+            downstream_output_price_per_token = CASE
+                WHEN $21 THEN $22
+                ELSE downstream_output_price_per_token
+            END,
+            downstream_hourly_rate = CASE
+                WHEN $23 THEN $24
+                ELSE downstream_hourly_rate
+            END,
+            downstream_input_token_cost_ratio = CASE
+                WHEN $25 THEN $26
+                ELSE downstream_input_token_cost_ratio
+            END,
+
+            -- Composite model fields
+            lb_strategy = COALESCE($27, lb_strategy),
+            fallback_enabled = COALESCE($28, fallback_enabled),
+            fallback_on_rate_limit = COALESCE($29, fallback_on_rate_limit),
+            fallback_on_status = COALESCE($30, fallback_on_status),
+            sanitize_responses = COALESCE($31, sanitize_responses),
+            fallback_with_replacement = COALESCE($34, fallback_with_replacement),
+            fallback_max_attempts = CASE
+                WHEN $35 THEN $36
+                ELSE fallback_max_attempts
+            END,
+            trusted = COALESCE($37, trusted),
+
+            -- Batch completion windows
+            allowed_batch_completion_windows = CASE
+                WHEN $38 THEN $39
+                ELSE allowed_batch_completion_windows
+            END,
+
+            -- Catalog metadata
+            metadata = CASE
+                WHEN $40 THEN $41
+                ELSE metadata
+            END,
+
+            display_name = COALESCE($42, display_name),
+
+            -- Inter-attempt backoff
+            backoff_enabled = COALESCE($43, backoff_enabled),
+            backoff_initial_ms = COALESCE($44, backoff_initial_ms),
+            backoff_max_ms = COALESCE($45, backoff_max_ms),
+            backoff_factor = COALESCE($46, backoff_factor),
+            backoff_jitter = COALESCE($47, backoff_jitter),
+            backoff_max_total_ms = CASE
+                WHEN $48 THEN $49
+                ELSE backoff_max_total_ms
+            END,
+
+            reasoning_translation_overrides = CASE
+                WHEN $50 THEN $51
+                ELSE reasoning_translation_overrides
+            END,
+
+            first_token_timeout_ms = CASE WHEN $52 THEN $53 ELSE first_token_timeout_ms END,
+            aimd = CASE WHEN $54 THEN $55 ELSE aimd END,
+            fallback_realtime_on_status = COALESCE($56, fallback_realtime_on_status),
+            affinity = CASE WHEN $57 THEN $58 ELSE affinity END,
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, realtime_inflight_limit,
+                batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, affinity, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
+        "#,
+        )
+        .bind(id)
+        .bind(request.model_name.as_deref().map(str::trim))
+        .bind(request.alias.as_deref().map(str::trim))
+        .bind(request.description.is_some())
+        .bind(request.description.as_ref().and_then(Option::as_deref))
+        .bind(request.model_type.is_some())
+        .bind(model_type_str)
+        .bind(request.capabilities.is_some())
+        .bind(capabilities_slice)
+        .bind(status_str.as_deref())
+        .bind(request.last_sync.is_some())
+        .bind(request.last_sync.as_ref().and_then(Option::as_ref))
+        .bind(request.deleted)
+        .bind(request.realtime_inflight_limit)
+        .bind(request.batch_capacity.is_some())
+        .bind(request.batch_capacity.as_ref().and_then(Option::as_ref))
+        .bind(pricing_params.should_update_mode)
+        .bind(pricing_params.mode.as_deref())
+        .bind(pricing_params.should_update_input)
+        .bind(pricing_params.input)
+        .bind(pricing_params.should_update_output)
+        .bind(pricing_params.output)
+        .bind(pricing_params.should_update_hourly)
+        .bind(pricing_params.hourly)
+        .bind(pricing_params.should_update_ratio)
+        .bind(pricing_params.ratio)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.sanitize_responses)
+        .bind(request.throughput.is_some())
+        .bind(request.throughput.as_ref().and_then(Option::as_ref))
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts.is_some())
+        .bind(request.fallback_max_attempts.as_ref().and_then(Option::as_ref))
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.is_some())
+        .bind(request.allowed_batch_completion_windows.as_ref().and_then(Option::as_deref))
+        .bind(request.metadata.is_some())
+        .bind(
+            request
+                .metadata
+                .as_ref()
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .bind(request.display_name.as_deref())
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_deref())
+        .bind(request.backoff_max_total_ms.is_some())
+        .bind(request.backoff_max_total_ms.as_ref().and_then(Option::as_ref))
+        .bind(request.reasoning_translation_overrides.is_some())
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms.is_some())
+        .bind(request.first_token_timeout_ms.flatten())
+        .bind(request.aimd.is_some())
+        .bind(request.aimd.as_ref().and_then(Option::as_ref).map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
+        .bind(request.affinity.is_some())
+        .bind(request.affinity.as_ref().and_then(Option::as_ref).map(Json))
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let model_type = model.r#type.as_deref().and_then(|s| match s {
+            "CHAT" => Some(ModelType::Chat),
+            "EMBEDDINGS" => Some(ModelType::Embeddings),
+            "RERANKER" => Some(ModelType::Reranker),
+            _ => None,
+        });
+
+        tx.commit().await?;
+        Ok(DeploymentDBResponse::from((model_type, model)))
+    }
+
+    #[instrument(level = "debug", skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
+    async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
+        let mut query = QueryBuilder::new(
+            "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
+                dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.realtime_inflight_limit,
+                dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_realtime_on_status, dm.fallback_with_replacement,
+                dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
+                dm.backoff_jitter, dm.backoff_max_total_ms, dm.first_token_timeout_ms, dm.aimd, dm.affinity, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+             FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
+
+        Self::apply_filters(&mut query, filter);
+
+        let (sort_expr, default_dir) = match filter.sort_field {
+            Some(ModelSortField::Alias) => ("dm.alias", "ASC"),
+            Some(ModelSortField::IntelligenceIndex) => ("(dm.metadata->>'intelligence_index')::float8", "DESC"),
+            Some(ModelSortField::ReleasedAt) => ("(dm.metadata->>'released_at')::date", "DESC"),
+            Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
+            Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
+            Some(ModelSortField::PriceFrom) => (
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND mt.serving_class IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
+                "ASC",
+            ),
+            Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
+        };
+        let direction = match filter.sort_direction {
+            Some(SortDirection::Asc) => "ASC",
+            Some(SortDirection::Desc) => "DESC",
+            None => default_dir,
+        };
+        let nulls_clause =
+            if filter.sort_field.is_some() && !matches!(filter.sort_field, Some(ModelSortField::CreatedAt) | Some(ModelSortField::Alias)) {
+                " NULLS LAST"
+            } else {
+                ""
+            };
+        if matches!(filter.sort_field, Some(ModelSortField::PriceFrom)) && filter.pricing_account.is_some() {
+            query.push(" ORDER BY (WITH selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM model_tariffs WHERE deployed_model_id = dm.id AND (user_id IS NULL OR user_id = ");
+            query.push_bind(filter.pricing_account);
+            query.push(") AND serving_class IS NULL AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IN ('realtime','batch','playground')) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN LATERAL effective_model_display_tariff(dm.id, ");
+            query.push_bind(filter.pricing_account);
+            query.push(", s.api_key_purpose, s.completion_window, NOW()) t)");
+            query.push(format!(" {direction} NULLS LAST, dm.id LIMIT "));
+        } else {
+            query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        }
+        query.push_bind(filter.limit);
+        query.push(" OFFSET ");
+        query.push_bind(filter.skip);
+
+        let models = query.build_query_as::<DeployedModel>().fetch_all(&mut *self.db).await?;
+
+        Ok(models
+            .into_iter()
+            .map(|m| {
+                let model_type = m.r#type.as_ref().and_then(|s| match s.as_str() {
+                    "CHAT" => Some(ModelType::Chat),
+                    "EMBEDDINGS" => Some(ModelType::Embeddings),
+                    "RERANKER" => Some(ModelType::Reranker),
+                    _ => None,
+                });
+
+                DeploymentDBResponse::from((model_type, m))
+            })
+            .collect())
+    }
+}
+
+impl<'c> Deployments<'c> {
+    pub fn new(db: &'c mut PgConnection) -> Self {
+        Self { db }
+    }
+
+    fn apply_filters<'a>(query: &mut QueryBuilder<'a, sqlx::Postgres>, filter: &'a DeploymentFilter) {
+        if let Some(endpoint_id) = filter.endpoint_id {
+            query.push(" AND dm.hosted_on = ");
+            query.push_bind(endpoint_id);
+        }
+
+        if let Some(ref statuses) = filter.statuses {
+            let status_strings: Vec<String> = statuses.iter().map(|s| s.to_db_string().to_string()).collect();
+            query.push(" AND dm.status = ANY(");
+            query.push_bind(status_strings);
+            query.push(")");
+        }
+
+        if let Some(deleted) = filter.deleted {
+            query.push(" AND dm.deleted = ");
+            query.push_bind(deleted);
+        }
+
+        if let Some(ref aliases) = filter.aliases
+            && !aliases.is_empty()
+        {
+            query.push(" AND dm.alias = ANY(");
+            query.push_bind(aliases);
+            query.push(")");
+        }
+
+        if let Some(user_id) = filter.accessible_to {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id IN (");
+            query.push("SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = ");
+            query.push_bind(user_id);
+            query.push(" UNION SELECT '00000000-0000-0000-0000-000000000000'::uuid WHERE ");
+            query.push_bind(user_id);
+            query.push(" != '00000000-0000-0000-0000-000000000000'::uuid");
+            query.push("))");
+        }
+
+        if let Some(ref group_ids) = filter.group_ids
+            && !group_ids.is_empty()
+        {
+            query.push(" AND dm.id IN (");
+            query.push("SELECT dg.deployment_id FROM deployment_groups dg WHERE dg.group_id = ANY(");
+            query.push_bind(group_ids);
+            query.push("))");
+        }
+
+        if let Some(ref search) = filter.search {
+            let search_pattern = format!("%{}%", search.to_lowercase());
+            query.push(" AND (LOWER(dm.alias) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.display_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(ie.name) LIKE ");
+            query.push_bind(search_pattern);
+            query.push(")");
+        }
+
+        if let Some(is_composite) = filter.is_composite {
+            query.push(" AND dm.is_composite = ");
+            query.push_bind(is_composite);
+        }
+
+        if let Some(ref provider) = filter.provider {
+            query.push(" AND LOWER(dm.metadata->>'provider') = LOWER(");
+            query.push_bind(provider.clone());
+            query.push(")");
+        }
+
+        if let Some(ref model_type) = filter.model_type {
+            let type_str = match model_type {
+                ModelType::Chat => "CHAT",
+                ModelType::Embeddings => "EMBEDDINGS",
+                ModelType::Reranker => "RERANKER",
+            };
+            query.push(" AND dm.type = ");
+            query.push_bind(type_str.to_string());
+        }
+
+        if let Some(ref capability) = filter.capability {
+            query.push(" AND ");
+            query.push_bind(capability.clone());
+            query.push(" = ANY(dm.capabilities)");
+        }
+
+        if let Some(available_for_realtime) = filter.available_for_realtime {
+            if available_for_realtime {
+                query.push(
+                    " AND NOT EXISTS (
+                        SELECT 1 FROM model_traffic_rules mtr
+                        WHERE mtr.deployed_model_id = dm.id
+                        AND mtr.api_key_purpose = 'realtime'
+                        AND mtr.action = 'deny'
+                    )",
+                );
+            } else {
+                query.push(
+                    " AND EXISTS (
+                        SELECT 1 FROM model_traffic_rules mtr
+                        WHERE mtr.deployed_model_id = dm.id
+                        AND mtr.api_key_purpose = 'realtime'
+                        AND mtr.action = 'deny'
+                    )",
+                );
+            }
+        }
+    }
+
+    pub async fn facets(&mut self, filter: &DeploymentFilter) -> Result<(Vec<String>, Vec<String>, Vec<String>)> {
+        let mut query = QueryBuilder::new(
+            "WITH visible AS (SELECT dm.metadata, dm.capabilities, dm.type FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
+
+        let facets_filter = DeploymentFilter {
+            skip: 0,
+            limit: i64::MAX,
+            search: None,
+            sort_field: None,
+            sort_direction: None,
+            ..filter.clone()
+        };
+        Self::apply_filters(&mut query, &facets_filter);
+
+        query.push(
+            r#")
+            SELECT
+                array_agg(DISTINCT metadata->>'provider' ORDER BY metadata->>'provider')
+                    FILTER (WHERE metadata->>'provider' IS NOT NULL),
+                (SELECT array_agg(DISTINCT cap ORDER BY cap)
+                    FROM visible, unnest(capabilities) AS cap),
+                array_agg(DISTINCT type ORDER BY type) FILTER (WHERE type IS NOT NULL)
+            FROM visible"#,
+        );
+
+        let row = query
+            .build_query_as::<(Option<Vec<String>>, Option<Vec<String>>, Option<Vec<String>>)>()
+            .fetch_one(&mut *self.db)
+            .await?;
+
+        Ok((row.0.unwrap_or_default(), row.1.unwrap_or_default(), row.2.unwrap_or_default()))
+    }
+
+    #[instrument(level = "debug", skip(self), fields(deployment_alias = %deployment_alias, user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn check_user_access(&mut self, deployment_alias: &str, user_id: UserId) -> Result<Option<DeploymentAccessInfo>> {
+        let result = sqlx::query_as!(
+            DeploymentAccessInfo,
+            r#"
+            SELECT
+                d.id as deployment_id,
+                d.alias as deployment_alias
+            FROM deployed_models d
+            JOIN deployment_groups dg ON dg.deployment_id = d.id
+            WHERE d.alias = $1
+            AND dg.group_id IN (
+                SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2
+                UNION
+                SELECT '00000000-0000-0000-0000-000000000000'::uuid
+                WHERE $2 != '00000000-0000-0000-0000-000000000000'::uuid
+            )
+            LIMIT 1
+            "#,
+            deployment_alias,
+            user_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result)
+    }
+
+    #[instrument(level = "debug", skip(self, filter), err)]
+    pub async fn count(&mut self, filter: &DeploymentFilter) -> Result<i64> {
+        let mut query =
+            QueryBuilder::new("SELECT COUNT(*) FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
+
+        Self::apply_filters(&mut query, filter);
+
+        let count: (i64,) = query.build_query_as().fetch_one(&mut *self.db).await?;
+        Ok(count.0)
+    }
+
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id), deployed_id = %abbrev_uuid(&request.deployed_model_id)), err)]
+    pub async fn add_component(&mut self, request: &DeploymentComponentCreateDBRequest) -> Result<DeploymentComponentDBResponse> {
+        let result = sqlx::query!(
+            r#"
+            WITH inserted AS (
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, pool, created_at
+            )
+            SELECT
+                inserted.id,
+                inserted.composite_model_id,
+                inserted.deployed_model_id,
+                inserted.weight,
+                inserted.enabled,
+                inserted.sort_order,
+                inserted.pool,
+                inserted.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM inserted
+            JOIN deployed_models dm ON dm.id = inserted.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            "#,
+            request.composite_model_id,
+            request.deployed_model_id,
+            request.weight,
+            request.enabled,
+            request.sort_order,
+            request.pool
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(DeploymentComponentDBResponse {
+            id: result.id,
+            composite_model_id: result.composite_model_id,
+            deployed_model_id: result.deployed_model_id,
+            weight: result.weight,
+            enabled: result.enabled,
+            sort_order: result.sort_order,
+            pool: result.pool,
+            created_at: result.created_at,
+            model_alias: result.model_alias,
+            model_name: result.model_name,
+            model_description: result.model_description,
+            model_type: result.model_type,
+            endpoint_id: result.endpoint_id,
+            endpoint_name: result.endpoint_name,
+            model_trusted: result.model_trusted,
+        })
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn remove_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query!(
+            "DELETE FROM deployed_model_components
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3",
+            composite_model_id,
+            deployed_model_id,
+            pool
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn get_components(&mut self, composite_model_id: DeploymentId) -> Result<Vec<DeploymentComponentDBResponse>> {
+        let results = sqlx::query!(
+            r#"
+            SELECT
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.pool,
+                dmc.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = $1
+            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            "#,
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| DeploymentComponentDBResponse {
+                id: r.id,
+                composite_model_id: r.composite_model_id,
+                deployed_model_id: r.deployed_model_id,
+                weight: r.weight,
+                enabled: r.enabled,
+                sort_order: r.sort_order,
+                pool: r.pool,
+                created_at: r.created_at,
+                model_alias: r.model_alias,
+                model_name: r.model_name,
+                model_description: r.model_description,
+                model_type: r.model_type,
+                endpoint_id: r.endpoint_id,
+                endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+            })
+            .collect())
+    }
+
+    #[instrument(level = "debug", skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
+    pub async fn get_components_bulk(
+        &mut self,
+        composite_model_ids: Vec<DeploymentId>,
+    ) -> Result<std::collections::HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>>> {
+        if composite_model_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let results = sqlx::query!(
+            r#"
+            SELECT
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.pool,
+                dmc.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = ANY($1)
+            ORDER BY dmc.composite_model_id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            "#,
+            &composite_model_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: std::collections::HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>> = std::collections::HashMap::new();
+
+        for r in results {
+            map.entry(r.composite_model_id).or_default().push(DeploymentComponentDBResponse {
+                id: r.id,
+                composite_model_id: r.composite_model_id,
+                deployed_model_id: r.deployed_model_id,
+                weight: r.weight,
+                enabled: r.enabled,
+                sort_order: r.sort_order,
+                pool: r.pool,
+                created_at: r.created_at,
+                model_alias: r.model_alias,
+                model_name: r.model_name,
+                model_description: r.model_description,
+                model_type: r.model_type,
+                endpoint_id: r.endpoint_id,
+                endpoint_name: r.endpoint_name,
+                model_trusted: r.model_trusted,
+            });
+        }
+
+        Ok(map)
+    }
+
+    #[instrument(level = "debug", skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
+    pub async fn set_components(
+        &mut self,
+        composite_model_id: DeploymentId,
+        components: Vec<(DeploymentId, i32, bool, i32)>,
+    ) -> Result<Vec<DeploymentComponentDBResponse>> {
+        sqlx::query!(
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND pool = 'default'",
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        let mut results = Vec::new();
+        for (deployed_model_id, weight, enabled, sort_order) in components {
+            let request = DeploymentComponentCreateDBRequest {
+                composite_model_id,
+                deployed_model_id,
+                weight,
+                enabled,
+                sort_order,
+                pool: DEFAULT_COMPONENT_POOL.to_string(),
+            };
+            results.push(self.add_component(&request).await?);
+        }
+
+        Ok(results)
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn lock_composite(&mut self, composite_model_id: DeploymentId) -> Result<bool> {
+        let locked = sqlx::query_scalar!(
+            "SELECT id FROM deployed_models WHERE id = $1 AND is_composite = TRUE FOR UPDATE",
+            composite_model_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(locked.is_some())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<()> {
+        sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
+                FROM deployed_model_components
+                WHERE composite_model_id = $1 AND pool = $2
+            )
+            UPDATE deployed_model_components dmc
+            SET sort_order = ranked.new_order
+            FROM ranked
+            WHERE dmc.id = ranked.id
+              AND dmc.sort_order IS DISTINCT FROM ranked.new_order
+            "#,
+            composite_model_id,
+            pool
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<i32> {
+        let next = sqlx::query_scalar!(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components
+             WHERE composite_model_id = $1 AND pool = $2",
+            composite_model_id,
+            pool
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(next.unwrap_or(0))
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn renumber_components_by_weight(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY pool ORDER BY weight DESC, created_at ASC) - 1 AS new_order
+                FROM deployed_model_components
+                WHERE composite_model_id = $1
+            )
+            UPDATE deployed_model_components dmc
+            SET sort_order = ranked.new_order
+            FROM ranked
+            WHERE dmc.id = ranked.id
+              AND dmc.sort_order IS DISTINCT FROM ranked.new_order
+            "#,
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    async fn move_component_to_position(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+        target_position: i32,
+    ) -> Result<()> {
+        let mut ordered: Vec<DeploymentId> = sqlx::query_scalar!(
+            "SELECT deployed_model_id FROM deployed_model_components
+             WHERE composite_model_id = $1 AND pool = $2
+             ORDER BY sort_order ASC, weight DESC, created_at ASC",
+            composite_model_id,
+            pool
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        if let Some(pos) = ordered.iter().position(|id| *id == deployed_model_id) {
+            ordered.remove(pos);
+        }
+        let target = target_position.clamp(0, ordered.len() as i32) as usize;
+        ordered.insert(target, deployed_model_id);
+
+        for (idx, id) in ordered.iter().enumerate() {
+            sqlx::query!(
+                "UPDATE deployed_model_components SET sort_order = $4
+                 WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
+                   AND sort_order IS DISTINCT FROM $4",
+                composite_model_id,
+                id,
+                pool,
+                idx as i32
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn get_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+    ) -> Result<Option<DeploymentComponentDBResponse>> {
+        let result = sqlx::query!(
+            r#"
+            SELECT
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.pool,
+                dmc.created_at,
+                dm.alias as model_alias,
+                dm.model_name,
+                dm.description as model_description,
+                dm.type as model_type,
+                dm.trusted as model_trusted,
+                dm.hosted_on as endpoint_id,
+                e.name as "endpoint_name?"
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2 AND dmc.pool = $3
+            "#,
+            composite_model_id,
+            deployed_model_id,
+            pool
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(result.map(|r| DeploymentComponentDBResponse {
+            id: r.id,
+            composite_model_id: r.composite_model_id,
+            deployed_model_id: r.deployed_model_id,
+            weight: r.weight,
+            enabled: r.enabled,
+            sort_order: r.sort_order,
+            pool: r.pool,
+            created_at: r.created_at,
+            model_alias: r.model_alias,
+            model_name: r.model_name,
+            model_description: r.model_description,
+            model_type: r.model_type,
+            endpoint_id: r.endpoint_id,
+            endpoint_name: r.endpoint_name,
+            model_trusted: r.model_trusted,
+        }))
+    }
+
+    #[instrument(level = "debug", skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn update_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+        weight: Option<i32>,
+        enabled: Option<bool>,
+        sort_order: Option<i32>,
+    ) -> Result<Option<DeploymentComponentDBResponse>> {
+        let exists = sqlx::query_scalar!(
+            "UPDATE deployed_model_components
+             SET weight = COALESCE($4, weight),
+                 enabled = COALESCE($5, enabled)
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
+             RETURNING id",
+            composite_model_id,
+            deployed_model_id,
+            pool,
+            weight,
+            enabled
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        if let Some(target_position) = sort_order {
+            self.move_component_to_position(composite_model_id, deployed_model_id, pool, target_position)
+                .await?;
+        }
+
+        self.get_component(composite_model_id, deployed_model_id, pool).await
+    }
+
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_batch_model_info(&mut self, aliases: &[String]) -> Result<BatchModelInfo> {
+        if aliases.is_empty() {
+            return Ok(BatchModelInfo::default());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT alias, throughput, allowed_batch_completion_windows
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut info = BatchModelInfo::default();
+        for row in rows {
+            if let Some(t) = row.throughput {
+                info.throughputs.insert(row.alias.clone(), t);
+            }
+            if let Some(w) = row.allowed_batch_completion_windows {
+                info.allowed_windows.insert(row.alias, w);
+            }
+        }
+        Ok(info)
+    }
+
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
+        if aliases.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                requested.alias AS routing_alias,
+                endpoint.reasoning_translation AS endpoint_reasoning_translation,
+                provider.reasoning_translation_overrides AS model_reasoning_translation_overrides
+            FROM deployed_models requested
+            JOIN LATERAL (
+                SELECT
+                    requested.hosted_on,
+                    requested.reasoning_translation_overrides
+                WHERE requested.is_composite = FALSE
+                  AND NOT class_routes_active(requested.id)
+
+                UNION ALL
+
+                SELECT
+                    component.hosted_on,
+                    component.reasoning_translation_overrides
+                FROM deployed_model_components link
+                INNER JOIN deployed_models component ON component.id = link.deployed_model_id
+                WHERE requested.is_composite = TRUE
+                  AND NOT class_routes_active(requested.id)
+                  AND link.composite_model_id = requested.id
+                  AND component.deleted = FALSE
+
+                UNION ALL
+
+                -- A class-routed model's name is served by its standard class.
+                SELECT
+                    class.inference_endpoint_id,
+                    requested.reasoning_translation_overrides
+                FROM model_serving_classes class
+                WHERE class_routes_active(requested.id)
+                  AND class.deployed_model_id = requested.id
+                  AND class.class_key = 'standard'
+            ) provider ON TRUE
+            INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
+            WHERE requested.alias = ANY($1)
+              AND requested.deleted = FALSE
+
+            UNION ALL
+
+            -- A class route (`alias:<class>`) reasons as its model: the standard class's.
+            SELECT
+                model.alias || ':' || class.class_key AS routing_alias,
+                endpoint.reasoning_translation AS endpoint_reasoning_translation,
+                model.reasoning_translation_overrides AS model_reasoning_translation_overrides
+            FROM model_serving_classes class
+            INNER JOIN deployed_models model ON model.id = class.deployed_model_id
+            INNER JOIN model_serving_classes standard
+                ON standard.deployed_model_id = model.id AND standard.class_key = 'standard'
+            INNER JOIN inference_endpoints endpoint ON endpoint.id = standard.inference_endpoint_id
+            WHERE class.class_key <> 'standard'
+              AND model.alias || ':' || class.class_key = ANY($1)
+              AND model.deleted = FALSE
+              AND class_routes_active(model.id)
+            ORDER BY routing_alias
+            "#,
+        )
+        .bind(aliases)
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut providers: HashMap<String, Vec<Option<crate::reasoning::ReasoningTranslationConfig>>> =
+            aliases.iter().cloned().map(|alias| (alias, Vec::new())).collect();
+        for row in rows {
+            let alias: String = row.try_get("routing_alias")?;
+            let endpoint_value: Option<serde_json::Value> = row.try_get("endpoint_reasoning_translation")?;
+            let model_value: Option<serde_json::Value> = row.try_get("model_reasoning_translation_overrides")?;
+            let resolved = resolve_reasoning_translation(endpoint_value, model_value, &alias);
+            providers.entry(alias).or_default().push(resolved);
+        }
+
+        Ok(providers
+            .into_iter()
+            .map(|(alias, providers)| (alias, ModelReasoningPolicy::new(providers)))
+            .collect())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(alias = %alias), err)]
+    pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
+        let id = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM deployed_models WHERE alias = $1 AND deleted = false
+            "#,
+            alias
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(id)
+    }
+
+    #[instrument(level = "debug", skip(self, rules), fields(deployment_id = %abbrev_uuid(&deployed_model_id), count = rules.len()), err)]
+    pub async fn set_traffic_rules(&mut self, deployed_model_id: DeploymentId, rules: &[(ApiKeyPurpose, TrafficRuleAction)]) -> Result<()> {
+        sqlx::query!("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1", deployed_model_id)
+            .execute(&mut *self.db)
+            .await?;
+
+        for (purpose, action) in rules {
+            let purpose_str = serde_json::to_value(purpose)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+            let (action_str, redirect_target_id) = match action {
+                TrafficRuleAction::Deny => ("deny", None),
+                TrafficRuleAction::Redirect(target_id) => ("redirect", Some(*target_id)),
+            };
+
+            sqlx::query!(
+                r#"
+                INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)
+                VALUES ($1, $2, $3, $4)
+                "#,
+                deployed_model_id,
+                purpose_str,
+                action_str,
+                redirect_target_id,
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(deployment_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn get_traffic_rules(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TrafficRuleDBRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = $1
+            ORDER BY mtr.api_key_purpose
+            "#,
+            deployed_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            })
+            .collect())
+    }
+
+    #[instrument(level = "debug", skip(self, deployment_ids), fields(count = deployment_ids.len()), err)]
+    pub async fn get_traffic_rules_bulk(
+        &mut self,
+        deployment_ids: &[DeploymentId],
+    ) -> Result<HashMap<DeploymentId, Vec<TrafficRuleDBRow>>> {
+        if deployment_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT mtr.id, mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+                   mtr.redirect_target_id, dm.alias as "redirect_target_alias?",
+                   mtr.created_at
+            FROM model_traffic_rules mtr
+            LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+            WHERE mtr.deployed_model_id = ANY($1)
+            ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+            "#,
+            deployment_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: HashMap<DeploymentId, Vec<TrafficRuleDBRow>> = HashMap::new();
+        for r in rows {
+            map.entry(r.deployed_model_id).or_default().push(TrafficRuleDBRow {
+                id: r.id,
+                deployed_model_id: r.deployed_model_id,
+                api_key_purpose: r.api_key_purpose,
+                action: r.action,
+                redirect_target_id: r.redirect_target_id,
+                redirect_target_alias: r.redirect_target_alias,
+                created_at: r.created_at,
+            });
+        }
+
+        Ok(map)
+    }
+
+    pub async fn get_aliases_by_ids(&mut self, ids: &[DeploymentId]) -> Result<std::collections::BTreeMap<DeploymentId, String>> {
+        let rows: Vec<(DeploymentId, String)> =
+            sqlx::query_as("SELECT id, alias FROM deployed_models WHERE id = ANY($1) AND deleted = FALSE")
+                .bind(ids)
+                .fetch_all(&mut *self.db)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_model_ids_by_aliases(&mut self, aliases: &[String]) -> Result<std::collections::HashMap<String, uuid::Uuid>> {
+        if aliases.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, alias
+            FROM deployed_models
+            WHERE alias = ANY($1)
+              AND deleted = false
+            "#,
+            aliases
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.alias, r.id)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::models::users::{Role, UserCreate, UserResponse},
+        db::{
+            handlers::{Groups, Users, inference_endpoints::InferenceEndpoints},
+            models::{
+                deployments::{ModelCatalogMetadata, ProviderPricing, ProviderPricingUpdate},
+                groups::GroupCreateDBRequest,
+                inference_endpoints::InferenceEndpointCreateDBRequest,
+                users::UserCreateDBRequest,
+            },
+        },
+        reasoning::{ReasoningEffort, ReasoningSurfaceOverride, ReasoningTranslation, ReasoningTranslationOverrides, ReasoningWrite},
+        test::utils::get_test_endpoint_id,
+    };
+
+    use rust_decimal::Decimal;
+    use serde_json::json;
+    use sqlx::{Acquire, PgPool};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::str::FromStr;
+
+    async fn create_test_user(pool: &PgPool) -> UserResponse {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+        let user_create = UserCreateDBRequest::from(UserCreate {
+            username: format!("testuser_{}", uuid::Uuid::new_v4()),
+            email: format!("test_{}@example.com", uuid::Uuid::new_v4()),
+            display_name: None,
+            avatar_url: None,
+            roles: vec![Role::StandardUser],
+        });
+        user_repo.create(&user_create).await.unwrap().into()
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn searches_customer_visible_model_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .alias("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .display_name("Qwen3.8 27B".to_string())
+                    .description("Optimized for multilingual retrieval".to_string())
+                    .hosted_on(endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        for search in ["qwen3.8 27b", "qwen3.8-27b"] {
+            let results = repo
+                .list(&DeploymentFilter::new(0, 10).with_search(search.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, created.id);
+        }
+    }
+
+    fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
+        ReasoningTranslationOverrides {
+            chat_completions: ReasoningSurfaceOverride::Override(ReasoningTranslation {
+                unsupported_efforts: BTreeSet::from([ReasoningEffort::Minimal, ReasoningEffort::Xhigh, ReasoningEffort::Max]),
+                writes: vec![ReasoningWrite {
+                    target_path: "/chat_template_kwargs/thinking".to_string(),
+                    values: BTreeMap::from([
+                        (ReasoningEffort::None, json!(false)),
+                        (ReasoningEffort::Low, json!(true)),
+                        (ReasoningEffort::Medium, json!(true)),
+                        (ReasoningEffort::High, json!(true)),
+                    ]),
+                }],
+            }),
+            responses: ReasoningSurfaceOverride::Disabled,
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn persists_and_clears_mixed_reasoning_translation_overrides(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let overrides = reasoning_translation_overrides();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("reasoning-model".to_string())
+                    .alias("reasoning-model".to_string())
+                    .hosted_on(endpoint_id)
+                    .reasoning_translation_overrides(overrides.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.reasoning_translation_overrides, Some(overrides));
+
+        let cleared = repo
+            .update(
+                created.id,
+                &DeploymentUpdateDBRequest::builder().reasoning_translation_overrides(None).build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.reasoning_translation_overrides, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn loads_effective_reasoning_policy_for_standard_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("reasoning-policy".to_string())
+                .alias("reasoning-policy".to_string())
+                .hosted_on(endpoint_id)
+                .reasoning_translation_overrides(reasoning_translation_overrides())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let policies = repo.get_reasoning_policies(&["reasoning-policy".to_string()]).await.unwrap();
+        let supported = policies["reasoning-policy"].supported_efforts().unwrap();
+
+        assert_eq!(
+            supported.chat_completions,
+            Some(vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ])
+        );
+        assert_eq!(supported.responses, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_deployed_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("test-model".to_string())
+                    .alias("test-deployment".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Chat)
+                    .capabilities(vec!["text-generation".to_string(), "streaming".to_string()])
+                    .realtime_inflight_limit(40)
+                    .batch_capacity(50)
+                    .build();
+
+                model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(model.model_name, "test-model");
+        assert_eq!(model.alias, "test-deployment");
+        assert_eq!(model.created_by, user.id);
+        assert_eq!(model.model_type, Some(ModelType::Chat));
+        assert_eq!(
+            model.capabilities,
+            Some(vec!["text-generation".to_string(), "streaming".to_string()])
+        );
+        assert_eq!(model.realtime_inflight_limit, 40);
+        assert_eq!(model.batch_capacity, Some(50));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_deployed_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        let found_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let mut model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("get-test-model".to_string())
+                    .alias("get-test-deployment".to_string())
+                    .build();
+                model_create.hosted_on = Some(test_endpoint_id);
+
+                created_model = repo.create(&model_create).await.unwrap();
+                found_model = repo.get_by_id(created_model.id).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        assert!(found_model.is_some());
+        let found_model = found_model.unwrap();
+        assert_eq!(found_model.model_name, "get-test-model");
+        assert_eq!(found_model.alias, "get-test-deployment");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_deployed_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        let updated_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("update-test-model".to_string())
+                    .alias("update-test-deployment".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build();
+
+                created_model = repo.create(&model_create).await.unwrap();
+
+                let update = DeploymentUpdateDBRequest::builder()
+                    .model_name("updated-model".to_string())
+                    .alias("updated-deployment".to_string())
+                    .description(Some("Updated description".to_string()))
+                    .model_type(Some(ModelType::Embeddings))
+                    .capabilities(Some(vec!["embeddings".to_string(), "similarity".to_string()]))
+                    .realtime_inflight_limit(200)
+                    .batch_capacity(Some(75))
+                    .build();
+
+                updated_model = repo.update(created_model.id, &update).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(updated_model.model_name, "updated-model");
+        assert_eq!(updated_model.alias, "updated-deployment");
+        assert_eq!(updated_model.model_type, Some(ModelType::Embeddings));
+        assert_eq!(
+            updated_model.capabilities,
+            Some(vec!["embeddings".to_string(), "similarity".to_string()])
+        );
+        assert_eq!(updated_model.realtime_inflight_limit, 200);
+        assert_eq!(updated_model.batch_capacity, Some(75));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_deployed_model_with_null_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let mut model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("null-fields-model".to_string())
+                    .alias("null-fields-deployment".to_string())
+                    .build();
+                model_create.hosted_on = Some(test_endpoint_id);
+
+                model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(model.model_name, "null-fields-model");
+        assert_eq!(model.alias, "null-fields-deployment");
+        assert_eq!(model.created_by, user.id);
+        assert_eq!(model.model_type, None);
+        assert_eq!(model.capabilities, None);
+        assert_eq!(model.realtime_inflight_limit, 14);
+        assert_eq!(model.batch_capacity, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_deployed_model_to_null_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        let updated_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let mut model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("to-null-model".to_string())
+                    .alias("to-null-deployment".to_string())
+                    .build();
+                model_create.hosted_on = Some(test_endpoint_id);
+                model_create.model_type = Some(ModelType::Chat);
+                model_create.capabilities = Some(vec!["test-capability".to_string()]);
+                model_create.batch_capacity = Some(60);
+
+                created_model = repo.create(&model_create).await.unwrap();
+
+                let update = DeploymentUpdateDBRequest::builder()
+                    .maybe_model_type(Some(None))
+                    .maybe_capabilities(Some(None))
+                    .maybe_batch_capacity(Some(None))
+                    .build();
+
+                updated_model = repo.update(created_model.id, &update).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(created_model.model_type, Some(ModelType::Chat));
+        assert_eq!(created_model.capabilities, Some(vec!["test-capability".to_string()]));
+        assert_eq!(created_model.batch_capacity, Some(60));
+        assert_eq!(updated_model.model_type, None);
+        assert_eq!(updated_model.capabilities, None);
+        assert_eq!(updated_model.batch_capacity, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_deployed_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+
+                let mut model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("delete-test-model".to_string())
+                    .alias("delete-test-deployment".to_string())
+                    .build();
+                model_create.hosted_on = Some(test_endpoint_id);
+
+                created_model = repo.create(&model_create).await.unwrap();
+                let deleted = repo.delete(created_model.id).await.unwrap();
+                assert!(deleted);
+
+                let found_model = repo.get_by_id(created_model.id).await.unwrap();
+                assert!(found_model.is_none());
+            }
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_deployed_models(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("list-test-model-1".to_string())
+            .alias("list-test-deployment-1".to_string())
+            .build();
+        model1.hosted_on = Some(test_endpoint_id);
+
+        let mut model2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("list-test-model-2".to_string())
+            .alias("list-test-deployment-2".to_string())
+            .build();
+        model2.hosted_on = Some(test_endpoint_id);
+
+        repo.create(&model1).await.unwrap();
+        repo.create(&model2).await.unwrap();
+
+        let mut models = repo.list(&DeploymentFilter::new(0, 10)).await.unwrap();
+        models.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+        assert!(models.len() >= 2);
+        assert!(models[0].model_name == "list-test-model-1");
+        assert!(models[1].model_name == "list-test-model-2");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_endpoint_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("endpoint-filter-model".to_string())
+            .alias("endpoint-filter-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(endpoint_id);
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let filter = DeploymentFilter::new(0, 10).with_endpoint(endpoint_id);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment.id));
+        assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_status_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("status-filter-model".to_string())
+            .alias("status-filter-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder().status(ModelStatus::Active).build();
+        repo.update(deployment.id, &update).await.unwrap();
+
+        let mut filter = DeploymentFilter::new(0, 10);
+        filter.statuses = Some(vec![ModelStatus::Active]);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment.id));
+        assert!(models.iter().all(|m| m.status == ModelStatus::Active));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_deleted_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("deleted-filter-model".to_string())
+            .alias("deleted-filter-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+        repo.update(deployment.id, &update).await.unwrap();
+
+        let filter = DeploymentFilter::new(0, 10).with_deleted(true);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment.id));
+        assert!(models.iter().all(|m| m.deleted));
+
+        let filter = DeploymentFilter::new(0, 10).with_deleted(false);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(!models.iter().any(|m| m.id == deployment.id));
+        assert!(models.iter().all(|m| !m.deleted));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_accessible_to_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+        let user1 = create_test_user(&pool).await;
+        let user2 = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model1_create = DeploymentCreateDBRequest::builder()
+            .created_by(user1.id)
+            .model_name("accessible-model-1".to_string())
+            .alias("accessible-deployment-1".to_string())
+            .build();
+        model1_create.hosted_on = Some(test_endpoint_id);
+        let mut model2_create = DeploymentCreateDBRequest::builder()
+            .created_by(user1.id)
+            .model_name("accessible-model-2".to_string())
+            .alias("accessible-deployment-2".to_string())
+            .build();
+        model2_create.hosted_on = Some(test_endpoint_id);
+        let deployment1 = repo.create(&model1_create).await.unwrap();
+        let deployment2 = repo.create(&model2_create).await.unwrap();
+
+        let group_create = GroupCreateDBRequest {
+            name: "Test Group".to_string(),
+            description: Some("Test group for access control".to_string()),
+            created_by: user1.id,
+        };
+        let group = group_repo.create(&group_create).await.unwrap();
+        group_repo.add_user_to_group(user1.id, group.id).await.unwrap();
+
+        group_repo
+            .add_deployment_to_group(deployment1.id, group.id, user1.id)
+            .await
+            .unwrap();
+
+        let filter = DeploymentFilter::new(0, 10).with_accessible_to(user1.id);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(!models.iter().any(|m| m.id == deployment2.id));
+
+        let filter = DeploymentFilter::new(0, 10).with_accessible_to(user2.id);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(!models.iter().any(|m| m.id == deployment1.id));
+        assert!(!models.iter().any(|m| m.id == deployment2.id));
+
+        let filter = DeploymentFilter::new(0, 10);
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(models.iter().any(|m| m.id == deployment2.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_combined_filters(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+
+        let user = create_test_user(&pool).await;
+
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("combined-filter-model".to_string())
+            .alias("combined-filter-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(endpoint_id);
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder().status(ModelStatus::Active).build();
+        repo.update(deployment.id, &update).await.unwrap();
+
+        let group_create = GroupCreateDBRequest {
+            name: "Combined Filter Group".to_string(),
+            description: Some("Test group for combined filters".to_string()),
+            created_by: user.id,
+        };
+        let group = group_repo.create(&group_create).await.unwrap();
+        group_repo.add_user_to_group(user.id, group.id).await.unwrap();
+        group_repo.add_deployment_to_group(deployment.id, group.id, user.id).await.unwrap();
+
+        let mut filter = DeploymentFilter::new(0, 10).with_endpoint(endpoint_id).with_accessible_to(user.id);
+        filter.statuses = Some(vec![ModelStatus::Active]);
+
+        let models = repo.list(&filter).await.unwrap();
+
+        assert!(models.iter().any(|m| m.id == deployment.id));
+        assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
+        assert!(models.iter().all(|m| m.status == ModelStatus::Active));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_pagination(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        for i in 1..=5 {
+            let mut model_create = DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name(format!("pagination-model-{i}"))
+                .alias(format!("pagination-deployment-{i}"))
+                .build();
+            model_create.hosted_on = Some(test_endpoint_id);
+            repo.create(&model_create).await.unwrap();
+        }
+
+        let filter = DeploymentFilter::new(0, 2);
+        let page1 = repo.list(&filter).await.unwrap();
+        assert_eq!(page1.len(), 2);
+
+        let filter = DeploymentFilter::new(2, 2);
+        let page2 = repo.list(&filter).await.unwrap();
+        assert_eq!(page2.len(), 2);
+
+        let page1_ids: std::collections::HashSet<_> = page1.iter().map(|m| m.id).collect();
+        let page2_ids: std::collections::HashSet<_> = page2.iter().map(|m| m.id).collect();
+        assert!(page1_ids.is_disjoint(&page2_ids));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_embeddings_deployment(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("embeddings-model".to_string())
+            .alias("embeddings-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        model_create.model_type = Some(ModelType::Embeddings);
+        model_create.capabilities = Some(vec!["embeddings".to_string(), "similarity".to_string()]);
+
+        let result = repo.create(&model_create).await;
+        assert!(result.is_ok());
+
+        let model = result.unwrap();
+        assert_eq!(model.model_name, "embeddings-model");
+        assert_eq!(model.alias, "embeddings-deployment");
+        assert_eq!(model.created_by, user.id);
+        assert_eq!(model.model_type, Some(ModelType::Embeddings));
+        assert_eq!(model.capabilities, Some(vec!["embeddings".to_string(), "similarity".to_string()]));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_by_id_with_embeddings_type(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("get-embeddings-model".to_string())
+            .alias("get-embeddings-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        model_create.model_type = Some(ModelType::Embeddings);
+
+        let created_model = repo.create(&model_create).await.unwrap();
+        let found_model = repo.get_by_id(created_model.id).await.unwrap();
+
+        assert!(found_model.is_some());
+        let found_model = found_model.unwrap();
+        assert_eq!(found_model.model_name, "get-embeddings-model");
+        assert_eq!(found_model.alias, "get-embeddings-deployment");
+        assert_eq!(found_model.model_type, Some(ModelType::Embeddings));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_bulk_with_mixed_model_types(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut chat_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("bulk-chat-model".to_string())
+            .alias("bulk-chat-deployment".to_string())
+            .build();
+        chat_create.hosted_on = Some(test_endpoint_id);
+        chat_create.model_type = Some(ModelType::Chat);
+        let chat_deployment = repo.create(&chat_create).await.unwrap();
+
+        let mut embeddings_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("bulk-embeddings-model".to_string())
+            .alias("bulk-embeddings-deployment".to_string())
+            .build();
+        embeddings_create.hosted_on = Some(test_endpoint_id);
+        embeddings_create.model_type = Some(ModelType::Embeddings);
+        let embeddings_deployment = repo.create(&embeddings_create).await.unwrap();
+
+        let mut no_type_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("bulk-no-type-model".to_string())
+            .alias("bulk-no-type-deployment".to_string())
+            .build();
+        no_type_create.hosted_on = Some(test_endpoint_id);
+        let no_type_deployment = repo.create(&no_type_create).await.unwrap();
+
+        let ids = vec![chat_deployment.id, embeddings_deployment.id, no_type_deployment.id];
+        let bulk_result = repo.get_bulk(ids).await.unwrap();
+
+        assert_eq!(bulk_result.len(), 3);
+
+        let chat_result = bulk_result.get(&chat_deployment.id).unwrap();
+        assert_eq!(chat_result.model_type, Some(ModelType::Chat));
+
+        let embeddings_result = bulk_result.get(&embeddings_deployment.id).unwrap();
+        assert_eq!(embeddings_result.model_type, Some(ModelType::Embeddings));
+
+        let no_type_result = bulk_result.get(&no_type_deployment.id).unwrap();
+        assert_eq!(no_type_result.model_type, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_mixed_model_types(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+        let user = create_test_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut chat_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("list-chat-model".to_string())
+            .alias("list-chat-deployment".to_string())
+            .build();
+        chat_create.hosted_on = Some(test_endpoint_id);
+        chat_create.model_type = Some(ModelType::Chat);
+        let chat_deployment = repo.create(&chat_create).await.unwrap();
+
+        let mut embeddings_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("list-embeddings-model".to_string())
+            .alias("list-embeddings-deployment".to_string())
+            .build();
+        embeddings_create.hosted_on = Some(test_endpoint_id);
+        embeddings_create.model_type = Some(ModelType::Embeddings);
+        let embeddings_deployment = repo.create(&embeddings_create).await.unwrap();
+
+        let deployments = repo.list(&DeploymentFilter::new(0, 10)).await.unwrap();
+
+        let chat_found = deployments.iter().find(|d| d.id == chat_deployment.id).unwrap();
+        assert_eq!(chat_found.model_type, Some(ModelType::Chat));
+
+        let embeddings_found = deployments.iter().find(|d| d.id == embeddings_deployment.id).unwrap();
+        assert_eq!(embeddings_found.model_type, Some(ModelType::Embeddings));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_chat_to_embeddings(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+        let user = create_test_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("chat-to-embeddings-model".to_string())
+            .alias("chat-to-embeddings-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        model_create.model_type = Some(ModelType::Chat);
+        let created_model = repo.create(&model_create).await.unwrap();
+        assert_eq!(created_model.model_type, Some(ModelType::Chat));
+
+        let update = DeploymentUpdateDBRequest::builder()
+            .model_type(Some(ModelType::Embeddings))
+            .capabilities(Some(vec!["embeddings".to_string()]))
+            .build();
+
+        let updated_model = repo.update(created_model.id, &update).await.unwrap();
+        assert_eq!(updated_model.model_type, Some(ModelType::Embeddings));
+        assert_eq!(updated_model.capabilities, Some(vec!["embeddings".to_string()]));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_embeddings_to_chat(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("embeddings-to-chat-model".to_string())
+            .alias("embeddings-to-chat-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        model_create.model_type = Some(ModelType::Embeddings);
+        let created_model = repo.create(&model_create).await.unwrap();
+        assert_eq!(created_model.model_type, Some(ModelType::Embeddings));
+
+        let update = DeploymentUpdateDBRequest::builder()
+            .model_type(Some(ModelType::Chat))
+            .capabilities(Some(vec!["text-generation".to_string(), "streaming".to_string()]))
+            .build();
+
+        let updated_model = repo.update(created_model.id, &update).await.unwrap();
+        assert_eq!(updated_model.model_type, Some(ModelType::Chat));
+        assert_eq!(
+            updated_model.capabilities,
+            Some(vec!["text-generation".to_string(), "streaming".to_string()])
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_bulk_empty_ids(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let result = repo.get_bulk(vec![]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_check_user_access(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+        let mut deploy_conn = pool.acquire().await.unwrap();
+        let mut deployment_repo = Deployments::new(&mut deploy_conn);
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut deployment_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("access-test-model".to_string())
+            .alias("access-test-alias".to_string())
+            .build();
+        deployment_create.hosted_on = Some(test_endpoint_id);
+        let deployment = deployment_repo.create(&deployment_create).await.unwrap();
+
+        let group_create = GroupCreateDBRequest {
+            name: "Access Test Group".to_string(),
+            description: Some("Test group for access control".to_string()),
+            created_by: user.id,
+        };
+        let group = group_repo.create(&group_create).await.unwrap();
+
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
+        assert!(access_result.is_none());
+
+        group_repo
+            .add_user_to_group(user.id, group.id)
+            .await
+            .expect("Failed to add user to group");
+
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
+        assert!(access_result.is_none());
+
+        group_repo
+            .add_deployment_to_group(deployment.id, group.id, user.id)
+            .await
+            .expect("Failed to add deployment to group");
+
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
+        assert!(access_result.is_some());
+
+        let access_info = access_result.unwrap();
+        assert_eq!(access_info.deployment_id, deployment.id);
+        assert_eq!(access_info.deployment_alias, "access-test-alias");
+
+        let nonexistent_user_id = uuid::Uuid::new_v4();
+        let access_result = deployment_repo
+            .check_user_access("access-test-alias", nonexistent_user_id)
+            .await
+            .unwrap();
+        assert!(access_result.is_none());
+
+        let access_result = deployment_repo.check_user_access("nonexistent-alias", user.id).await.unwrap();
+        assert!(access_result.is_none());
+
+        group_repo
+            .remove_user_from_group(user.id, group.id)
+            .await
+            .expect("Failed to remove user from group");
+
+        let access_result = deployment_repo.check_user_access("access-test-alias", user.id).await.unwrap();
+        assert!(access_result.is_none());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_partial_downstream_per_token_pricing_updates(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+
+                let initial_provider_pricing = ProviderPricing::PerToken {
+                    input_price_per_token: Some(Decimal::from_str("0.005").unwrap()),
+                    output_price_per_token: Some(Decimal::from_str("0.01").unwrap()),
+                };
+
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("provider-per-token-test".to_string())
+                    .alias("provider-per-token-alias".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .provider_pricing(initial_provider_pricing)
+                    .build();
+
+                created_model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: Some(Some(Decimal::from_str("0.003").unwrap())),
+                output_price_per_token: None,
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap()));
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.01").unwrap()));
+            }
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: None,
+                output_price_per_token: Some(Some(Decimal::from_str("0.008").unwrap())),
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &Some(Decimal::from_str("0.003").unwrap()));
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap()));
+            }
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::PerToken {
+                input_price_per_token: Some(None),
+                output_price_per_token: None,
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::PerToken {
+                input_price_per_token,
+                output_price_per_token,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(input_price_per_token, &None);
+                assert_eq!(output_price_per_token, &Some(Decimal::from_str("0.008").unwrap()));
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_provider_hourly_pricing_updates(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let created_model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+
+                let initial_provider_pricing = ProviderPricing::Hourly {
+                    rate: Decimal::from_str("5.00").unwrap(),
+                    input_token_cost_ratio: Decimal::from_str("0.8").unwrap(),
+                };
+
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("provider-hourly-test".to_string())
+                    .alias("provider-hourly-alias".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .provider_pricing(initial_provider_pricing)
+                    .build();
+
+                created_model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        assert!(created_model.provider_pricing.is_some());
+        if let Some(ProviderPricing::Hourly {
+            rate,
+            input_token_cost_ratio,
+        }) = &created_model.provider_pricing
+        {
+            assert_eq!(rate, &Decimal::from_str("5.00").unwrap());
+            assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap());
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: Some(Decimal::from_str("6.50").unwrap()),
+                input_token_cost_ratio: None,
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("6.50").unwrap());
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.8").unwrap());
+            }
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: None,
+                input_token_cost_ratio: Some(Decimal::from_str("0.9").unwrap()),
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("6.50").unwrap());
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.9").unwrap());
+            }
+        }
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = Deployments::new(&mut conn);
+
+            let pricing_update = ProviderPricingUpdate::Hourly {
+                rate: Some(Decimal::from_str("7.00").unwrap()),
+                input_token_cost_ratio: Some(Decimal::from_str("0.75").unwrap()),
+            };
+
+            let update = DeploymentUpdateDBRequest::builder().provider_pricing(pricing_update).build();
+
+            let updated_model = repo.update(created_model.id, &update).await.unwrap();
+
+            if let Some(ProviderPricing::Hourly {
+                rate,
+                input_token_cost_ratio,
+            }) = &updated_model.provider_pricing
+            {
+                assert_eq!(rate, &Decimal::from_str("7.00").unwrap());
+                assert_eq!(input_token_cost_ratio, &Decimal::from_str("0.75").unwrap());
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_inactive_status_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("active-test-model".to_string())
+            .alias("active-test-deployment".to_string())
+            .build();
+        model_create1.hosted_on = Some(test_endpoint_id);
+
+        let mut model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("inactive-test-model".to_string())
+            .alias("inactive-test-deployment".to_string())
+            .build();
+        model_create2.hosted_on = Some(test_endpoint_id);
+
+        let deployment1 = repo.create(&model_create1).await.unwrap();
+        let deployment2 = repo.create(&model_create2).await.unwrap();
+
+        let update_active = DeploymentUpdateDBRequest::builder().status(ModelStatus::Active).build();
+        repo.update(deployment1.id, &update_active).await.unwrap();
+
+        let update_inactive = DeploymentUpdateDBRequest::builder().status(ModelStatus::Inactive).build();
+        repo.update(deployment2.id, &update_inactive).await.unwrap();
+
+        let mut filter = DeploymentFilter::new(0, 10);
+        filter.statuses = Some(vec![ModelStatus::Active]);
+        let active_models = repo.list(&filter).await.unwrap();
+
+        assert!(active_models.iter().any(|m| m.id == deployment1.id));
+        assert!(!active_models.iter().any(|m| m.id == deployment2.id));
+        assert!(active_models.iter().all(|m| m.status == ModelStatus::Active));
+
+        let mut filter = DeploymentFilter::new(0, 10);
+        filter.statuses = Some(vec![ModelStatus::Inactive]);
+        let inactive_models = repo.list(&filter).await.unwrap();
+
+        assert!(!inactive_models.iter().any(|m| m.id == deployment1.id));
+        assert!(inactive_models.iter().any(|m| m.id == deployment2.id));
+        assert!(inactive_models.iter().all(|m| m.status == ModelStatus::Inactive));
+
+        let filter = DeploymentFilter::new(0, 10);
+        let all_models = repo.list(&filter).await.unwrap();
+
+        assert!(all_models.iter().any(|m| m.id == deployment1.id));
+        assert!(all_models.iter().any(|m| m.id == deployment2.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_combined_deleted_and_inactive_filters(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("combined-filter-model".to_string())
+            .alias("combined-filter-deployment".to_string())
+            .build();
+        model_create.hosted_on = Some(test_endpoint_id);
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder()
+            .status(ModelStatus::Inactive)
+            .deleted(true)
+            .build();
+        repo.update(deployment.id, &update).await.unwrap();
+
+        let filter = DeploymentFilter::new(0, 10)
+            .with_deleted(false)
+            .with_statuses(vec![ModelStatus::Active]);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(!models.iter().any(|m| m.id == deployment.id));
+
+        let filter = DeploymentFilter::new(0, 10)
+            .with_deleted(true)
+            .with_statuses(vec![ModelStatus::Inactive]);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == deployment.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            reasoning_translation: None,
+            accepts_scheduling_priority: false,
+            created_by: user.id,
+            kind: Default::default(),
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _ = repo.create(&model_create1).await.unwrap();
+
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("shared-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create2).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { }
+            _ => panic!("Expected UniqueViolation error for alias"),
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_deployment_alias_conflict(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let mut endpoints_repo = InferenceEndpoints::new(&mut conn);
+        let endpoint_create = InferenceEndpointCreateDBRequest {
+            name: format!("test-endpoint-{}", uuid::Uuid::new_v4()),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            description: None,
+            model_filter: None,
+            auth_header_name: None,
+            auth_header_prefix: None,
+            reasoning_translation: None,
+            accepts_scheduling_priority: false,
+            created_by: user.id,
+            kind: Default::default(),
+        };
+        let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
+        let test_endpoint_id = endpoint.id;
+
+        let mut repo = Deployments::new(&mut conn);
+
+        let model_create1 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-1".to_string())
+            .alias("alias-1".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let _deployment1 = repo.create(&model_create1).await.unwrap();
+
+        let model_create2 = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("model-2".to_string())
+            .alias("alias-2".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment2 = repo.create(&model_create2).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder().alias("alias-1".to_string()).build();
+        let result = repo.update(deployment2.id, &update).await;
+
+        match result {
+            Err(crate::db::errors::DbError::UniqueViolation { .. }) => { }
+            _ => panic!("Expected UniqueViolation error for alias update"),
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("   ".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("   ".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let result = repo.create(&model_create).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_deployment_with_empty_model_name_or_alias(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let model_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("valid-model".to_string())
+            .alias("valid-alias".to_string())
+            .hosted_on(test_endpoint_id)
+            .build();
+        let deployment = repo.create(&model_create).await.unwrap();
+
+        let update = DeploymentUpdateDBRequest::builder().model_name("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "model_name"),
+            _ => panic!("Expected InvalidModelField error for empty model_name"),
+        }
+
+        let update = DeploymentUpdateDBRequest::builder().alias("   ".to_string()).build();
+        let result = repo.update(deployment.id, &update).await;
+        match result {
+            Err(DbError::InvalidModelField { field }) => assert_eq!(field, "alias"),
+            _ => panic!("Expected InvalidModelField error for empty alias"),
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_group_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let mut group_conn = pool.acquire().await.unwrap();
+        let mut group_repo = Groups::new(&mut group_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let mut model1_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-1".to_string())
+            .alias("group-deployment-1".to_string())
+            .build();
+        model1_create.hosted_on = Some(test_endpoint_id);
+        let deployment1 = repo.create(&model1_create).await.unwrap();
+
+        let mut model2_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-2".to_string())
+            .alias("group-deployment-2".to_string())
+            .build();
+        model2_create.hosted_on = Some(test_endpoint_id);
+        let deployment2 = repo.create(&model2_create).await.unwrap();
+
+        let mut model3_create = DeploymentCreateDBRequest::builder()
+            .created_by(user.id)
+            .model_name("group-model-3".to_string())
+            .alias("group-deployment-3".to_string())
+            .build();
+        model3_create.hosted_on = Some(test_endpoint_id);
+        let deployment3 = repo.create(&model3_create).await.unwrap();
+
+        let group1_create = GroupCreateDBRequest {
+            name: "Production".to_string(),
+            description: Some("Production group".to_string()),
+            created_by: user.id,
+        };
+        let group1 = group_repo.create(&group1_create).await.unwrap();
+
+        let group2_create = GroupCreateDBRequest {
+            name: "Staging".to_string(),
+            description: Some("Staging group".to_string()),
+            created_by: user.id,
+        };
+        let group2 = group_repo.create(&group2_create).await.unwrap();
+
+        group_repo
+            .add_deployment_to_group(deployment1.id, group1.id, user.id)
+            .await
+            .unwrap();
+
+        group_repo
+            .add_deployment_to_group(deployment2.id, group2.id, user.id)
+            .await
+            .unwrap();
+
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id]);
+        let models = repo.list(&filter).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(!models.iter().any(|m| m.id == deployment2.id));
+        assert!(!models.iter().any(|m| m.id == deployment3.id));
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id, group2.id]);
+        let models = repo.list(&filter).await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m.id == deployment1.id));
+        assert!(models.iter().any(|m| m.id == deployment2.id));
+        assert!(!models.iter().any(|m| m.id == deployment3.id));
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![]);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.len() >= 3);
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id]);
+        let count = repo.count(&filter).await.unwrap();
+        assert_eq!(count, 1);
+
+        let filter = DeploymentFilter::new(0, 10).with_groups(vec![group1.id, group2.id]);
+        let count = repo.count(&filter).await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_resolve_alias_to_id(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let model_create = DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("resolve-test".to_string())
+                    .alias("resolve-alias".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build();
+                model = repo.create(&model_create).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("resolve-alias").await.unwrap();
+            assert_eq!(resolved, Some(model.id));
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("does-not-exist").await.unwrap();
+            assert_eq!(resolved, None);
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+                repo.update(model.id, &update).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let resolved = repo.resolve_alias_to_id("resolve-alias").await.unwrap();
+            assert_eq!(resolved, None);
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_set_and_get_traffic_rules(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (source, target);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                source = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("source-model".to_string())
+                            .alias("source-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                target = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("target-model".to_string())
+                            .alias("target-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                let rules = vec![
+                    (ApiKeyPurpose::Batch, TrafficRuleAction::Deny),
+                    (ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(target.id)),
+                ];
+                repo.set_traffic_rules(source.id, &rules).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(source.id).await.unwrap();
+            assert_eq!(rules.len(), 2);
+
+            let batch_rule = rules.iter().find(|r| r.api_key_purpose == "batch").unwrap();
+            assert_eq!(batch_rule.action, "deny");
+            assert_eq!(batch_rule.redirect_target_id, None);
+            assert_eq!(batch_rule.redirect_target_alias, None);
+
+            let realtime_rule = rules.iter().find(|r| r.api_key_purpose == "realtime").unwrap();
+            assert_eq!(realtime_rule.action, "redirect");
+            assert_eq!(realtime_rule.redirect_target_id, Some(target.id));
+            assert_eq!(realtime_rule.redirect_target_alias.as_deref(), Some("target-alias"));
+
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_set_traffic_rules_replaces_existing(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model, target);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("replace-model".to_string())
+                            .alias("replace-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                target = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("replace-target".to_string())
+                            .alias("replace-target-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(target.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].api_key_purpose, "realtime");
+            assert_eq!(rules[0].action, "redirect");
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_set_traffic_rules_empty_clears(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("clear-model".to_string())
+                            .alias("clear-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[]).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_empty(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("empty-rules-model".to_string())
+                            .alias("empty-rules-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_bulk(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model_a, model_b, model_c);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model_a = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-a".to_string())
+                            .alias("bulk-alias-a".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_b = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-b".to_string())
+                            .alias("bulk-alias-b".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_c = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("bulk-c".to_string())
+                            .alias("bulk-alias-c".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model_a.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+                repo.set_traffic_rules(model_b.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(model_c.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let map = repo.get_traffic_rules_bulk(&[model_a.id, model_b.id, model_c.id]).await.unwrap();
+
+            let a_rules = map.get(&model_a.id).unwrap();
+            assert_eq!(a_rules.len(), 1);
+            assert_eq!(a_rules[0].api_key_purpose, "batch");
+            assert_eq!(a_rules[0].action, "deny");
+
+            let b_rules = map.get(&model_b.id).unwrap();
+            assert_eq!(b_rules.len(), 1);
+            assert_eq!(b_rules[0].api_key_purpose, "realtime");
+            assert_eq!(b_rules[0].action, "redirect");
+
+            assert!(!map.contains_key(&model_c.id));
+
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_traffic_rules_bulk_empty_ids(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let mut repo = Deployments::new(tx.acquire().await.unwrap());
+        let map = repo.get_traffic_rules_bulk(&[]).await.unwrap();
+        assert!(map.is_empty());
+        tx.commit().await.unwrap();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_cascade_delete_source_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-src".to_string())
+                            .alias("cascade-src-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model.id, &[(ApiKeyPurpose::Batch, TrafficRuleAction::Deny)])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model.id).await.unwrap();
+            assert_eq!(rules.len(), 1);
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.delete(model.id).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        let count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as \"count!\" FROM model_traffic_rules WHERE deployed_model_id = $1",
+            model.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_cascade_delete_redirect_target(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let (model_a, model_b);
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model_a = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-a".to_string())
+                            .alias("cascade-alias-a".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                model_b = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("cascade-b".to_string())
+                            .alias("cascade-alias-b".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.set_traffic_rules(model_a.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(model_b.id))])
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                repo.delete(model_b.id).await.unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let rules = repo.get_traffic_rules(model_a.id).await.unwrap();
+            assert!(rules.is_empty());
+            tx.commit().await.unwrap();
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_unique_purpose_per_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("unique-model".to_string())
+                            .alias("unique-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            model.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            model.id
+        )
+        .execute(&pool)
+        .await;
+
+        assert!(result.is_err());
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_provider_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let openai_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("provider-filter-openai".to_string())
+                    .alias("provider-filter-openai".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .metadata(ModelCatalogMetadata {
+                        provider: Some("OpenAI".to_string()),
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("provider-filter-anthropic".to_string())
+                .alias("provider-filter-anthropic".to_string())
+                .hosted_on(test_endpoint_id)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100).with_provider("openai".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == openai_model.id));
+        assert_eq!(models.len(), 1, "provider filter should only return the OpenAI model");
+        assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_model_type_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let chat_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-chat".to_string())
+                    .alias("type-filter-chat".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Chat)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let embed_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("type-filter-embed".to_string())
+                    .alias("type-filter-embed".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .model_type(ModelType::Embeddings)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Chat);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == chat_model.id));
+        assert!(!models.iter().any(|m| m.id == embed_model.id));
+
+        let filter = DeploymentFilter::new(0, 100).with_model_type(ModelType::Embeddings);
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == embed_model.id));
+        assert!(!models.iter().any(|m| m.id == chat_model.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_capability_filter(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let vision_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-vision".to_string())
+                    .alias("cap-filter-vision".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let text_model = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("cap-filter-text".to_string())
+                    .alias("cap-filter-text".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .capabilities(vec!["streaming".to_string()])
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100).with_capability("vision".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(!models.iter().any(|m| m.id == text_model.id));
+
+        let filter = DeploymentFilter::new(0, 100).with_capability("streaming".to_string());
+        let models = repo.list(&filter).await.unwrap();
+        assert!(models.iter().any(|m| m.id == vision_model.id));
+        assert!(models.iter().any(|m| m.id == text_model.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_with_sort(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model_a = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-aaa".to_string())
+                    .alias("sort-aaa".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let model_z = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("sort-zzz".to_string())
+                    .alias("sort-zzz".to_string())
+                    .hosted_on(test_endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, None);
+        let models = repo.list(&filter).await.unwrap();
+        let sort_models: Vec<_> = models.iter().filter(|m| m.alias.starts_with("sort-")).collect();
+        assert!(sort_models.len() >= 2);
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_a < pos_z, "sort-aaa should come before sort-zzz in ASC order");
+
+        let filter = DeploymentFilter::new(0, 100).with_sort(ModelSortField::Alias, Some(SortDirection::Desc));
+        let models = repo.list(&filter).await.unwrap();
+        let pos_a = models.iter().position(|m| m.id == model_a.id).unwrap();
+        let pos_z = models.iter().position(|m| m.id == model_z.id).unwrap();
+        assert!(pos_z < pos_a, "sort-zzz should come before sort-aaa in DESC order");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_facets(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-openai-chat".to_string())
+                .alias("facet-openai-chat".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .capabilities(vec!["vision".to_string(), "streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("OpenAI".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-anthropic-embed".to_string())
+                .alias("facet-anthropic-embed".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Embeddings)
+                .capabilities(vec!["streaming".to_string()])
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("Anthropic".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let filter = DeploymentFilter::new(0, 100);
+        let (providers, capabilities, model_types) = repo.facets(&filter).await.unwrap();
+
+        assert!(providers.contains(&"OpenAI".to_string()));
+        assert!(providers.contains(&"Anthropic".to_string()));
+        assert!(capabilities.contains(&"vision".to_string()));
+        assert!(capabilities.contains(&"streaming".to_string()));
+        assert!(model_types.contains(&"CHAT".to_string()));
+        assert!(model_types.contains(&"EMBEDDINGS".to_string()));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_facets_respect_filters(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let mut pool_conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut pool_conn);
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("facet-deleted".to_string())
+                .alias("facet-deleted".to_string())
+                .hosted_on(test_endpoint_id)
+                .model_type(ModelType::Chat)
+                .metadata(ModelCatalogMetadata {
+                    provider: Some("DeletedProvider".to_string()),
+                    ..Default::default()
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let models = repo.list(&DeploymentFilter::new(0, 100)).await.unwrap();
+        let deleted_model = models.iter().find(|m| m.alias == "facet-deleted").unwrap();
+        let update = DeploymentUpdateDBRequest::builder().deleted(true).build();
+        repo.update(deleted_model.id, &update).await.unwrap();
+
+        let filter = DeploymentFilter::new(0, 100).with_deleted(false);
+        let (providers, _, _) = repo.facets(&filter).await.unwrap();
+        assert!(!providers.contains(&"DeletedProvider".to_string()));
+    }
+
+
+    async fn create_composite_and_components(pool: &PgPool, user_id: UserId, n: usize) -> (DeploymentId, Vec<DeploymentId>) {
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, pool).await.unwrap();
+
+        let endpoint_id = get_test_endpoint_id(pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        let result = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let composite = repo
+                .create(
+                    &DeploymentCreateDBRequest::builder()
+                        .created_by(user_id)
+                        .model_name(format!("composite-{}", uuid::Uuid::new_v4()))
+                        .alias(format!("composite-{}", uuid::Uuid::new_v4()))
+                        .is_composite(true)
+                        .lb_strategy(LoadBalancingStrategy::WeightedRandom)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let mut ids = Vec::new();
+            for i in 0..n {
+                let component = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user_id)
+                            .model_name(format!("component-{}-{}", i, uuid::Uuid::new_v4()))
+                            .alias(format!("component-{}-{}", i, uuid::Uuid::new_v4()))
+                            .hosted_on(endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                ids.push(component.id);
+            }
+            (composite.id, ids)
+        };
+        tx.commit().await.unwrap();
+        result
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn realtime_fallback_backfill_follows_server_error_failover(pool: PgPool) {
+        let migrator = crate::migrator();
+        let (before, backfill): (Vec<_>, Vec<_>) = migrator.iter().partition(|migration| migration.version < 145);
+        for migration in before {
+            sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, fallback_on_status) VALUES
+                ('explicit', 'explicit', '00000000-0000-0000-0000-000000000000', TRUE, '{429,503}'),
+                ('class', 'class', '00000000-0000-0000-0000-000000000000', TRUE, '{5}'),
+                ('inherited', 'inherited', '00000000-0000-0000-0000-000000000000', TRUE, NULL),
+                ('no-5xx', 'no-5xx', '00000000-0000-0000-0000-000000000000', TRUE, '{429,499}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backfill = backfill.first().expect("realtime fallback migration");
+        assert_eq!(backfill.version, 145);
+        sqlx::raw_sql(backfill.sql.as_ref()).execute(&pool).await.unwrap();
+
+        let statuses: BTreeMap<String, Vec<i32>> =
+            sqlx::query_as::<_, (String, Vec<i32>)>("SELECT alias, fallback_realtime_on_status FROM deployed_models")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        let expected: BTreeMap<String, Vec<i32>> = [
+            ("class", vec![529]),
+            ("explicit", vec![529]),
+            ("inherited", vec![529]),
+            ("no-5xx", vec![]),
+        ]
+        .into_iter()
+        .map(|(alias, statuses)| (alias.to_string(), statuses))
+        .collect();
+        assert_eq!(statuses, expected);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn database_fallback_status_default_remains_historical(pool: PgPool) {
+        let column_default: String = sqlx::query_scalar(
+            r#"
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'deployed_models'
+              AND column_name = 'fallback_on_status'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn reasoning_policy_includes_every_configured_composite_provider(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_id, component_ids) = create_composite_and_components(&pool, user.id, 2).await;
+        let composite_alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let first = serde_json::json!({
+            "chat_completions": {
+                "mode": "override",
+                "translation": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none", "low": "low", "medium": "medium", "high": "high"}
+                    }]
+                }
+            },
+            "responses": {"mode": "disabled"}
+        });
+        let second = serde_json::json!({
+            "chat_completions": {
+                "mode": "override",
+                "translation": {
+                    "unsupported_efforts": ["none", "minimal", "low", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {"medium": "medium", "high": "high"}
+                    }]
+                }
+            },
+            "responses": {"mode": "disabled"}
+        });
+        for (component_id, overrides) in component_ids.iter().zip([first, second]) {
+            sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE id = $2")
+                .bind(overrides)
+                .bind(component_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.set_components(
+            composite_id,
+            component_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (*id, 50, false, index as i32))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        let policies = repo.get_reasoning_policies(std::slice::from_ref(&composite_alias)).await.unwrap();
+        let supported = policies[&composite_alias].supported_efforts().unwrap();
+
+        assert_eq!(
+            supported.chat_completions,
+            Some(vec![ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn every_class_of_a_class_routed_model_reasons_as_the_model(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_id, _) = create_composite_and_components(&pool, user.id, 1).await;
+        let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let efforts = |supported: &[&str]| {
+            let all = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+            serde_json::json!({
+                "chat_completions": {
+                    "unsupported_efforts": all.iter().filter(|e| !supported.contains(e)).collect::<Vec<_>>(),
+                    "writes": [{"target_path": "/reasoning_effort",
+                                "values": supported.iter().map(|e| (e.to_string(), serde_json::json!(e))).collect::<serde_json::Map<_, _>>()}]
+                }
+            })
+        };
+        for (class, supported) in [("standard", vec!["low", "medium", "high"]), ("fast", vec!["high"])] {
+            let endpoint = crate::test::utils::create_test_endpoint(&pool, &format!("class-{class}"), user.id).await;
+            sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+                .bind(efforts(&supported))
+                .bind(endpoint)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO model_serving_classes (deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name)
+                 VALUES ($1, $2, $2, $3, 'upstream')",
+            )
+            .bind(composite_id)
+            .bind(class)
+            .bind(endpoint)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("UPDATE deployed_models SET routing_mode = 'class_routes' WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let fast = format!("{alias}:fast");
+        let mut conn = pool.acquire().await.unwrap();
+        let policies = Deployments::new(&mut conn)
+            .get_reasoning_policies(&[alias.clone(), fast.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            policies[&alias].supported_efforts().unwrap().chat_completions,
+            Some(vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+        assert_eq!(
+            policies[&fast].supported_efforts().unwrap().chat_completions,
+            Some(vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+    }
+
+    async fn ordered_components(pool: &PgPool, composite_id: DeploymentId) -> Vec<(DeploymentId, i32)> {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.get_components(composite_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.deployed_model_id, c.sort_order))
+            .collect()
+    }
+
+    fn assert_dense_unique(ordered: &[(DeploymentId, i32)]) {
+        let orders: Vec<i32> = ordered.iter().map(|(_, s)| *s).collect();
+        let expected: Vec<i32> = (0..orders.len() as i32).collect();
+        assert_eq!(orders, expected, "sort_order must be a dense, unique 0..n-1 sequence");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_next_sort_order_appends(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for component_id in &components {
+                let sort_order = repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(), components);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_renumber_by_weight(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+        let weights = [10, 50, 30];
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (component_id, weight) in components.iter().zip(weights) {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight,
+                    enabled: true,
+                    sort_order: 0,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
+                })
+                .await
+                .unwrap();
+            }
+            repo.renumber_components_by_weight(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[1], components[2], components[0]]
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_move_component_reindexes_densely(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (i, component_id) in components.iter().enumerate() {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let moved = repo
+                .update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(0))
+                .await
+                .unwrap()
+                .expect("component exists");
+            assert_eq!(moved.sort_order, 0);
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[2], components[0], components[1]]
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(999))
+                .await
+                .unwrap()
+                .expect("component exists");
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(ordered.last().unwrap().0, components[2]);
+
+        let order_before = ordered_components(&pool, composite).await;
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.update_component(composite, components[0], DEFAULT_COMPONENT_POOL, Some(99), None, None)
+                .await
+                .unwrap()
+                .expect("component exists");
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(ordered_components(&pool, composite).await, order_before);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_remove_compacts_sort_order(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (i, component_id) in components.iter().enumerate() {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            assert!(
+                repo.remove_component(composite, components[1], DEFAULT_COMPONENT_POOL)
+                    .await
+                    .unwrap()
+            );
+            repo.compact_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[0], components[2]]
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        let next = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap()
+        };
+        tx.commit().await.unwrap();
+        assert_eq!(next, 2);
+    }
+}

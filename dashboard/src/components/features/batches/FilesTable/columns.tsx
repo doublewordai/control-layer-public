@@ -1,0 +1,305 @@
+"use client";
+
+import { type ColumnDef } from "@tanstack/react-table";
+import {
+  ArrowUpDown,
+  Trash2,
+  List,
+  FileInput,
+  Download,
+  Play,
+  FileCheck,
+  AlertCircle,
+  Layers,
+  Loader2,
+  Cable,
+} from "lucide-react";
+import { Button } from "../../../ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
+import { formatBytes, formatTimestamp } from "../../../../utils";
+import type { FileObject } from "../types";
+
+interface ColumnActions {
+  onView: (file: FileObject) => void;
+  onDelete: (file: FileObject) => void;
+  onDownloadCode: (file: FileObject) => void;
+  onTriggerBatch: (file: FileObject) => void;
+  onViewBatches: (file: FileObject) => void;
+  isFileInProgress: (file: FileObject) => boolean;
+  showUserColumn?: boolean;
+  showContextColumn?: boolean;
+  showSourceColumn?: boolean;
+}
+
+const userColumn: ColumnDef<FileObject> = {
+  id: "user",
+  header: "User",
+  cell: ({ row }) => {
+    const file = row.original;
+    const email = file.created_by_email;
+    if (!email) {
+      return <span className="text-gray-400">-</span>;
+    }
+    return (
+      <Tooltip delayDuration={300}>
+        <TooltipTrigger asChild>
+          <span className="text-sm text-gray-700 truncate max-w-[120px] block cursor-default">
+            {email}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{email}</TooltipContent>
+      </Tooltip>
+    );
+  },
+};
+
+const sourceColumn: ColumnDef<FileObject> = {
+  id: "source",
+  header: "Source",
+  cell: ({ row }) => {
+    const file = row.original;
+    if (file.source === "sync") {
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="inline-flex items-center gap-1 text-xs text-blue-600 cursor-default">
+              <Cable className="w-3 h-3" />
+              S3
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{file.source_name || "S3 Sync"}</TooltipContent>
+        </Tooltip>
+      );
+    }
+    return <span className="text-xs text-gray-500">Upload</span>;
+  },
+};
+
+const contextColumn: ColumnDef<FileObject> = {
+  id: "context",
+  header: "Context",
+  cell: ({ row }) => {
+    const file = row.original;
+    const { context_name, context_type } = file;
+    if (!context_name) {
+      return <span className="text-gray-400">-</span>;
+    }
+    const isOrg = context_type === "organization";
+    return (
+      <span
+        className={`text-sm truncate max-w-[120px] block ${
+          isOrg ? "text-blue-700 font-medium" : "text-gray-500"
+        }`}
+      >
+        {context_name}
+      </span>
+    );
+  },
+};
+
+export const createFileColumns = (
+  actions: ColumnActions,
+): ColumnDef<FileObject>[] => [
+  {
+    accessorKey: "created_at",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Created
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const timestamp = row.getValue("created_at") as number;
+      return (
+        <span className="text-gray-700">
+          {formatTimestamp(new Date(timestamp * 1000).toISOString())}
+        </span>
+      );
+    },
+  },
+  ...(actions.showUserColumn ? [userColumn] : []),
+  ...(actions.showContextColumn ? [contextColumn] : []),
+  {
+    accessorKey: "id",
+    header: "File ID",
+    cell: ({ row }) => {
+      const id = row.getValue("id") as string;
+      const truncatedId = id.slice(0, 8) + "...";
+      return (
+        <Tooltip delayDuration={300}>
+          <TooltipTrigger asChild>
+            <span className="font-mono text-xs text-gray-600 cursor-help">
+              {truncatedId}
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{id}</TooltipContent>
+        </Tooltip>
+      );
+    },
+  },
+  {
+    accessorKey: "filename",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center text-left font-medium group"
+        >
+          Filename
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const file = row.original;
+
+      const isInProgress = actions.isFileInProgress(file);
+
+      let icon = <FileInput className="w-4 h-4 text-gray-500" />;
+      if (isInProgress) {
+        icon = <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />;
+      } else if (file.purpose === "batch_output") {
+        icon = <FileCheck className="w-4 h-4 text-green-600" />;
+      } else if (file.purpose === "batch_error") {
+        icon = <AlertCircle className="w-4 h-4 text-red-500" />;
+      }
+
+      return (
+        <div
+          className="flex items-center gap-2 cursor-pointer hover:text-blue-600 transition-colors py-0"
+          onClick={() => actions.onView(file)}
+        >
+          {icon}
+          <span className="font-medium">{file.filename}</span>
+        </div>
+      );
+    },
+  },
+
+
+
+  ...(actions.showSourceColumn ? [sourceColumn] : []),
+  {
+    accessorKey: "bytes",
+    header: ({ column }) => {
+      return (
+        <button
+          onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+          className="flex items-center justify-end text-right font-medium group w-full"
+        >
+          Size
+          <ArrowUpDown className="ml-2 h-4 w-4 text-gray-400 group-hover:text-gray-700 transition-colors" />
+        </button>
+      );
+    },
+    cell: ({ row }) => {
+      const bytes = row.getValue("bytes") as number;
+      return (
+        <div className="text-right text-gray-700">{formatBytes(bytes)}</div>
+      );
+    },
+  },
+  {
+    id: "actions",
+    header: () => <div className="text-right font-medium">Actions</div>,
+    size: 200,
+    cell: ({ row }) => {
+      const file = row.original;
+
+      return (
+        <div className="flex items-center justify-end gap-1">
+          { }
+          {file.purpose === "batch" && (
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    actions.onTriggerBatch(file);
+                  }}
+                >
+                  <Play className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Trigger Batch</TooltipContent>
+            </Tooltip>
+          )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onView(file);
+                }}
+              >
+                <List className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>View Requests</TooltipContent>
+          </Tooltip>
+          {file.purpose === "batch" && (
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    actions.onViewBatches(file);
+                  }}
+                >
+                  <Layers className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>View Batches</TooltipContent>
+            </Tooltip>
+          )}
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 w-7 p-0 text-gray-700 hover:bg-gray-100 hover:text-gray-900"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onDownloadCode(file);
+                }}
+              >
+                <Download className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Download File</TooltipContent>
+          </Tooltip>
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 w-8 p-0 text-gray-700 hover:bg-red-50 hover:text-red-600"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  actions.onDelete(file);
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete</TooltipContent>
+          </Tooltip>
+        </div>
+      );
+    },
+  },
+];

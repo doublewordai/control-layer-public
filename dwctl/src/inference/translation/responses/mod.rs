@@ -1,0 +1,1033 @@
+
+pub mod hydrate;
+pub mod request;
+pub mod response;
+pub mod streaming;
+pub mod types;
+pub mod util;
+
+use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
+use bytes::Bytes;
+use serde_json::Value;
+use tracing::warn;
+
+use onwards::strict::schemas::chat_completions::{
+    ChatCompletionChunk, ChatCompletionResponse, normalize_chat_completion_chunk_value, normalize_chat_completion_response_value,
+};
+
+use self::types::{ResponsesRequest, Tool};
+
+use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError, parse_request, unsupported_server_tool};
+
+pub struct OpenResponses;
+
+impl OpenResponses {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for OpenResponses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProtocolTranslator for OpenResponses {
+    fn name(&self) -> &'static str {
+        "openai_responses"
+    }
+
+    fn detect(&self, path: &str, _headers: &HeaderMap) -> bool {
+        path.ends_with("/responses")
+    }
+
+    fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
+        let mut req: ResponsesRequest = match parse_request(&body, DECLARED_FIELDS, "OpenAI Responses") {
+            Ok(req) => req,
+            Err(error) => {
+                if let Some(tool_type) = unsupported_server_tool_in_raw_request(&body) {
+                    return Err(unsupported_server_tool(&tool_type));
+                }
+                return Err(error);
+            }
+        };
+        drop_compatible_web_search(&mut req, true);
+        validate_server_tools(&req)?;
+        validate_reasoning_controls(&req)?;
+
+        let chat = request::to_chat_request(&req);
+        let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
+
+        let uri = normalize_path(&parts.uri)?;
+
+        let mut headers = parts.headers.clone();
+        headers.remove(header::CONTENT_LENGTH);
+
+        Ok(TranslatedRequest {
+            uri,
+            headers,
+            body: Bytes::from(new_body),
+        })
+    }
+
+    fn translate_response(&self, request: &Bytes, response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError> {
+        let mut req: ResponsesRequest =
+            serde_json::from_slice(request).map_err(|e| TranslationError::Internal(format!("re-parsing Responses request: {e}")))?;
+        drop_compatible_web_search(&mut req, false);
+        let mut raw: Value = serde_json::from_slice(&body)
+            .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
+        normalize_chat_completion_response_value(&mut raw, &req.model);
+        let cache_write_tokens = util::cache_write_tokens(raw.get("usage"));
+        let chat: ChatCompletionResponse = serde_json::from_value(raw)
+            .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
+
+        let mut out = response::to_responses_response(&chat, &req, response_id);
+        if let Some(usage) = out.usage.as_mut() {
+            usage.input_tokens_details.cache_write_tokens = cache_write_tokens;
+        }
+        serde_json::to_vec(&out)
+            .map(Bytes::from)
+            .map_err(|e| TranslationError::Internal(e.to_string()))
+    }
+
+    fn translate_error(&self, status: StatusCode, body: Bytes) -> (StatusCode, Bytes) {
+        (status, body)
+    }
+
+    fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes) {
+        self.error_for_param(status, message, None)
+    }
+
+    fn error_for_param(&self, status: StatusCode, message: &str, param: Option<&str>) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param, None))
+    }
+
+    fn error_for_code(&self, status: StatusCode, message: &str, param: Option<&str>, code: &str) -> (StatusCode, Bytes) {
+        (status, openai_error(status, message, param, Some(code)))
+    }
+
+    fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
+        Box::new(ResponsesStreamReframer::new(request, response_id))
+    }
+}
+
+fn validate_server_tools(req: &ResponsesRequest) -> Result<(), TranslationError> {
+    let unsupported = req.tools.iter().flatten().find_map(server_tool_type);
+    match unsupported {
+        Some(tool_type) => Err(unsupported_server_tool(tool_type)),
+        None => Ok(()),
+    }
+}
+
+fn drop_compatible_web_search(req: &mut ResponsesRequest, emit_warning: bool) {
+    let Some(tools) = req.tools.as_mut() else {
+        return;
+    };
+
+    let before = tools.len();
+    tools.retain(|tool| !matches!(tool, Tool::WebSearchCurrent { .. }));
+    let dropped = before - tools.len();
+    if dropped == 0 {
+        return;
+    }
+
+    if tools.is_empty() {
+        req.tools = None;
+        req.tool_choice = None;
+    } else if matches!(req.tool_choice.as_ref(), Some(types::ToolChoice::Specific { tool_type, .. }) if tool_type == "web_search") {
+        req.tool_choice = Some(types::ToolChoice::Mode("auto".to_string()));
+    }
+    if emit_warning {
+        warn!(
+            tool_type = "web_search",
+            dropped_tools = dropped,
+            "ignoring unsupported server-side web search tool for Codex compatibility"
+        );
+    }
+}
+
+fn server_tool_type(tool: &Tool) -> Option<&'static str> {
+    match tool {
+        Tool::CodeInterpreter { .. } => Some("code_interpreter"),
+        Tool::FileSearch { .. } => Some("file_search"),
+        Tool::WebSearch { .. } => Some("web_search_preview"),
+        Tool::Mcp { .. } => Some("mcp"),
+        Tool::HostedTool { .. } => Some("hosted_tool"),
+        Tool::Function { .. } | Tool::WebSearchCurrent { .. } | Tool::ComputerUse { .. } | Tool::Namespace { .. } => None,
+    }
+}
+
+fn unsupported_server_tool_in_raw_request(body: &[u8]) -> Option<String> {
+    let request: Value = serde_json::from_slice(body).ok()?;
+    request
+        .get("tools")?
+        .as_array()?
+        .iter()
+        .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+        .find(|tool_type| is_server_tool_type(tool_type))
+        .map(str::to_string)
+}
+
+fn is_server_tool_type(tool_type: &str) -> bool {
+    matches!(
+        tool_type,
+        "code_interpreter" | "file_search" | "image_generation" | "mcp" | "hosted_tool" | "shell"
+    ) || tool_type.starts_with("web_search_")
+}
+
+fn validate_reasoning_controls(req: &ResponsesRequest) -> Result<(), TranslationError> {
+    let mut controls = match &req.extra {
+        Some(Value::Object(extra)) => extra.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Some(reasoning) = &req.reasoning {
+        let reasoning = serde_json::to_value(reasoning).map_err(|e| TranslationError::Internal(e.to_string()))?;
+        controls.insert("reasoning".to_string(), reasoning);
+    }
+    onwards::reasoning::validate_canonical_reasoning("/responses", &Value::Object(controls))
+        .map(|_| ())
+        .map_err(TranslationError::Reasoning)
+}
+
+fn normalize_path(uri: &Uri) -> Result<Uri, TranslationError> {
+    let path = uri.path();
+    let base = path
+        .strip_suffix("/responses")
+        .ok_or_else(|| TranslationError::Internal(format!("path does not end with /responses: {path}")))?;
+    let new_path = format!("{base}/chat/completions");
+    let target = match uri.query() {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path,
+    };
+    target
+        .parse::<Uri>()
+        .map_err(|e| TranslationError::Internal(format!("failed to build normalised URI: {e}")))
+}
+
+const DECLARED_FIELDS: &[&str] = &[
+    "allowed_tools",
+    "annotation_type",
+    "annotations",
+    "arguments",
+    "background",
+    "call_id",
+    "code_interpreter",
+    "computer_use_preview",
+    "container",
+    "content",
+    "content_filter",
+    "custom",
+    "data",
+    "defer_loading",
+    "description",
+    "detail",
+    "display_height",
+    "display_width",
+    "effort",
+    "encrypted_content",
+    "environment",
+    "external_web_access",
+    "extra",
+    "file_id",
+    "file_search",
+    "filename",
+    "filters",
+    "format",
+    "function",
+    "headers",
+    "hosted_tool",
+    "id",
+    "image_url",
+    "include",
+    "input",
+    "input_file",
+    "input_image",
+    "input_text",
+    "instructions",
+    "json_object",
+    "json_schema",
+    "logprobs",
+    "max_num_results",
+    "max_output_tokens",
+    "mcp",
+    "message.output_text.logprobs",
+    "metadata",
+    "model",
+    "name",
+    "namespace",
+    "output",
+    "output_text",
+    "parallel_tool_calls",
+    "parameters",
+    "previous_response_id",
+    "prompt_cache_key",
+    "reasoning",
+    "reasoning.encrypted_content",
+    "reasoning_text",
+    "refusal",
+    "require_approval",
+    "role",
+    "schema",
+    "search_context_size",
+    "server_label",
+    "server_url",
+    "service_tier",
+    "status",
+    "stop",
+    "store",
+    "stream",
+    "strict",
+    "summary",
+    "summary_text",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tool_type",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "type",
+    "user",
+    "user_location",
+    "vector_store_ids",
+    "web_search",
+    "web_search_preview",
+];
+
+fn openai_error(status: StatusCode, message: &str, param: Option<&str>, code: Option<&str>) -> Bytes {
+    let err_type = match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        s if s >= 500 => "server_error",
+        _ => "invalid_request_error",
+    };
+    let mut body = serde_json::json!({ "error": { "message": message, "type": err_type, "param": param } });
+    if let Some(code) = code {
+        body["error"]["code"] = Value::from(code);
+    }
+    Bytes::from(serde_json::to_vec(&body).unwrap_or_default())
+}
+
+struct ResponsesStreamReframer {
+    state: Option<streaming::StreamingState>,
+    model: String,
+    fallback_id: String,
+    errored: bool,
+}
+
+impl ResponsesStreamReframer {
+    fn new(request: &Bytes, response_id: Option<&str>) -> Self {
+        let mut req = serde_json::from_slice::<ResponsesRequest>(request).ok();
+        if let Some(req) = req.as_mut() {
+            drop_compatible_web_search(req, false);
+        }
+        let model = req.as_ref().map(|r| r.model.clone()).unwrap_or_default();
+        let state = req.map(|req| streaming::StreamingState::new(&req, response_id));
+        let fallback_id = response_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
+        Self {
+            state,
+            model,
+            fallback_id,
+            errored: false,
+        }
+    }
+
+    fn emit_error(&mut self, message: &str) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
+        self.errored = true;
+        error_event(message)
+    }
+}
+
+impl StreamReframer for ResponsesStreamReframer {
+    fn push(&mut self, chunk: &Value) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
+        if self.state.is_none() {
+            return self.emit_error("could not initialise Responses stream");
+        }
+        if let Some(err) = chunk.get("error").filter(|e| e.is_object()) {
+            let message = err.get("message").and_then(Value::as_str).unwrap_or("upstream error");
+            return self.emit_error(message);
+        }
+        let mut raw = chunk.clone();
+        normalize_chat_completion_chunk_value(&mut raw, &self.model, &self.fallback_id);
+        let Ok(parsed) = serde_json::from_value::<ChatCompletionChunk>(raw) else {
+            return Vec::new();
+        };
+        let state = self.state.as_mut().expect("state is Some");
+        let events = state.process_chunk(&parsed);
+        if parsed.usage.is_some() {
+            state.preserve_cache_write_tokens(chunk.get("usage"));
+        }
+        events.iter().flat_map(|e| e.to_sse().into_bytes()).collect()
+    }
+
+    fn error(&mut self, message: &str) -> Vec<u8> {
+        self.emit_error(message)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
+        match self.state.as_mut() {
+            Some(state) => state.finalize().iter().flat_map(|e| e.to_sse().into_bytes()).collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+fn error_event(message: &str) -> Vec<u8> {
+    let data = serde_json::json!({ "type": "error", "error": { "message": message, "type": "server_error" } });
+    format!("event: error\ndata: {data}\n\n").into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inference::translation::TranslationRegistry;
+    use crate::inference::translation::middleware::translation_middleware;
+
+    use axum::body::Body;
+    use axum::response::Response;
+    use axum::{Router, extract::Request, routing::post};
+    use onwards::strict::schema_mismatch::SchemaMismatch;
+    use std::sync::Arc;
+
+    fn refusal(body: &[u8]) -> TranslationError {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        match OpenResponses::new().translate_request(&parts, Bytes::copy_from_slice(body)) {
+            Ok(_) => panic!("the body should not translate"),
+            Err(e) => e,
+        }
+    }
+
+    fn located(body: &[u8]) -> Option<SchemaMismatch> {
+        match refusal(body) {
+            TranslationError::SchemaMismatch { mismatch, .. } => mismatch,
+            other => panic!("expected a schema mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_mismatch_names_the_field_but_not_its_value() {
+        let found = located(br#"{"model":"m","input":"hi","max_output_tokens":"planted-secret","metadata":{"planted-secret":1}}"#)
+            .expect("located");
+        assert_eq!(found.path.as_deref(), Some("max_output_tokens"));
+        assert_eq!(found.reason, "invalid_type");
+        assert!(!format!("{found:?}").contains("planted"));
+    }
+
+    #[test]
+    fn a_schema_mismatch_hides_client_keys_in_free_form_values() {
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"client_secret":{"$serde_json::private::RawValue":1}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+
+        let found =
+            located(br#"{"model":"m","input":"hi","metadata":{"model":{"input":{"$serde_json::private::RawValue":1}}}}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("metadata"));
+    }
+
+    #[test]
+    fn a_malformed_input_item_is_located_at_input() {
+        let found =
+            located(br#"{"model":"m","input":[{"type":"function_call","call_id":5,"name":"f","arguments":"{}"}]}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("input"));
+        assert_eq!(found.reason, "no_matching_variant");
+    }
+
+    #[test]
+    fn a_missing_field_is_named() {
+        let found = located(br#"{"input":"hi"}"#).expect("located");
+        assert_eq!(found.path.as_deref(), Some("model"));
+        assert_eq!(found.reason, "missing_field");
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_not_a_schema_mismatch() {
+        assert!(matches!(refusal(b"{not json"), TranslationError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn server_side_tools_are_rejected_by_type() {
+        let cases = [
+            (serde_json::json!({"type": "code_interpreter"}), "code_interpreter"),
+            (serde_json::json!({"type": "file_search"}), "file_search"),
+            (serde_json::json!({"type": "web_search_preview"}), "web_search_preview"),
+            (
+                serde_json::json!({"type": "mcp", "server_label": "docs", "server_url": "https://example.test"}),
+                "mcp",
+            ),
+            (serde_json::json!({"type": "hosted_tool", "name": "web_search"}), "hosted_tool"),
+            (serde_json::json!({"type": "web_search_2025_08_26"}), "web_search_2025_08_26"),
+            (serde_json::json!({"type": "image_generation"}), "image_generation"),
+            (serde_json::json!({"type": "shell"}), "shell"),
+        ];
+
+        for (tool, expected_type) in cases {
+            let body = serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi", "tools": [tool]})).unwrap();
+            match refusal(&body) {
+                TranslationError::UnsupportedParameter { param: "tools", message } => {
+                    assert!(message.contains(expected_type), "{message}");
+                    assert!(message.contains("server-side tool"), "{message}");
+                }
+                other => panic!("expected {expected_type} to be rejected clearly, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn codex_web_search_is_dropped_while_client_tools_are_preserved() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [
+                {"type": "web_search", "external_web_access": true},
+                {
+                    "type": "function", "name": "lookup", "description": "Look up data",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "tool_choice": {"type": "web_search"}
+        });
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+
+        let translated = OpenResponses::new()
+            .translate_request(&parts, Bytes::from(serde_json::to_vec(&body).unwrap()))
+            .expect("Codex web_search should be ignored");
+        let chat: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(chat["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn codex_web_search_is_dropped_with_its_tool_choice_when_no_tools_remain() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "tools": [{"type": "web_search", "external_web_access": true}],
+            "tool_choice": "auto"
+        });
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+
+        let translated = OpenResponses::new()
+            .translate_request(&parts, Bytes::from(serde_json::to_vec(&body).unwrap()))
+            .expect("Codex web_search should be ignored");
+        let chat: Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert!(chat.get("tools").is_none());
+        assert!(chat.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn client_executed_tool_types_are_not_rejected() {
+        let cases = [
+            serde_json::json!({
+                "type": "function", "name": "lookup", "description": "Look up data",
+                "parameters": {"type": "object"}
+            }),
+            serde_json::json!({
+                "type": "computer_use_preview", "environment": "browser",
+                "display_width": 1024, "display_height": 768
+            }),
+            serde_json::json!({
+                "type": "namespace", "name": "functions", "tools": [{
+                    "type": "custom", "name": "apply_patch"
+                }]
+            }),
+        ];
+
+        for tool in cases {
+            let body = serde_json::to_vec(&serde_json::json!({"model": "m", "input": "hi", "tools": [tool]})).unwrap();
+            let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+            OpenResponses::new()
+                .translate_request(&parts, Bytes::from(body))
+                .expect("client-executed tool should remain accepted");
+        }
+    }
+
+    #[test]
+    fn errors_name_the_param() {
+        let (_, body) = OpenResponses::new().error_for_param(StatusCode::BAD_REQUEST, "bad", Some("input"));
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "input");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        let (_, body) = OpenResponses::new().error_from_message(StatusCode::BAD_REQUEST, "bad");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], Value::Null);
+    }
+
+    #[test]
+    fn declared_fields_are_sorted_and_unique() {
+        assert!(DECLARED_FIELDS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn declared_fields_are_the_request_types_fields() {
+        let source = include_str!("types.rs");
+        let start = source.find("/// Request body for POST /v1/responses").expect("request types start");
+        let end = source.find("/// Response from POST /v1/responses").expect("response types start");
+        let declared: std::collections::BTreeSet<String> =
+            onwards::test_utils::declared_field_names(&source[start..end]).into_iter().collect();
+        let listed: std::collections::BTreeSet<String> = DECLARED_FIELDS.iter().map(|name| name.to_string()).collect();
+        assert_eq!(listed, declared, "DECLARED_FIELDS must list exactly the request types' fields");
+    }
+
+    #[test]
+    fn detect_claims_responses_ignoring_headers() {
+        let t = OpenResponses::new();
+        assert!(t.detect("/v1/responses", &HeaderMap::new()));
+        assert!(t.detect("/ai/v1/responses", &HeaderMap::new()));
+        assert!(!t.detect("/v1/chat/completions", &HeaderMap::new()));
+        assert!(!t.detect("/v1/messages", &HeaderMap::new()));
+    }
+
+    #[test]
+    fn request_translates_and_normalizes_path() {
+        let req = axum::http::Request::builder().uri("/ai/v1/responses").body(()).unwrap();
+        let (parts, ()) = req.into_parts();
+        let body = Bytes::from(serde_json::to_vec(&serde_json::json!({ "model": "gpt-4o", "input": "hi" })).unwrap());
+
+        let out = OpenResponses::new().translate_request(&parts, body).unwrap();
+
+        assert_eq!(out.uri.path(), "/ai/v1/chat/completions");
+        let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["model"], "gpt-4o");
+        assert_eq!(chat["messages"][0]["role"], "user");
+        assert_eq!(chat["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn blocking_response_emits_standard_cache_usage_only() {
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let usage = serde_json::json!({
+            "prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
+            "prompt_tokens_details": {"cached_tokens": 1000},
+            "cache_read_input_tokens": 1000,
+            "cache_creation_input_tokens": 600,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 100,
+                "ephemeral_1h_input_tokens": 200,
+                "ephemeral_24h_input_tokens": 300
+            },
+            "unrelated_provider_field": "do not forward"
+        });
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": usage
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["usage"]["input_tokens"], 2000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cache_write_tokens"], 600);
+        for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
+            assert!(response["usage"].get(field).is_none(), "internal field {field} must not be public");
+        }
+        assert!(response["usage"].get("unrelated_provider_field").is_none());
+    }
+
+    #[test]
+    fn displayed_cache_tokens_do_not_create_billing_fields() {
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
+                "prompt_tokens_details": {"cached_tokens": 1000}}
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+        for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
+            assert!(
+                response["usage"].get(field).is_none(),
+                "display-only counts must not synthesize {field}"
+            );
+        }
+    }
+
+    async fn fake_onwards_chat_completions(req: Request) -> Response {
+        let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        let received: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(received.get("input").is_none(), "input should be gone, got: {received}");
+        assert_eq!(received["messages"][0]["content"], "hello");
+        assert!(
+            received.get("tools").is_none(),
+            "ignored web_search should be gone, got: {received}"
+        );
+
+        let resp = serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": received["model"],
+            "choices": [ { "index": 0, "message": { "role": "assistant", "content": "hi back" }, "finish_reason": "stop" } ],
+            "usage": { "prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6 }
+        });
+        let mut r = Response::new(Body::from(serde_json::to_vec(&resp).unwrap()));
+        r.headers_mut()
+            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        r
+    }
+
+    #[tokio::test]
+    async fn responses_round_trips_via_alias_route() {
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_onwards_chat_completions))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({
+                "model": "gpt-4o",
+                "input": "hello",
+                "tools": [{"type": "web_search", "external_web_access": true}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["model"], "gpt-4o");
+        assert_eq!(body["status"], "completed");
+        assert!(body["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(body["output"][0]["content"][0]["text"], "hi back");
+        assert_eq!(body["usage"]["input_tokens"], 4);
+        assert_eq!(body["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn server_side_tool_returns_openai_400_before_downstream() {
+        async fn must_not_run(_req: Request) -> Response {
+            panic!("unsupported server tool reached downstream")
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(must_not_run))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({
+                "model": "gpt-4o", "input": "hello",
+                "tools": [{"type": "web_search_preview"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 400);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "tools");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert!(body["error"]["message"].as_str().unwrap().contains("web_search_preview"));
+    }
+
+    #[tokio::test]
+    async fn streaming_request_is_reframed_to_responses_events() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi", "stream": true }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        for ev in [
+            "response.created",
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.completed",
+        ] {
+            assert!(text.contains(&format!("event: {ev}")), "missing {ev} in:\n{text}");
+        }
+        assert!(
+            text.contains(r#""delta":"Hi""#) || text.contains("Hi"),
+            "missing text delta in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn embedded_upstream_error_ends_the_stream_with_an_error_event() {
+        let request = Bytes::from(r#"{"model":"m","input":"hi","stream":true}"#);
+        let mut reframer = OpenResponses::new().stream_reframer(&request, None);
+        let content = serde_json::json!({
+            "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "Hel"}}]
+        });
+        let error = serde_json::json!({
+            "error": {"message": "The response stream was interrupted before it finished. Retry the request.", "type": "api_error", "param": null, "code": 502}
+        });
+
+        let mut out = reframer.push(&content);
+        out.extend(reframer.push(&error));
+        out.extend(reframer.push(&content));
+        out.extend(reframer.finish());
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.contains("event: response.output_text.delta"), "{text}");
+        assert!(text.contains("event: error"), "{text}");
+        assert!(text.contains("interrupted before it finished"), "{text}");
+        assert!(!text.contains("response.completed"), "{text}");
+        assert_eq!(text.matches("event: error").count(), 1, "{text}");
+        assert!(
+            text.rfind("event: error") > text.rfind("output_text.delta"),
+            "nothing follows the error: {text}"
+        );
+    }
+
+    #[test]
+    fn blocking_reply_missing_optional_fields_is_tolerated() {
+        let request = Bytes::from(r#"{"model":"m","input":"hi","max_output_tokens":1}"#);
+        let body = Bytes::from(r#"{"choices":[{"message":{"content":"Hello"},"finish_reason":"length"}]}"#);
+
+        let out = OpenResponses::new()
+            .translate_response(&request, None, body)
+            .expect("must translate");
+
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "incomplete", "length-capped replies surface as incomplete");
+        assert_eq!(v["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(v["model"], "m", "model backfilled from the request");
+        assert_eq!(v["output"][0]["role"], "assistant", "missing role defaults to assistant");
+        assert_eq!(v["output"][0]["content"][0]["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn streamed_chunks_missing_optional_fields_are_reframed() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi", "stream": true, "max_output_tokens": 1 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(text.contains("event: response.output_text.delta"), "chunk was dropped:\n{text}");
+        assert!(text.contains("Hi"), "missing text delta in:\n{text}");
+    }
+
+    #[tokio::test]
+    async fn length_cut_stream_ends_with_response_incomplete() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Let me think\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "m", "input": "hi", "stream": true, "max_output_tokens": 16 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(!text.contains("response.completed"), "{text}");
+        let terminal = text
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .last()
+            .expect("a terminal event");
+        let terminal: serde_json::Value = serde_json::from_str(terminal).unwrap();
+        assert_eq!(terminal["type"], "response.incomplete", "{text}");
+        assert_eq!(terminal["response"]["status"], "incomplete");
+        assert_eq!(terminal["response"]["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(terminal["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
+    }
+
+    #[tokio::test]
+    async fn untranslatable_success_body_is_a_non_retriable_status() {
+        async fn bad_handler(_req: Request) -> Response {
+            let mut r = Response::new(Body::from("not json at all"));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(bad_handler))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi" }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 422);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["message"], "response translation failed");
+    }
+
+    #[tokio::test]
+    async fn native_thinking_fields_are_refused_before_translation() {
+        async fn unreachable_upstream(_req: Request) -> Response {
+            panic!("a refused request must not reach onwards");
+        }
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(unreachable_upstream))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let cases = [
+            ("reasoning_effort", serde_json::json!("none")),
+            (
+                "chat_template_kwargs.enable_thinking",
+                serde_json::json!({"enable_thinking": false}),
+            ),
+            ("chat_template_kwargs.thinking", serde_json::json!({"thinking": false})),
+            ("chat_template_kwargs", serde_json::json!({"reasoning_effort": "low"})),
+            ("thinking", serde_json::json!({"type": "disabled"})),
+            ("thinking_token_budget", serde_json::json!(128)),
+        ];
+        for (param, value) in cases {
+            let field = param.split('.').next().unwrap();
+            let mut request = serde_json::json!({"model": "gpt-4o", "input": "hello", "reasoning": {"effort": "low"}});
+            request[field] = value;
+
+            let response = server.post("/ai/v1/responses").json(&request).await;
+
+            assert_eq!(response.status_code().as_u16(), 400, "{param}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{param}: {body}");
+            assert_eq!(body["error"]["code"], "unsupported_parameter", "{param}: {body}");
+            assert_eq!(body["error"]["param"], param, "{body}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("Unsupported parameter '{param}'; use 'reasoning.effort'."),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_reasoning_effort_is_named_by_its_responses_path() {
+        let error = match refusal(br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"ultra"}}"#) {
+            TranslationError::Reasoning(error) => error,
+            other => panic!("expected a reasoning refusal, got {other:?}"),
+        };
+        assert_eq!(error.param(), Some("reasoning.effort"));
+        assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn canonical_reasoning_and_nvext_still_translate() {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        let body =
+            br#"{"model":"gpt-4o","input":"hello","reasoning":{"effort":"none","summary":"auto"},"nvext":{"routing_constraints":{}}}"#;
+
+        let out = OpenResponses::new().translate_request(&parts, Bytes::from_static(body)).unwrap();
+
+        let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["reasoning_effort"], "none");
+        assert!(chat.get("nvext").is_some(), "{chat}");
+    }
+
+    #[test]
+    fn prompt_cache_key_reaches_chat_and_is_echoed() {
+        let (parts, ()) = axum::http::Request::builder().uri("/v1/responses").body(()).unwrap().into_parts();
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi","prompt_cache_key":"session-123"}"#);
+
+        let out = OpenResponses::new().translate_request(&parts, request.clone()).unwrap();
+        let chat: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(chat["prompt_cache_key"], "session-123", "{chat}");
+
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["prompt_cache_key"], "session-123");
+
+        let plain = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let out = OpenResponses::new().translate_request(&parts, plain.clone()).unwrap();
+        let chat: Value = serde_json::from_slice(&out.body).unwrap();
+        assert!(chat.get("prompt_cache_key").is_none(), "{chat}");
+        let translated = OpenResponses::new()
+            .translate_response(&plain, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["prompt_cache_key"], Value::Null);
+    }
+}

@@ -1,0 +1,201 @@
+[package]
+name = "dwctl"
+version = "17.1.4"
+edition = "2024"
+publish = false
+description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "dwctl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dwctl"
+path = "src/main.rs"
+
+[[bin]]
+name = "dwctl-model-provisioning"
+path = "src/bin/model_provisioning.rs"
+
+[features]
+default = ["embedded-db"]
+embedded-db = ["dep:postgresql_embedded"]
+
+[dependencies]
+axum = { version = "0.8", features = ["multipart"] }
+fusillade = { path = "../fusillade" }
+fusillade-arsenal = { path = "../fusillade-arsenal" }
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+notify = "8.2.0"
+sqlx = { version = "0.8", features = [
+  "runtime-tokio-rustls",
+  "postgres",
+  "uuid",
+  "chrono",
+  "migrate",
+  "rust_decimal",
+] }
+scopeguard = "1"
+underway = { git = "https://github.com/doublewordai/underway", rev = "d4899d5f0e2bfb341ba7886958d09b6665a848ea" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_yaml = "0.9"
+schemars = "1.2"
+uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+arc-swap = "1.7"
+log = "0.4"
+tracing = "0.1"
+regex = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "tracing-log"] }
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+  "http-proto",
+  "http-json",
+  "reqwest-blocking-client",
+  "reqwest-rustls",
+] }
+tracing-opentelemetry = "0.34.0"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
+async-trait = "0.1"
+async-stream = "0.3"
+eventsource-stream = "0.2"
+openai-reassembler = { path = "../openai-reassembler" }
+url = { version = "2.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls-no-provider",
+  "http2",
+  "charset",
+] }
+humantime = "2.2.0"
+humantime-serde = "1.1"
+utoipa = { version = "5.0", features = [
+  "axum_extras",
+  "chrono",
+  "uuid",
+  "macros",
+] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+figment = { version = "0.10", features = ["yaml", "env", "test"] }
+rand = "0.10"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+argon2 = "0.6"
+base64 = "0.23"
+bytes = "1.5"
+onwards = { path = "../onwards" }
+thiserror = "2.0.14"
+crc = "3"
+axum-prometheus = "0.10"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+outlet = "0.11.1"
+outlet-postgres = "0.8.0"
+brotli = "8.0"
+flate2 = "1"
+zstd = "0.14"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
+lettre = { version = "0.11", features = [
+  "smtp-transport",
+  "file-transport",
+  "tokio1-rustls-tls",
+  "builder",
+], default-features = false }
+hickory-resolver = { version = "0.26.3", default-features = false, features = [
+  "system-config",
+  "tokio",
+] }
+aes-gcm = "0.11.0"
+deadpool-redis = "0.22"
+redis = { version = "0.32", default-features = false, features = [
+  "tokio-rustls-comp",
+  "connection-manager",
+] }
+paste = "1.0"
+serde_with = "3.14.1"
+rust_decimal = { version = "1.38.0", features = ["serde"] }
+bon = "3.3"
+once_cell = "1.20"
+prometheus = "0.14"
+postgresql_embedded = { version = "0.20", optional = true, default-features = false, features = [
+  "bundled",
+  "rustls",
+  "theseus",
+] }
+rust-embed = { version = "8.5", features = ["debug-embed"] }
+mime_guess = "2.0"
+futures = "0.3.31"
+http-body = "1"
+http-body-util = "0.1"
+dashmap = { version = "6.1.0", features = ["serde"] }
+moka = { version = "0.12", features = ["future"] }
+async-stripe = { version = "1.0.0-rc.0", default-features = false, features = [
+  "rustls-tls-webpki-roots",
+  "rustls-aws-lc-rs",
+] }
+async-stripe-checkout = { version = "1.0.0-rc.0", features = [
+  "checkout_session",
+] }
+async-stripe-webhook = { version = "1.0.0-rc.0", features = [
+  "async-stripe-checkout",
+  "deserialize",
+] }
+async-stripe-types = { version = "1.0.0-rc.0" }
+async-stripe-shared = { version = "1.0.0-rc.0" }
+async-stripe-core = { version = "1.0.0-rc.0", features = [
+  "payment_intent",
+  "customer",
+] }
+async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+async-stripe-billing = { version = "1.0.0-rc.0", features = [
+  "billing_portal_session",
+  "invoice_item",
+] }
+sqlx-pool-router = "1.0"
+minijinja = "2.15.1"
+multer = "3.1.0"
+ctor = "0.9"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+aws-sdk-s3 = { version = "1.21", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-credential-types = "1.1"
+google-cloud-storage = "1.12"
+google-cloud-auth = "1.10"
+
+[dev-dependencies]
+dwctl-test-macros = { path = "test-macros" }
+dotenvy = "0.15"
+axum-test = { version = "18.4.1" }
+miniserde = "0.1"
+sqlx = { version = "0.8", features = [
+  "postgres",
+  "runtime-tokio-rustls",
+  "uuid",
+  "chrono",
+  "migrate",
+] }
+tokio-test = "0.4"
+serial_test = "3.0"
+test-log = { version = "0.2", features = ["trace"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
+tempfile = "3.0"
+wiremock = "0.6"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+serde_urlencoded = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = ["profiling"] }
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+jemalloc_pprof = { version = "0.9.0", features = ["symbolize"] }
+
+[lints]
+workspace = true

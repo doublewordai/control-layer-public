@@ -1,0 +1,1077 @@
+import React, { useState, useEffect, useMemo } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
+import { toast } from "sonner";
+import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import {
+  type DeltaWithReasoning,
+  applyDelta,
+  createReasoningAccumulator,
+  finalizeReasoning,
+} from "./reasoning";
+import { useQuery } from "@tanstack/react-query";
+import { useModels, dwctlApi } from "../../../../api/control-layer";
+import { type ModelType } from "../../../../utils/modelType";
+import { isPlaygroundDenied } from "../../../../utils/modelAccess";
+import type {
+  Model,
+  RerankResponse,
+} from "../../../../api/control-layer/types";
+import EmbeddingPlayground from "./EmbeddingPlayground";
+import GenerationPlayground from "./GenerationPlayground";
+import RerankPlayground from "./RerankPlayground";
+import { Button } from "../../../ui/button";
+import { ModelCombobox } from "../../../ui/model-combobox";
+
+interface ImageContent {
+  type: "image_url";
+  image_url: {
+    url: string;
+  };
+}
+
+interface TextContent {
+  type: "text";
+  text: string;
+}
+
+type MessageContent = string | (TextContent | ImageContent)[];
+
+interface MessageMetrics {
+  timeToFirstToken?: number;
+  totalTime?: number;
+  tokensPerSecond?: number;
+  totalTokens?: number;
+  inputTokens?: number;
+}
+
+interface Message {
+  role: "user" | "assistant" | "system";
+  content: MessageContent;
+  reasoningContent?: string;
+  timestamp: Date;
+  metrics?: MessageMetrics;
+}
+
+
+const Playground: React.FC = () => {
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const selectedModelId = searchParams.get("model") || undefined;
+  const fromUrl = searchParams.get("from");
+
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [currentMessage, setCurrentMessage] = useState("");
+  const [uploadedImages, setUploadedImages] = useState<string[]>([]);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingContent, setStreamingContent] = useState("");
+  const [streamingReasoningContent, setStreamingReasoningContent] =
+    useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<Model | null>(null);
+  const [modelType, setModelType] = useState<ModelType>("chat");
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [systemPromptModelB, setSystemPromptModelB] = useState("");
+  const [textA, setTextA] = useState("");
+  const [textB, setTextB] = useState("");
+  const [similarityResult, setSimilarityResult] = useState<{
+    score: number;
+    category: string;
+  } | null>(null);
+
+  const { data: modelsData, error: modelsError } = useModels({
+    accessible: true,
+  });
+  const models = useMemo(() => modelsData?.data ?? [], [modelsData]);
+
+  const { data: urlModel } = useQuery({
+    queryKey: ["playground-model", selectedModelId],
+    queryFn: () => dwctlApi.models.get(selectedModelId!),
+    enabled: !!selectedModelId && !selectedModel,
+  });
+
+  useEffect(() => {
+    if (selectedModel) return;
+
+    if (selectedModelId) {
+      const model = urlModel ?? models.find((m) => m.id === selectedModelId);
+      if (model) {
+        if (isPlaygroundDenied(model)) {
+          setError(
+            `Playground access to "${model.alias}" is restricted by traffic routing rules.`,
+          );
+          return;
+        }
+        setSelectedModel(model);
+        setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
+      }
+    } else if (models.length > 0) {
+      const model = models.find((m) => !isPlaygroundDenied(m));
+      if (model) {
+        setSelectedModel(model);
+        setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
+        navigate(`/playground?model=${encodeURIComponent(model.id)}`, {
+          replace: true,
+        });
+      }
+    }
+  }, [models, selectedModelId, selectedModel, urlModel, navigate]);
+
+  useEffect(() => {
+    if (modelsError) {
+      console.error("Error loading models:", modelsError);
+      setError("Failed to load models");
+    }
+  }, [modelsError]);
+
+  useEffect(() => {
+    if (selectedModel) {
+      setMessages([]);
+      setStreamingContent("");
+      setStreamingReasoningContent("");
+      setSimilarityResult(null);
+      setRerankResult(null);
+      setError(null);
+      setCurrentMessage("");
+      setUploadedImages([]);
+      setSystemPrompt("");
+      setSystemPromptModelB("");
+      setTextA("");
+      setTextB("");
+      setQuery("What is the capital of France?");
+      setDocuments([
+        "The capital of Brazil is Brasilia.",
+        "The capital of France is Paris.",
+        "Horses and cows are both animals",
+      ]);
+      setIsComparisonMode(false);
+      setComparisonModel(null);
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
+      setCurrentMessageModelB("");
+      setIsSplitInput(false);
+    }
+  }, [selectedModel]);
+
+  const handleModelChange = (model: Model) => {
+    if (model) {
+      setSelectedModel(model);
+      setModelType((model.model_type?.toLowerCase() as ModelType) || "chat");
+      navigate(`/playground?model=${encodeURIComponent(model.id)}`);
+    }
+  };
+
+  const [query, setQuery] = useState("What is the capital of France?");
+  const [documents, setDocuments] = useState<string[]>([
+    "The capital of Brazil is Brasilia.",
+    "The capital of France is Paris.",
+    "Horses and cows are both animals",
+  ]);
+  const [rerankResult, setRerankResult] = useState<RerankResponse | null>(null);
+  const baseURL = `${window.location.origin}/admin/api/v1/ai/v1`;
+
+  const openai = new OpenAI({
+    baseURL,
+    apiKey: "",
+    dangerouslyAllowBrowser: true,
+    defaultHeaders: {
+      Authorization: null as any,
+    },
+  });
+
+  const calculateCosineSimilarity = (
+    vecA: number[],
+    vecB: number[],
+  ): number => {
+    if (vecA.length !== vecB.length) {
+      throw new Error("Vectors must have the same dimension");
+    }
+
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+
+    for (let i = 0; i < vecA.length; i++) {
+      dotProduct += vecA[i] * vecB[i];
+      normA += vecA[i] * vecA[i];
+      normB += vecB[i] * vecB[i];
+    }
+
+    normA = Math.sqrt(normA);
+    normB = Math.sqrt(normB);
+
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+
+    return dotProduct / (normA * normB);
+  };
+
+  const getSimilarityCategory = (score: number): string => {
+    if (score >= 0.9) return "Very Similar";
+    if (score >= 0.7) return "Similar";
+    if (score >= 0.5) return "Somewhat Similar";
+    if (score >= 0.3) return "Slightly Similar";
+    return "Different";
+  };
+
+  const handleCompareSimilarity = async () => {
+    if (!textA.trim() || !textB.trim() || isStreaming || !selectedModel) return;
+
+    setIsStreaming(true);
+    setSimilarityResult(null);
+    setError(null);
+
+    try {
+      const [responseA, responseB] = await Promise.all([
+        openai.embeddings.create({
+          model: selectedModel.alias,
+          input: textA.trim(),
+        }),
+        openai.embeddings.create({
+          model: selectedModel.alias,
+          input: textB.trim(),
+        }),
+      ]);
+
+      const embeddingA = responseA.data[0].embedding;
+      const embeddingB = responseB.data[0].embedding;
+
+      const similarity = calculateCosineSimilarity(embeddingA, embeddingB);
+      const category = getSimilarityCategory(similarity);
+
+      setSimilarityResult({
+        score: similarity,
+        category: category,
+      });
+    } catch (err) {
+      console.error("Error comparing similarity:", err);
+      setError(
+        err instanceof Error ? err.message : "Failed to compare similarity",
+      );
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const handleRerank = async () => {
+    if (
+      !query.trim() ||
+      documents.length < 2 ||
+      documents.some((doc) => !doc.trim()) ||
+      isStreaming ||
+      !selectedModel
+    )
+      return;
+
+    setIsStreaming(true);
+    setRerankResult(null);
+    setError(null);
+
+    try {
+      const response = await fetch(
+        `${window.location.origin}/admin/api/v1/ai/rerank`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: selectedModel.alias,
+            query: query.trim(),
+            documents: documents
+              .filter((doc) => doc.trim())
+              .map((doc) => doc.trim()),
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      setRerankResult(result);
+    } catch (err) {
+      console.error("Error reranking documents:", err);
+      setError(
+        err instanceof Error ? err.message : "Failed to rerank documents",
+      );
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  const handleDocumentChange = (index: number, value: string) => {
+    const newDocuments = [...documents];
+    newDocuments[index] = value;
+    setDocuments(newDocuments);
+  };
+
+  const handleAddDocument = () => {
+    if (documents.length < 10) {
+      setDocuments([...documents, ""]);
+    }
+  };
+
+  const handleRemoveDocument = (index: number) => {
+    if (documents.length > 2) {
+      const newDocuments = documents.filter((_, i) => i !== index);
+      setDocuments(newDocuments);
+    }
+  };
+
+  const cancelStreaming = () => {
+    if (abortController) {
+      abortController.abort();
+      setAbortController(null);
+      setIsStreaming(false);
+      setStreamingContent("");
+      setStreamingReasoningContent("");
+    }
+  };
+
+  const handleImageUpload = async (
+    event: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const newImages: string[] = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+
+      if (!file.type.startsWith("image/")) {
+        setError("Please select only image files");
+        continue;
+      }
+
+      if (file.size > 10 * 1024 * 1024) {
+        setError("Image size must be less than 10MB");
+        continue;
+      }
+
+      const reader = new FileReader();
+      const base64Promise = new Promise<string>((resolve) => {
+        reader.onload = (e) => {
+          const base64String = e.target?.result as string;
+          resolve(base64String);
+        };
+        reader.readAsDataURL(file);
+      });
+
+      const base64 = await base64Promise;
+      newImages.push(base64);
+    }
+
+    setUploadedImages((prev) => [...prev, ...newImages]);
+    event.target.value = "";
+  };
+
+  const handleRemoveImage = (index: number) => {
+    setUploadedImages((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleSendMessage = async () => {
+    if (
+      (!currentMessage.trim() && uploadedImages.length === 0) ||
+      isStreaming ||
+      !selectedModel
+    )
+      return;
+
+    let messageContent: MessageContent;
+    if (uploadedImages.length > 0) {
+      const contentParts: (TextContent | ImageContent)[] = [];
+
+      if (currentMessage.trim()) {
+        contentParts.push({
+          type: "text",
+          text: currentMessage.trim(),
+        });
+      }
+
+      uploadedImages.forEach((imageUrl) => {
+        contentParts.push({
+          type: "image_url",
+          image_url: {
+            url: imageUrl,
+          },
+        });
+      });
+
+      messageContent = contentParts;
+    } else {
+      messageContent = currentMessage.trim();
+    }
+
+    const userMessage: Message = {
+      role: "user",
+      content: messageContent,
+      timestamp: new Date(),
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setCurrentMessage("");
+    setUploadedImages([]);
+    setIsStreaming(true);
+    setStreamingContent("");
+    setStreamingReasoningContent("");
+    setError(null);
+
+    const controller = new AbortController();
+    setAbortController(controller);
+
+    if (isComparisonMode && comparisonModel && !isSplitInput) {
+      setMessagesModelB((prev) => [...prev, userMessage]);
+      setIsStreamingModelB(true);
+      setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
+      const controllerB = new AbortController();
+      setAbortControllerModelB(controllerB);
+
+      (async () => {
+        try {
+          const startTimeB = performance.now();
+          let firstTokenTimeB: number | undefined;
+          let totalTokensB = 0;
+          let inputTokensB = 0;
+
+          const apiMessagesB: ChatCompletionMessageParam[] = [];
+
+          const systemPromptB =
+            systemPromptModelB.trim() || systemPrompt.trim();
+          if (systemPromptB) {
+            apiMessagesB.push({
+              role: "system",
+              content: systemPromptB,
+            });
+          }
+
+          messagesModelB.forEach((msg) => {
+            apiMessagesB.push({
+              role: msg.role,
+              content: msg.content,
+            } as ChatCompletionMessageParam);
+          });
+
+          apiMessagesB.push({ role: "user", content: userMessage.content });
+
+          const streamB = await openai.chat.completions.create(
+            {
+              model: comparisonModel.alias,
+              messages: apiMessagesB,
+              stream: true,
+              stream_options: {
+                include_usage: true,
+              },
+            },
+            {
+              signal: controllerB.signal,
+            },
+          );
+
+          const accB = createReasoningAccumulator();
+          let chunkCountB = 0;
+
+          for await (const chunk of streamB) {
+            const { contentDelta, reasoningDelta, content, reasoning } =
+              applyDelta(
+                accB,
+                chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+              );
+
+            if (reasoning) {
+              setStreamingReasoningContentModelB(reasoning);
+            }
+
+            if (contentDelta) {
+              chunkCountB++;
+              setStreamingContentModelB(content);
+            }
+
+            if (
+              (contentDelta || reasoningDelta) &&
+              firstTokenTimeB === undefined
+            ) {
+              firstTokenTimeB = performance.now() - startTimeB;
+            }
+
+            if (chunk.usage?.completion_tokens) {
+              totalTokensB = chunk.usage.completion_tokens;
+            }
+            if (chunk.usage?.prompt_tokens) {
+              inputTokensB = chunk.usage.prompt_tokens;
+            }
+          }
+
+          const finalB = finalizeReasoning(accB);
+
+          const endTimeB = performance.now();
+          const totalTimeB = endTimeB - startTimeB;
+
+          const metricsB: MessageMetrics = {
+            timeToFirstToken: firstTokenTimeB,
+            totalTime: totalTimeB,
+            totalTokens: totalTokensB || chunkCountB,
+            inputTokens: inputTokensB || undefined,
+            tokensPerSecond:
+              totalTokensB && totalTimeB > 0
+                ? totalTokensB / (totalTimeB / 1000)
+                : undefined,
+          };
+
+          const assistantMessageB: Message = {
+            role: "assistant",
+            content: finalB.content,
+            reasoningContent: finalB.reasoning || undefined,
+            timestamp: new Date(),
+            metrics: metricsB,
+          };
+          setMessagesModelB((prev) => [...prev, assistantMessageB]);
+          setStreamingContentModelB("");
+          setStreamingReasoningContentModelB("");
+        } catch (err) {
+          console.error("Error sending message to Model B:", err);
+        } finally {
+          setIsStreamingModelB(false);
+          setAbortControllerModelB(null);
+        }
+      })();
+    }
+
+    try {
+      const apiMessages: ChatCompletionMessageParam[] = [];
+
+      if (systemPrompt.trim()) {
+        apiMessages.push({
+          role: "system",
+          content: systemPrompt.trim(),
+        });
+      }
+
+      messages.forEach((msg) => {
+        apiMessages.push({
+          role: msg.role,
+          content: msg.content,
+        } as ChatCompletionMessageParam);
+      });
+
+      apiMessages.push({ role: "user", content: userMessage.content });
+
+      const startTime = performance.now();
+      let firstTokenTime: number | undefined;
+      let totalTokens = 0;
+      let inputTokens = 0;
+
+      const stream = await openai.chat.completions.create(
+        {
+          model: selectedModel.alias,
+          messages: apiMessages,
+          stream: true,
+          stream_options: {
+            include_usage: true,
+          },
+        },
+        {
+          signal: controller.signal,
+        },
+      );
+
+      const acc = createReasoningAccumulator();
+      let chunkCount = 0;
+
+      for await (const chunk of stream) {
+        const { contentDelta, reasoningDelta, content, reasoning } = applyDelta(
+          acc,
+          chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+        );
+
+        if (reasoning) {
+          setStreamingReasoningContent(reasoning);
+        }
+
+        if (contentDelta) {
+          chunkCount++;
+
+          setStreamingContent(content);
+        }
+
+        if ((contentDelta || reasoningDelta) && firstTokenTime === undefined) {
+          firstTokenTime = performance.now() - startTime;
+        }
+
+        if (chunk.usage?.completion_tokens) {
+          totalTokens = chunk.usage.completion_tokens;
+        }
+        if (chunk.usage?.prompt_tokens) {
+          inputTokens = chunk.usage.prompt_tokens;
+        }
+      }
+
+      const final = finalizeReasoning(acc);
+      const endTime = performance.now();
+      const totalTime = endTime - startTime;
+
+      const metrics: MessageMetrics = {
+        timeToFirstToken: firstTokenTime,
+        totalTime,
+        totalTokens: totalTokens || chunkCount,
+        inputTokens: inputTokens || undefined,
+        tokensPerSecond:
+          totalTokens && totalTime > 0
+            ? totalTokens / (totalTime / 1000)
+            : undefined,
+      };
+
+      const assistantMessage: Message = {
+        role: "assistant",
+        content: final.content,
+        reasoningContent: final.reasoning || undefined,
+        timestamp: new Date(),
+        metrics,
+      };
+
+      setMessages((prev) => [...prev, assistantMessage]);
+      setStreamingContent("");
+      setStreamingReasoningContent("");
+    } catch (err) {
+      console.error("Error sending message:", err);
+      if (err instanceof Error && err.name === "AbortError") {
+        setError("Message cancelled");
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to send message");
+      }
+    } finally {
+      setIsStreaming(false);
+      setAbortController(null);
+    }
+  };
+
+  const handleSendMessageModelB = async () => {
+    if (!currentMessageModelB.trim() || isStreamingModelB || !comparisonModel)
+      return;
+
+    const userMessage: Message = {
+      role: "user",
+      content: currentMessageModelB.trim(),
+      timestamp: new Date(),
+    };
+
+    setMessagesModelB((prev) => [...prev, userMessage]);
+    setCurrentMessageModelB("");
+    setIsStreamingModelB(true);
+    setStreamingContentModelB("");
+    setStreamingReasoningContentModelB("");
+
+    const controller = new AbortController();
+    setAbortControllerModelB(controller);
+
+    try {
+      const startTime = performance.now();
+      let firstTokenTime: number | undefined;
+      let totalTokens = 0;
+      let inputTokens = 0;
+
+      const apiMessagesB: ChatCompletionMessageParam[] = [];
+
+      const systemPromptB = systemPromptModelB.trim() || systemPrompt.trim();
+      if (systemPromptB) {
+        apiMessagesB.push({
+          role: "system",
+          content: systemPromptB,
+        });
+      }
+
+      messagesModelB.forEach((msg) => {
+        apiMessagesB.push({
+          role: msg.role,
+          content: msg.content,
+        } as ChatCompletionMessageParam);
+      });
+
+      apiMessagesB.push({ role: "user", content: userMessage.content });
+
+      const stream = await openai.chat.completions.create(
+        {
+          model: comparisonModel.alias,
+          messages: apiMessagesB,
+          stream: true,
+          stream_options: {
+            include_usage: true,
+          },
+        },
+        {
+          signal: controller.signal,
+        },
+      );
+
+      const acc = createReasoningAccumulator();
+      let chunkCount = 0;
+
+      for await (const chunk of stream) {
+        const { contentDelta, reasoningDelta, content, reasoning } = applyDelta(
+          acc,
+          chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+        );
+
+        if (reasoning) {
+          setStreamingReasoningContentModelB(reasoning);
+        }
+
+        if (contentDelta) {
+          chunkCount++;
+          setStreamingContentModelB(content);
+        }
+
+        if ((contentDelta || reasoningDelta) && firstTokenTime === undefined) {
+          firstTokenTime = performance.now() - startTime;
+        }
+
+        if (chunk.usage?.completion_tokens) {
+          totalTokens = chunk.usage.completion_tokens;
+        }
+        if (chunk.usage?.prompt_tokens) {
+          inputTokens = chunk.usage.prompt_tokens;
+        }
+      }
+
+      const final = finalizeReasoning(acc);
+
+      const endTime = performance.now();
+      const totalTime = endTime - startTime;
+
+      const metrics: MessageMetrics = {
+        timeToFirstToken: firstTokenTime,
+        totalTime,
+        totalTokens: totalTokens || chunkCount,
+        inputTokens: inputTokens || undefined,
+        tokensPerSecond:
+          totalTokens && totalTime > 0
+            ? totalTokens / (totalTime / 1000)
+            : undefined,
+      };
+
+      const assistantMessage: Message = {
+        role: "assistant",
+        content: final.content,
+        reasoningContent: final.reasoning || undefined,
+        timestamp: new Date(),
+        metrics,
+      };
+
+      setMessagesModelB((prev) => [...prev, assistantMessage]);
+      setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
+    } catch (err) {
+      console.error("Error sending message to Model B:", err);
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to send message to Model B",
+      );
+    } finally {
+      setIsStreamingModelB(false);
+      setAbortControllerModelB(null);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      if (modelType === "embeddings") {
+        handleCompareSimilarity();
+      } else if (modelType === "reranker") {
+        handleRerank();
+      } else {
+        handleSendMessage();
+      }
+    }
+  };
+
+  const clearConversation = () => {
+    setMessages([]);
+    setStreamingContent("");
+    setStreamingReasoningContent("");
+    setSimilarityResult(null);
+    setRerankResult(null);
+    setError(null);
+    setUploadedImages([]);
+    setSystemPrompt("");
+    setSystemPromptModelB("");
+    setTextA("");
+    setTextB("");
+    setQuery("What is the capital of France?");
+    setDocuments([
+      "The capital of Brazil is Brasilia.",
+      "The capital of France is Paris.",
+      "Horses and cows are both animals",
+    ]);
+    if (isComparisonMode) {
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
+      setCurrentMessageModelB("");
+    }
+  };
+
+  const handleComparisonModelSelect = (model: Model) => {
+    if (model) {
+      setComparisonModel(model);
+      setIsComparisonMode(true);
+      setMessagesModelB([]);
+      setStreamingContentModelB("");
+      setStreamingReasoningContentModelB("");
+      setCurrentMessageModelB("");
+    }
+  };
+
+  const handleExitComparisonMode = () => {
+    setIsComparisonMode(false);
+    setComparisonModel(null);
+    setMessagesModelB([]);
+    setStreamingContentModelB("");
+    setStreamingReasoningContentModelB("");
+    setCurrentMessageModelB("");
+    setIsSplitInput(false);
+  };
+
+  const handleCopyMessagesToModelB = () => {
+    const messagesWithoutMetrics = messages.map((msg) => ({
+      ...msg,
+      metrics: undefined,
+    }));
+    setMessagesModelB(messagesWithoutMetrics);
+    setStreamingContentModelB("");
+  };
+
+  const handleCopyMessagesToModelA = () => {
+    const messagesWithoutMetrics = messagesModelB.map((msg) => ({
+      ...msg,
+      metrics: undefined,
+    }));
+    setMessages(messagesWithoutMetrics);
+    setStreamingContent("");
+  };
+
+  const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(
+    null,
+  );
+  const [abortController, setAbortController] =
+    useState<AbortController | null>(null);
+
+  const [isComparisonMode, setIsComparisonMode] = useState(false);
+  const [comparisonModel, setComparisonModel] = useState<Model | null>(null);
+  const [messagesModelB, setMessagesModelB] = useState<Message[]>([]);
+  const [streamingContentModelB, setStreamingContentModelB] = useState("");
+  const [streamingReasoningContentModelB, setStreamingReasoningContentModelB] =
+    useState("");
+  const [isStreamingModelB, setIsStreamingModelB] = useState(false);
+  const [_abortControllerModelB, setAbortControllerModelB] =
+    useState<AbortController | null>(null);
+  const [isSplitInput, setIsSplitInput] = useState(false);
+  const [currentMessageModelB, setCurrentMessageModelB] = useState("");
+
+  const copyMessage = async (content: string, messageIndex: number) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedMessageIndex(messageIndex);
+      toast.success("Message copied to clipboard");
+      setTimeout(() => setCopiedMessageIndex(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy to clipboard:", err);
+      toast.error("Failed to copy message");
+    }
+  };
+
+  return (
+    <div className="h-[calc(100vh-4rem)] bg-white flex flex-col">
+      { }
+      <div className="bg-white border-b border-gray-200 px-4 md:px-8 py-3 shrink-0">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+          <div className="flex items-center gap-2 md:gap-4 w-full md:w-auto">
+            <button
+              onClick={() => navigate(fromUrl || "/models")}
+              className="p-2 text-gray-500 hover:bg-gray-100 rounded-lg transition-colors shrink-0"
+              aria-label={fromUrl ? "Go back" : "Back to Models"}
+              title={fromUrl ? "Go back" : "Back to Models"}
+            >
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+            <div className="flex items-center gap-2 md:gap-3 min-w-0">
+              <div className="w-8 h-8 md:w-10 md:h-10 bg-gray-100 rounded-lg flex items-center justify-center shrink-0">
+                <Play className="w-4 h-4 md:w-5 md:h-5 text-gray-600" />
+              </div>
+              <div className="min-w-0">
+                <h1 className="text-lg md:text-2xl font-bold text-gray-900 truncate">
+                  {modelType === "embeddings"
+                    ? "Embeddings Playground"
+                    : modelType === "reranker"
+                      ? "Reranker Playground"
+                      : "Chat Playground"}
+                </h1>
+                <p className="text-xs md:text-sm text-gray-600 hidden sm:block">
+                  {modelType === "embeddings"
+                    ? "Generate vector embeddings from text"
+                    : modelType === "reranker"
+                      ? "Rank documents by relevance to a query"
+                      : "Test AI models with custom settings"}
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 md:gap-3 w-full md:w-auto">
+            { }
+            <ModelCombobox
+              value={selectedModel}
+              onValueChange={handleModelChange}
+              placeholder="Search models..."
+              className="w-full md:w-[200px]"
+              filterFn={(model) => !isPlaygroundDenied(model)}
+            />
+
+            { }
+            {selectedModel && modelType === "chat" && (
+              <>
+                {!isComparisonMode ? (
+                  <ModelCombobox
+                    value={null}
+                    onValueChange={handleComparisonModelSelect}
+                    placeholder={
+                      <div className="text-sm flex items-center py-2">
+                        <GitCompare className="w-4 h-4 mr-2" />
+                        Compare...
+                      </div>
+                    }
+                    className="w-full md:w-[180px]"
+                    filterFn={(model) =>
+                      model.alias !== selectedModel?.alias &&
+                      (model.model_type?.toLowerCase() as ModelType) === "chat" &&
+                      !isPlaygroundDenied(model)
+                    }
+                  />
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm text-gray-600 flex items-center gap-2 bg-gray-100 rounded-lg px-3 py-2">
+                      <GitCompare className="w-4 h-4" />
+                      <span className="font-medium">
+                        {comparisonModel?.alias}
+                      </span>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleExitComparisonMode}
+                      aria-label="Exit comparison mode"
+                      title="Exit comparison mode"
+                    >
+                      <XIcon className="w-4 h-4" />
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      { }
+      {!selectedModel ? (
+        <div
+          className="flex-1 flex items-center justify-center"
+          role="main"
+          aria-label="Welcome to playground"
+        >
+          <div className="text-center">
+            <Play className="w-16 h-16 text-gray-400 mx-auto mb-4" />
+            <h2 className="text-xl text-gray-600 mb-2">
+              Welcome to the Playground
+            </h2>
+            <p className="text-gray-500">
+              Select a model from the dropdown to start testing
+            </p>
+          </div>
+        </div>
+      ) : modelType === "embeddings" ? (
+        <div className="flex-1 overflow-y-auto px-8 py-6">
+          <EmbeddingPlayground
+            selectedModel={selectedModel}
+            textA={textA}
+            textB={textB}
+            similarityResult={similarityResult}
+            isStreaming={isStreaming}
+            error={error}
+            onTextAChange={setTextA}
+            onTextBChange={setTextB}
+            onCompareSimilarity={handleCompareSimilarity}
+            onClearResult={() => setSimilarityResult(null)}
+            onKeyDown={handleKeyDown}
+          />
+        </div>
+      ) : modelType === "reranker" ? (
+        <div className="flex-1 overflow-y-auto px-8 py-6">
+          <RerankPlayground
+            selectedModel={selectedModel}
+            query={query}
+            documents={documents}
+            rerankResult={rerankResult}
+            isStreaming={isStreaming}
+            error={error}
+            onQueryChange={setQuery}
+            onDocumentChange={handleDocumentChange}
+            onAddDocument={handleAddDocument}
+            onRemoveDocument={handleRemoveDocument}
+            onRerank={handleRerank}
+            onClearResult={() => setRerankResult(null)}
+            onKeyDown={handleKeyDown}
+          />
+        </div>
+      ) : (
+        <GenerationPlayground
+          selectedModel={selectedModel}
+          messages={messages}
+          currentMessage={currentMessage}
+          uploadedImages={uploadedImages}
+          streamingContent={streamingContent}
+          streamingReasoningContent={streamingReasoningContent}
+          isStreaming={isStreaming}
+          error={error}
+          copiedMessageIndex={copiedMessageIndex}
+          supportsImages={
+            selectedModel.capabilities?.includes("vision") ?? false
+          }
+          systemPrompt={systemPrompt}
+          onSystemPromptChange={setSystemPrompt}
+          systemPromptModelB={systemPromptModelB}
+          onSystemPromptModelBChange={setSystemPromptModelB}
+          onCurrentMessageChange={setCurrentMessage}
+          onImageUpload={handleImageUpload}
+          onRemoveImage={handleRemoveImage}
+          onSendMessage={handleSendMessage}
+          onCopyMessage={copyMessage}
+          onKeyDown={handleKeyDown}
+          onClearConversation={clearConversation}
+          onCancelStreaming={cancelStreaming}
+          isComparisonMode={isComparisonMode}
+          comparisonModel={comparisonModel}
+          messagesModelB={messagesModelB}
+          streamingContentModelB={streamingContentModelB}
+          streamingReasoningContentModelB={streamingReasoningContentModelB}
+          isStreamingModelB={isStreamingModelB}
+          isSplitInput={isSplitInput}
+          currentMessageModelB={currentMessageModelB}
+          onCurrentMessageModelBChange={setCurrentMessageModelB}
+          onToggleSplitInput={() => setIsSplitInput(!isSplitInput)}
+          onSendMessageModelB={handleSendMessageModelB}
+          onCopyMessagesToModelB={handleCopyMessagesToModelB}
+          onCopyMessagesToModelA={handleCopyMessagesToModelA}
+        />
+      )}
+    </div>
+  );
+};
+
+export default Playground;

@@ -1,0 +1,253 @@
+
+use utoipa::{
+    Modify, OpenApi,
+    openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme},
+};
+
+use crate::{api, sync};
+
+struct AdminSecurityAddon;
+
+impl Modify for AdminSecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.security_schemes.insert(
+                "BearerAuth".to_string(),
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("API Key")
+                        .description(Some("Enter your API key"))
+                        .build(),
+                ),
+            );
+
+            components.security_schemes.insert(
+                "CookieAuth".to_string(),
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new("session"))),
+            );
+
+            components.security_schemes.insert(
+                "X-Doubleword-User".to_string(),
+                SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("X-Doubleword-User"))),
+            );
+        }
+    }
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    servers(
+        (url = "/admin/api/v1", description = "Admin API server")
+    ),
+    modifiers(&AdminSecurityAddon),
+    paths(
+        api::handlers::auth::register,
+        api::handlers::auth::login,
+        api::handlers::auth::logout,
+        api::handlers::auth::request_password_reset,
+        api::handlers::auth::confirm_password_reset,
+        api::handlers::users::list_users,
+        api::handlers::users::create_user,
+        api::handlers::users::get_user,
+        api::handlers::users::update_user,
+        api::handlers::users::delete_user,
+        api::handlers::api_keys::list_user_api_keys,
+        api::handlers::api_keys::create_user_api_key,
+        api::handlers::api_keys::get_user_api_key,
+        api::handlers::api_keys::update_user_api_key,
+        api::handlers::api_keys::delete_user_api_key,
+        api::handlers::api_keys::rotate_user_api_key,
+        api::handlers::api_keys::reveal_user_api_key,
+        api::handlers::inference_endpoints::list_inference_endpoints,
+        api::handlers::inference_endpoints::get_inference_endpoint,
+        api::handlers::inference_endpoints::create_inference_endpoint,
+        api::handlers::inference_endpoints::update_inference_endpoint,
+        api::handlers::inference_endpoints::delete_inference_endpoint,
+        api::handlers::inference_endpoints::validate_inference_endpoint,
+        api::handlers::inference_endpoints::synchronize_endpoint,
+        api::handlers::deployments::list_deployed_models,
+        api::handlers::deployments::create_deployed_model,
+        api::handlers::deployments::get_deployed_model,
+        api::handlers::deployments::update_deployed_model,
+        api::handlers::deployments::delete_deployed_model,
+        api::handlers::cache_pricing::get_cache_pricing,
+        api::handlers::cache_pricing::enable_cache_pricing,
+        api::handlers::cache_pricing::disable_cache_pricing,
+        api::handlers::serving::list_model_overlays,
+        api::handlers::realtime_inflight_limits::list_realtime_inflight_limits,
+        api::handlers::serving::get_organization_serving,
+        api::handlers::deployments::get_model_components,
+        api::handlers::deployments::add_model_component,
+        api::handlers::deployments::update_model_component,
+        api::handlers::deployments::remove_model_component,
+        api::handlers::provider_display_configs::list_provider_display_configs,
+        api::handlers::provider_display_configs::get_provider_display_config,
+        api::handlers::provider_display_configs::create_provider_display_config,
+        api::handlers::provider_display_configs::update_provider_display_config,
+        api::handlers::provider_display_configs::delete_provider_display_config,
+        api::handlers::provider_display_configs::get_provider_display_config_icon,
+        api::handlers::groups::list_groups,
+        api::handlers::groups::create_group,
+        api::handlers::groups::get_group,
+        api::handlers::groups::update_group,
+        api::handlers::groups::delete_group,
+        api::handlers::groups::add_user_to_group,
+        api::handlers::groups::remove_user_from_group,
+        api::handlers::groups::add_group_to_user,
+        api::handlers::groups::remove_group_from_user,
+        api::handlers::groups::get_group_users,
+        api::handlers::groups::get_user_groups,
+        api::handlers::groups::add_deployment_to_group,
+        api::handlers::groups::remove_deployment_from_group,
+        api::handlers::groups::get_group_deployments,
+        api::handlers::groups::get_deployment_groups,
+        api::handlers::transactions::create_transaction,
+        api::handlers::transactions::get_transaction,
+        api::handlers::transactions::list_transactions,
+        api::handlers::config::get_config,
+        api::handlers::probes::create_probe,
+        api::handlers::probes::list_probes,
+        api::handlers::probes::get_probe,
+        api::handlers::probes::delete_probe,
+        api::handlers::probes::activate_probe,
+        api::handlers::probes::deactivate_probe,
+        api::handlers::probes::update_probe,
+        api::handlers::probes::execute_probe,
+        api::handlers::probes::test_probe,
+        api::handlers::probes::get_probe_results,
+        api::handlers::probes::get_statistics,
+        api::handlers::requests::list_requests,
+        api::handlers::requests::aggregate_requests,
+        api::handlers::requests::aggregate_by_user,
+        api::handlers::queue::get_demand,
+    ),
+    components(
+        schemas(
+            api::handlers::queue::DemandResponse,
+            api::models::auth::RegisterRequest,
+            api::models::auth::LoginRequest,
+            api::models::auth::AuthResponse,
+            api::models::auth::AuthSuccessResponse,
+            api::models::users::Role,
+            api::models::users::UserCreate,
+            api::models::users::UserUpdate,
+            api::models::users::UserResponse,
+            crate::api::handlers::config::TolerationPresetResponse,
+            api::models::users::CurrentUser,
+            api::models::users::ListUsersQuery,
+            api::models::api_keys::ApiKeyCreate,
+            api::models::api_keys::ApiKeyUpdate,
+            api::models::api_keys::ListApiKeysQuery,
+            api::models::api_keys::ApiKeyResponse,
+            api::models::api_keys::ApiKeyInfoResponse,
+            api::models::api_keys::ApiKeySecretResponse,
+            api::models::deployments::DeployedModelCreate,
+            api::models::deployments::DeployedModelUpdate,
+            api::models::deployments::DeployedModelUpdateRequest,
+            api::models::deployments::DeployedModelResponse,
+            api::models::cache_pricing::CachePricingUpdateRequest,
+            api::models::cache_pricing::CachePricingResponse,
+            api::models::serving::OverlayResponse,
+            api::models::realtime_inflight_limits::RealtimeInflightLimitsResponse,
+            api::models::realtime_inflight_limits::RealtimeInflightOverrideResponse,
+            api::models::serving::OrganizationCacheTariffResponse,
+            api::models::serving::OrganizationServingResponse,
+            api::models::deployments::ModelComponentCreate,
+            api::models::deployments::ModelComponentUpdate,
+            api::models::deployments::ModelComponentResponse,
+            crate::db::models::deployments::LoadBalancingStrategy,
+            crate::db::models::deployments::FallbackConfig,
+            crate::db::models::deployments::DeploymentComponent,
+            api::models::groups::GroupCreate,
+            api::models::groups::GroupUpdate,
+            api::models::groups::GroupResponse,
+            api::models::groups::ListGroupsQuery,
+            api::models::deployments::ListModelsQuery,
+            api::models::deployments::ModelSortField,
+            api::models::deployments::SortDirection,
+            api::models::deployments::ModelFacets,
+            api::models::deployments::ModelListResponse,
+            api::models::provider_display_configs::CreateProviderDisplayConfig,
+            api::models::provider_display_configs::UpdateProviderDisplayConfig,
+            api::models::provider_display_configs::ProviderDisplayConfigResponse,
+            api::models::inference_endpoints::InferenceEndpointCreate,
+            api::models::inference_endpoints::InferenceEndpointUpdate,
+            api::models::inference_endpoints::InferenceEndpointValidate,
+            api::models::inference_endpoints::InferenceEndpointValidateResponse,
+            api::models::inference_endpoints::InferenceEndpointResponse,
+            api::models::inference_endpoints::ListEndpointsQuery,
+            api::models::inference_endpoints::OpenAIModel,
+            api::models::inference_endpoints::OpenAIModelsResponse,
+            api::models::transactions::CreditTransactionCreate,
+            api::models::transactions::CreditTransactionResponse,
+            crate::db::models::credits::CreditTransactionType,
+            sync::endpoint_sync::EndpointSyncResponse,
+            api::models::probes::CreateProbe,
+            api::models::probes::TestProbeRequest,
+            api::models::probes::ProbesQuery,
+            api::models::probes::ResultsQuery,
+            api::models::probes::StatsQuery,
+            api::models::probes::UpdateProbeRequest,
+            api::models::probes::ProbeStatistics,
+            crate::db::models::probes::Probe,
+            crate::db::models::probes::ProbeResult,
+            api::models::requests::ApiAiRequest,
+            api::models::requests::ApiAiResponse,
+            api::models::requests::AggregateRequestsQuery,
+            api::models::requests::ListRequestsQuery,
+            api::models::requests::HttpRequest,
+            api::models::requests::HttpResponse,
+            api::models::requests::RequestResponsePair,
+            api::models::requests::ListRequestsResponse,
+            api::models::requests::StatusCodeBreakdown,
+            api::models::requests::ModelUsage,
+            api::models::requests::UserUsage,
+            api::models::requests::ModelUserUsageResponse,
+            api::models::requests::TimeSeriesPoint,
+            api::models::requests::RequestsAggregateResponse,
+            api::handlers::config::ConfigResponse,
+            api::handlers::config::BatchConfigResponse,
+        )
+    ),
+    tags(
+        (name = "auth", description = "Authentication API"),
+        (name = "users", description = "User management API"),
+        (name = "api_keys", description = "API key management"),
+        (name = "endpoints", description = "Endpoint management"),
+        (name = "models", description = "Deployed model management"),
+        (name = "composite-models", description = "Composite model management - virtual models with weighted load balancing"),
+        (name = "groups", description = "Group management API"),
+        (name = "transactions", description = "Credit transaction management API"),
+        (name = "config", description = "Configuration API"),
+        (name = "probes", description = "Probe monitoring API"),
+        (name = "requests", description = "Request logging and analytics API"),
+        (name = "monitoring", description = "Queue and system monitoring API"),
+    ),
+    info(
+        title = "Admin API",
+        version = "0.1.0",
+        description = "API for managing users, API keys, inference endpoints, and deployed models",
+    ),
+)]
+pub struct AdminApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn current_user_schema_omits_internal_api_key_id() {
+        let spec = AdminApiDoc::openapi();
+        let schema = spec
+            .components
+            .as_ref()
+            .expect("spec has components")
+            .schemas
+            .get("CurrentUser")
+            .expect("CurrentUser schema present");
+        let json = serde_json::to_string(schema).unwrap();
+        assert!(!json.contains("api_key_id"), "api_key_id leaked into CurrentUser schema: {json}");
+    }
+}

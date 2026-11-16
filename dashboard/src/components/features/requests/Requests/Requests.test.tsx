@@ -1,0 +1,164 @@
+import { render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
+import { ReactNode } from "react";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterEach,
+  afterAll,
+  vi,
+} from "vitest";
+import { Requests } from "./Requests";
+import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import { SettingsProvider } from "../../../../contexts";
+
+vi.mock("../../../../utils/authorization", () => ({
+  useAuthorization: vi.fn(() => ({
+    userRoles: ["PlatformManager"],
+    hasPermission: vi.fn(() => true),
+    canAccessRoute: vi.fn(() => true),
+  })),
+}));
+
+import { useAuthorization } from "../../../../utils/authorization";
+const _mockUseAuthorization = vi.mocked(useAuthorization);
+
+class MockResizeObserver {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+globalThis.ResizeObserver = MockResizeObserver;
+
+const requestsAnalyticsHandler = http.get(
+  "/admin/api/v1/requests/aggregate",
+  () => {
+    return HttpResponse.json({
+      total_requests: 1250,
+      status_codes: [
+        { status: "200", count: 1150, percentage: 92.0 },
+        { status: "400", count: 75, percentage: 6.0 },
+        { status: "500", count: 25, percentage: 2.0 },
+      ],
+      models: [
+        { model: "claude-sonnet-3.5", count: 650 },
+        { model: "gpt-4", count: 400 },
+        { model: "gpt-3.5-turbo", count: 200 },
+      ],
+      time_series: [
+        {
+          timestamp: new Date().toISOString(),
+          requests: 100,
+          input_tokens: 5000,
+          output_tokens: 2000,
+          avg_latency_ms: 450,
+          p95_latency_ms: 800,
+          p99_latency_ms: 1200,
+        },
+      ],
+    });
+  },
+);
+
+const requestsHandler = http.get("/admin/api/v1/requests", ({ request }) => {
+  const url = new URL(request.url);
+  const _limit = url.searchParams.get("limit");
+
+  return HttpResponse.json({
+    requests: [
+      {
+        id: "req-1",
+        timestamp: new Date().toISOString(),
+        request_content: "What is AI?",
+        response_content: "AI stands for Artificial Intelligence...",
+        model: "claude-sonnet-3.5",
+        usage: { prompt_tokens: 10, completion_tokens: 50, total_tokens: 60 },
+        duration_ms: 450,
+        request_type: "chat_completions",
+      },
+    ],
+  });
+});
+
+const modelsHandler = http.get("/admin/api/v1/models", () => {
+  return HttpResponse.json({
+    models: [
+      { id: "claude-sonnet-3.5", name: "Claude 3.5 Sonnet" },
+      { id: "gpt-4", name: "GPT-4" },
+      { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo" },
+    ],
+  });
+});
+
+const pendingRequestCountsHandler = http.get(
+  "/admin/api/v1/monitoring/demand",
+  () => {
+    return HttpResponse.json({
+      "claude-sonnet-3.5": { "1h": 0, "24h": 0 },
+      "gpt-4": { "1h": 0, "24h": 0 },
+      "gpt-3.5-turbo": { "1h": 0, "24h": 0 },
+    });
+  },
+);
+
+const server = setupServer(
+  ...handlers,
+  requestsAnalyticsHandler,
+  requestsHandler,
+  modelsHandler,
+  pendingRequestCountsHandler,
+);
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => {
+  server.resetHandlers();
+  vi.mocked(useAuthorization).mockReturnValue({
+    isLoading: false,
+    userRoles: ["PlatformManager"],
+    hasPermission: vi.fn(() => true),
+    canAccessRoute: vi.fn(() => true),
+    getFirstAccessibleRoute: vi.fn(() => "/models"),
+  });
+});
+afterAll(() => server.close());
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+    },
+  });
+
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <SettingsProvider>{children}</SettingsProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+describe("Requests Component", () => {
+  it("renders without crashing", async () => {
+    render(<Requests />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("heading", { name: "Analytics" }),
+      ).toBeInTheDocument();
+    });
+
+    expect(screen.getByRole("tab", { name: /dashboard/i })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+});

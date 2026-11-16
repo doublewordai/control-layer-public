@@ -1,0 +1,805 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router-dom";
+import { Batches } from "./Batches";
+import * as hooks from "../../../../api/control-layer/hooks";
+import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
+
+vi.mock("../../../../api/control-layer/hooks", () => ({
+  useConfig: vi.fn(),
+  useFiles: vi.fn(),
+  useBatches: vi.fn(),
+  useDeleteFile: vi.fn(),
+  useCancelBatch: vi.fn(),
+  useBatchAnalytics: vi.fn(() => ({
+    data: null,
+    isLoading: false,
+  })),
+  useFileCostEstimate: vi.fn(() => ({
+    data: null,
+    isLoading: false,
+    error: null,
+  })),
+  useUser: vi.fn(() => ({
+    data: { roles: ["PlatformManager"] },
+    isLoading: false,
+  })),
+  useOrganizationMembers: vi.fn(() => ({
+    data: [],
+    isLoading: false,
+  })),
+  useUsers: vi.fn(() => ({
+    data: { data: [], total_count: 0 },
+    isLoading: false,
+  })),
+}));
+
+vi.mock("../../../../utils/authorization", () => ({
+  useAuthorization: vi.fn(() => ({
+    userRoles: ["PlatformManager"],
+    isLoading: false,
+    hasPermission: () => true,
+    canAccessRoute: () => true,
+    getFirstAccessibleRoute: () => "/batches",
+  })),
+}));
+
+vi.mock("../../../../contexts/organization/useOrganizationContext", () => ({
+  useOrganizationContext: vi.fn(() => ({
+    activeOrganizationId: null,
+    activeOrganization: null,
+    isOrgContext: false,
+    setActiveOrganization: vi.fn(),
+  })),
+}));
+
+vi.mock("../../../modals/CreateFileModal", () => ({
+  UploadFileModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? <div data-testid="upload-modal">Upload Modal</div> : null,
+}));
+
+vi.mock("../../../modals/CreateBatchModal", () => ({
+  CreateBatchModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? (
+      <div data-testid="create-batch-modal">Create Batch Modal</div>
+    ) : null,
+}));
+
+vi.mock("../../../modals/FileRequestsModal", () => ({
+  ViewFileRequestsModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? (
+      <div data-testid="view-file-requests-modal">View File Requests Modal</div>
+    ) : null,
+}));
+
+vi.mock("../../../modals/BatchRequestsModal", () => ({
+  ViewBatchRequestsModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? (
+      <div data-testid="view-batch-requests-modal">
+        View Batch Requests Modal
+      </div>
+    ) : null,
+}));
+
+vi.mock("../../../modals/DownloadFileModal", () => ({
+  DownloadFileModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? (
+      <div data-testid="download-file-modal">Download File Modal</div>
+    ) : null,
+}));
+
+vi.mock("../../../modals", () => ({
+  ApiExamples: () => null,
+}));
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+const mockFiles = [
+  {
+    id: "file-1",
+    object: "file",
+    bytes: 145600,
+    created_at: 1730995200,
+    expires_at: 1765065600,
+    filename: "test_file.jsonl",
+    purpose: "batch",
+  },
+  {
+    id: "file-2",
+    object: "file",
+    bytes: 89200,
+    created_at: 1730822400,
+    expires_at: 1767657600,
+    filename: "another_file.jsonl",
+    purpose: "batch",
+  },
+];
+
+const mockBatches = [
+  {
+    id: "batch-1",
+    object: "batch",
+    endpoint: "/v1/chat/completions",
+    errors: null,
+    input_file_id: "file-1",
+    completion_window: "24h",
+    status: "completed" as const,
+    output_file_id: "file-output-1",
+    error_file_id: null,
+    created_at: 1730822400,
+    in_progress_at: 1730824200,
+    expires_at: 1731427200,
+    finalizing_at: 1730865600,
+    completed_at: 1730869200,
+    failed_at: null,
+    expired_at: null,
+    cancelling_at: null,
+    cancelled_at: null,
+    request_counts: {
+      total: 250,
+      completed: 248,
+      failed: 2,
+    },
+    metadata: {},
+  },
+  {
+    id: "batch-2",
+    object: "batch",
+    endpoint: "/v1/chat/completions",
+    errors: null,
+    input_file_id: "file-2",
+    completion_window: "24h",
+    status: "in_progress" as const,
+    output_file_id: null,
+    error_file_id: null,
+    created_at: 1730901600,
+    in_progress_at: 1730903400,
+    expires_at: 1730980800,
+    finalizing_at: null,
+    completed_at: null,
+    failed_at: null,
+    expired_at: null,
+    cancelling_at: null,
+    cancelled_at: null,
+    request_counts: {
+      total: 150,
+      completed: 87,
+      failed: 1,
+    },
+    metadata: {},
+  },
+];
+
+const defaultProps = {
+  onOpenUploadModal: vi.fn(),
+  onOpenCreateBatchModal: vi.fn(),
+  onOpenDownloadModal: vi.fn(),
+  onOpenDeleteDialog: vi.fn(),
+  onOpenDeleteBatchDialog: vi.fn(),
+  onOpenCancelDialog: vi.fn(),
+  onBatchCreatedCallback: vi.fn(),
+};
+
+const createWrapper = () => {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+  return ({ children }: { children: React.ReactNode }) => (
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    </MemoryRouter>
+  );
+};
+
+describe("Batches", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    vi.mocked(hooks.useConfig).mockReturnValue({
+      data: {
+        batches: {
+          allowed_completion_windows: ["24h", "1h"],
+          async_requests: { enabled: true, completion_window: "1h" },
+        },
+      },
+      isLoading: false,
+    } as any);
+
+    vi.mocked(hooks.useFiles).mockImplementation((params?: any) => {
+      if (!params || (!params.purpose && !params.limit)) {
+        return {
+          data: { data: mockFiles },
+          isLoading: false,
+          error: null,
+          refetch: vi.fn(),
+        } as any;
+      }
+      if (params.purpose === "batch" || params.limit) {
+        return {
+          data: { data: mockFiles },
+          isLoading: false,
+          error: null,
+          refetch: vi.fn(),
+        } as any;
+      }
+      return {
+        data: { data: mockFiles },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any;
+    });
+
+    vi.mocked(hooks.useBatches).mockReturnValue({
+      data: { data: mockBatches },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    vi.mocked(hooks.useDeleteFile).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    } as any);
+
+    vi.mocked(hooks.useCancelBatch).mockReturnValue({
+      mutateAsync: vi.fn(),
+      isPending: false,
+    } as any);
+  });
+
+  describe("Rendering", () => {
+    it("should render the page title and description", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).getByRole("heading", { level: 1, name: "Batches" }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText("Create and manage batch requests"),
+      ).toBeInTheDocument();
+    });
+
+    it("should render create batch button on batches tab", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).getByRole("button", { name: /create batch/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("should render tabs", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).getByRole("tab", { name: /files/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("tab", { name: /batches/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("should fetch both files and batches on initial render", () => {
+      const useFilesSpy = vi.mocked(hooks.useFiles);
+      const useBatchesSpy = vi.mocked(hooks.useBatches);
+
+      render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(useFilesSpy).toHaveBeenCalled();
+      expect(useBatchesSpy).toHaveBeenCalled();
+    });
+
+    it("should request batches with include=analytics to avoid N+1 requests", () => {
+      const useBatchesSpy = vi.mocked(hooks.useBatches);
+
+      render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(useBatchesSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          include: "analytics",
+          completion_window: "24h,background",
+        }),
+      );
+    });
+
+    it("should show correct tab when starting on files tab", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const filesTab = within(container).getByRole("tab", {
+        name: /files/i,
+      });
+      const batchesTab = within(container).getByRole("tab", {
+        name: /batches/i,
+      });
+
+      expect(filesTab).toBeInTheDocument();
+      expect(batchesTab).toBeInTheDocument();
+
+      expect(batchesTab).toHaveAttribute("data-state", "active");
+      expect(filesTab).toHaveAttribute("data-state", "inactive");
+    });
+  });
+
+  describe("Loading State", () => {
+    it("should show loading state when files are loading", async () => {
+      const user = userEvent.setup();
+      vi.mocked(hooks.useFiles).mockReturnValue({
+        data: undefined,
+        isLoading: true,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
+    });
+
+    it("should show loading state when batches are loading", () => {
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: undefined,
+        isLoading: true,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
+    });
+
+    it("should show spinner when loading", () => {
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: undefined,
+        isLoading: true,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const skeletonElements = container.querySelectorAll(".animate-pulse");
+      expect(skeletonElements.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("Empty States", () => {
+    it("should show empty state when no files exist", async () => {
+      const user = userEvent.setup();
+      vi.mocked(hooks.useFiles).mockReturnValue({
+        data: { data: [] },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      expect(
+        within(container).getByText("No files uploaded"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
+          "Upload a .jsonl file to get started with batch processing",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", { name: /upload first file/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("should show empty state when no batches exist", async () => {
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: { data: [] },
+        isLoading: false,
+        error: null,
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).getByText("No batches found"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
+          "Create a batch from an uploaded file to start processing requests",
+        ),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", { name: /create first batch/i }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe("Files Tab", () => {
+    it("should display files in the table", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      expect(
+        within(container).getByText("test_file.jsonl"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText("another_file.jsonl"),
+      ).toBeInTheDocument();
+    });
+
+    it("should open upload modal when upload button is clicked", async () => {
+      const user = userEvent.setup();
+      const onOpenUploadModal = vi.fn();
+      const { container } = render(
+        <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
+        { wrapper: createWrapper() },
+      );
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
+
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
+    });
+
+    it("should allow searching files", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      const searchInput =
+        within(container).getByPlaceholderText(/search files/i);
+      await user.type(searchInput, "test");
+
+      expect(searchInput).toHaveValue("test");
+    });
+
+    it("should filter files based on search query", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      const searchInput =
+        within(container).getByPlaceholderText(/search files/i);
+      await user.type(searchInput, "test_file");
+
+      expect(
+        within(container).getByText("test_file.jsonl"),
+      ).toBeInTheDocument();
+    });
+  });
+
+  describe("Batches Tab", () => {
+    it("should allow searching batches", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
+
+      const searchInput =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(searchInput, "batch-1");
+
+      expect(searchInput).toHaveValue("batch-1");
+    });
+
+    it("should display batch status correctly", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
+
+      const completedElements = within(container).getAllByText(/completed/i);
+      expect(completedElements.length).toBeGreaterThan(0);
+
+      const statusBadge = completedElements.find(
+        (el) => el.tagName === "SPAN" && el.className.includes("rounded-full"),
+      );
+      expect(statusBadge).toBeDefined();
+
+      expect(within(container).getByText(/in progress/i)).toBeInTheDocument();
+    });
+
+    it("should hide the Completion Window column by default", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(
+        within(container).getByRole("tab", { name: /batches/i }),
+      );
+
+      expect(
+        within(container).queryByRole("columnheader", {
+          name: /completion window/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  describe("Tab Switching", () => {
+    it("should have independent search when switching tabs", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(batchSearch, "batch-1");
+      expect(batchSearch).toHaveValue("batch-1");
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      const fileSearch =
+        within(container).getByPlaceholderText(/search files/i);
+      expect(fileSearch).toHaveValue("");
+    });
+  });
+
+  describe("Modal Interactions", () => {
+    it("should call onOpenUploadModal when upload button is clicked", async () => {
+      const user = userEvent.setup();
+      const onOpenUploadModal = vi.fn();
+      const { container } = render(
+        <Batches {...defaultProps} onOpenUploadModal={onOpenUploadModal} />,
+        { wrapper: createWrapper() },
+      );
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(1);
+
+      await user.click(
+        within(container).getByRole("button", { name: /upload file/i }),
+      );
+      expect(onOpenUploadModal).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("File Size Display", () => {
+    it("should display file sizes correctly", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      within(container).getByText("test_file.jsonl").closest("table");
+    });
+  });
+
+  describe("Date Formatting", () => {
+    it("should display created dates for files", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      await user.click(within(container).getByRole("tab", { name: /files/i }));
+
+      within(container).getByText("test_file.jsonl").closest("table");
+    });
+  });
+
+  describe("Accessibility", () => {
+    it("should have accessible tab controls", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const filesTab = within(container).getByRole("tab", { name: /files/i });
+      const batchesTab = within(container).getByRole("tab", {
+        name: /batches/i,
+      });
+
+      expect(filesTab).toHaveAttribute("aria-selected");
+      expect(batchesTab).toHaveAttribute("aria-selected", "true");
+    });
+
+    it("should have accessible action buttons", () => {
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        within(container).getByRole("button", { name: /create batch/i }),
+      ).toBeEnabled();
+    });
+  });
+
+  describe("Filter persistence", () => {
+    it("seeds the batch search input from localStorage on mount", () => {
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ batchSearch: "saved-query" }),
+      );
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      expect(batchSearch).toHaveValue("saved-query");
+    });
+
+    it("writes the batch search query to localStorage when the user types", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(batchSearch, "abc");
+
+      const stored = JSON.parse(
+        localStorage.getItem("filters:batches") || "{}",
+      );
+      expect(stored.batchSearch).toBe("abc");
+    });
+
+    it("removes a key from localStorage once the value matches the default", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      const batchSearch =
+        within(container).getByPlaceholderText(/search batches/i);
+      await user.type(batchSearch, "x");
+      expect(
+        JSON.parse(localStorage.getItem("filters:batches") || "{}")
+          .batchSearch,
+      ).toBe("x");
+
+      await user.clear(batchSearch);
+      expect(localStorage.getItem("filters:batches")).toBeNull();
+    });
+
+    it("seeds a persisted member id and forwards it as member_id when the member resolves in memberList", () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-1",
+        activeOrganization: { id: "org-1", name: "Acme" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-1", email: "alice@acme.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ member: "user-1" }),
+      );
+
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+
+      const lastCall = vi.mocked(hooks.useBatches).mock.calls.at(-1)?.[0];
+      expect(lastCall?.member_id).toBe("user-1");
+    });
+
+    it("drops a persisted member_id when the id is not in the org's memberList (e.g. after switching orgs)", () => {
+      vi.mocked(useOrganizationContext).mockReturnValue({
+        activeOrganizationId: "org-2",
+        activeOrganization: { id: "org-2", name: "Other" } as any,
+        isOrgContext: true,
+        setActiveOrganization: vi.fn(),
+      });
+      vi.mocked(hooks.useOrganizationMembers).mockReturnValue({
+        data: [
+          {
+            status: "active",
+            user: { id: "user-9", email: "carol@other.test" },
+          },
+        ],
+        isLoading: false,
+      } as any);
+
+      localStorage.setItem(
+        "filters:batches",
+        JSON.stringify({ member: "user-1" }),
+      );
+
+      render(<Batches {...defaultProps} />, { wrapper: createWrapper() });
+
+      const lastCall = vi.mocked(hooks.useBatches).mock.calls.at(-1)?.[0];
+      expect(lastCall?.member_id).toBeUndefined();
+    });
+  });
+
+  describe("error state", () => {
+    it("renders a query failure as an error, not as 'No batches found'", async () => {
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: undefined,
+        isLoading: false,
+        error: new Error(
+          "completion_window=background is only available to platform managers",
+        ),
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        await within(container).findByText("Couldn't load batches"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(/only available to platform managers/),
+      ).toBeInTheDocument();
+      expect(
+        within(container).queryByText("No batches found"),
+      ).not.toBeInTheDocument();
+    });
+  });
+});

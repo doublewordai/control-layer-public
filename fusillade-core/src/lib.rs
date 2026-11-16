@@ -1,0 +1,68 @@
+
+macro_rules! debug_with_redacted_api_key {
+    ($ty:ident { $($field:ident),* $(,)? }) => {
+        impl std::fmt::Debug for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let Self { api_key: _, $($field),* } = self;
+                f.debug_struct(stringify!($ty))
+                    $(.field(stringify!($field), $field))*
+                    .field("api_key", &"<redacted>")
+                    .finish()
+            }
+        }
+    };
+}
+
+pub mod batch;
+pub mod daemon_record;
+pub mod error;
+pub mod manager;
+pub mod request;
+
+pub use batch::*;
+pub use daemon_record::{
+    AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
+    Initializing, Running,
+};
+pub use error::{FusilladeError, Result};
+pub use manager::{
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage, TrailingDemandCount,
+};
+pub use request::*;
+
+#[cfg(test)]
+mod redacted_api_key_tests {
+    use std::collections::HashMap;
+
+    use uuid::Uuid;
+
+    use super::*;
+
+    const SECRET: &str = "sk-test-do-not-log";
+
+    fn assert_redacted(value: &impl std::fmt::Debug) {
+        let output = format!("{value:?}");
+        assert!(!output.contains(SECRET), "secret leaked: {output}");
+        assert!(output.contains("api_key: \"<redacted>\""), "{output}");
+    }
+
+    #[test]
+    fn request_data_redacts_the_api_key() {
+        assert_redacted(&RequestData {
+            id: RequestId::from(Uuid::new_v4()),
+            batch_id: None,
+            template_id: TemplateId::from(Uuid::new_v4()),
+            custom_id: None,
+            endpoint: "http://localhost".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: "{}".to_string(),
+            model: "model-a".to_string(),
+            api_key: SECRET.to_string(),
+            created_by: "user".to_string(),
+            batch_metadata: HashMap::new(),
+        });
+    }
+}

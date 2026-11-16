@@ -1,0 +1,448 @@
+
+use async_trait::async_trait;
+use sqlx::PgPool;
+
+use crate::{
+    config::CreditsConfig,
+    db::{
+        handlers::{credits::Credits, repository::Repository},
+        models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+    },
+    payment_providers::{CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+};
+
+#[cfg(test)]
+use crate::payment_providers::AutoTopupDeclineKind;
+
+const DUMMY_SETUP_SESSION_PREFIX: &str = "dummy_setup_";
+
+pub struct DummyProvider {
+    config: crate::config::DummyConfig,
+}
+
+impl From<crate::config::DummyConfig> for DummyProvider {
+    fn from(config: crate::config::DummyConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl PaymentProvider for DummyProvider {
+    async fn create_checkout_session(
+        &self,
+        payer: &CheckoutPayer,
+        creditee_id: Option<&str>,
+        _cancel_url: &str,
+        success_url: &str,
+    ) -> Result<String> {
+        let payer_id_string = payer.id.to_string();
+        let recipient_id = creditee_id.unwrap_or(&payer_id_string);
+
+        let session_id = format!("dummy_session_{}_{}_{}", recipient_id, payer.id, uuid::Uuid::new_v4());
+
+        let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
+
+        tracing::info!(
+            "Dummy provider created checkout session {} for creditee {} (payer: {})",
+            session_id,
+            recipient_id,
+            payer.id
+        );
+
+        Ok(redirect_url)
+    }
+
+    async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
+        if !session_id.starts_with("dummy_session_") {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+
+        let parts: Vec<&str> = session_id.split('_').collect();
+        if parts.len() < 5 {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+
+        let creditee_id: crate::types::UserId = parts[2].parse().map_err(|e| {
+            tracing::error!("Failed to parse recipient ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid recipient user ID: {}", e))
+        })?;
+
+        let creditor_id: crate::types::UserId = parts[3].parse().map_err(|e| {
+            tracing::error!("Failed to parse payer ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid payer user ID: {}", e))
+        })?;
+
+        Ok(PaymentSession {
+            creditee_id,
+            creditor_id,
+            amount: self.config.amount,
+            is_paid: true,
+            payment_provider_id: Some(parts[3].to_string()),
+        })
+    }
+
+    async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str, credits_config: &CreditsConfig) -> Result<()> {
+        let mut conn = db_pool.acquire().await?;
+
+        {
+            let mut credits = Credits::new(&mut conn);
+            if credits.transaction_exists_by_source_id(session_id).await? {
+                tracing::trace!("Transaction for session_id {} already exists, skipping (fast path)", session_id);
+                return Ok(());
+            }
+        }
+
+        if let Some(rest) = session_id.strip_prefix(DUMMY_SETUP_SESSION_PREFIX) {
+            let target_id: crate::types::UserId = rest
+                .split('_')
+                .next()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|e| PaymentError::InvalidData(format!("Invalid dummy setup target user ID: {}", e)))?;
+
+            {
+                let mut users = crate::db::handlers::users::Users::new(&mut conn);
+                if users.get_by_id(target_id).await?.is_none() {
+                    return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
+                }
+                users
+                    .set_payment_provider_id_if_empty(target_id, &format!("dummy_cus_{}", target_id))
+                    .await?;
+                users.set_verified(target_id).await?;
+            }
+
+            if let Err(e) = Credits::new(&mut conn)
+                .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+                .await
+            {
+                tracing::error!(session_id, target_id = %target_id, error = %e, "Verification credits grant failed");
+            }
+
+            tracing::info!("Successfully fulfilled dummy setup session {} for user {}", session_id, target_id);
+            return Ok(());
+        }
+
+        let payment_session = self.get_payment_session(session_id).await?;
+
+        if !payment_session.is_paid {
+            tracing::trace!("Transaction for session_id {} has not been paid, skipping.", session_id);
+            return Err(PaymentError::PaymentNotCompleted);
+        }
+
+        let description = {
+            let mut users = crate::db::handlers::users::Users::new(&mut conn);
+
+            let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
+            if creditor_user.is_none() {
+                tracing::error!(
+                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
+                    payment_session.creditor_id,
+                    session_id
+                );
+            }
+
+            if payment_session.creditor_id == payment_session.creditee_id {
+                "Dummy payment (test)".to_string()
+            } else if let Some(creditor) = creditor_user.as_ref() {
+                let creditor_name = creditor.display_name.as_ref().unwrap_or(&creditor.email);
+                format!("Dummy payment (test) from {}", creditor_name)
+            } else {
+                "Dummy payment (test)".to_string()
+            }
+        };
+
+        let request = CreditTransactionCreateDBRequest {
+            user_id: payment_session.creditee_id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: payment_session.amount,
+            source_id: session_id.to_string(),
+            description: Some(description),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+
+        let mut credits = Credits::new(&mut conn);
+        credits.create_transaction(&request).await?;
+
+        if let Err(e) = credits
+            .grant_first_payment_match(
+                credits_config.first_payment_match_up_to,
+                payment_session.creditee_id,
+                payment_session.amount,
+                session_id,
+            )
+            .await
+        {
+            tracing::error!(session_id, creditee_id = %payment_session.creditee_id, error = %e, "First-payment match failed; purchase unaffected, grant manually if needed");
+        }
+
+        tracing::info!(
+            "Successfully fulfilled checkout session {} for user {}",
+            session_id,
+            payment_session.creditee_id
+        );
+        Ok(())
+    }
+
+    async fn validate_webhook(&self, _headers: &axum::http::HeaderMap, _body: &str) -> Result<Option<WebhookEvent>> {
+        Ok(None)
+    }
+
+    async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent, _credits_config: &CreditsConfig) -> Result<()> {
+        Ok(())
+    }
+
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+        let session_id = format!("{}{}_{}", DUMMY_SETUP_SESSION_PREFIX, payer.id, uuid::Uuid::new_v4());
+        Ok(success_url.replace("{CHECKOUT_SESSION_ID}", &session_id))
+    }
+
+    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+        let session_id = format!("dummy_session_{}_{}", payer.id, uuid::Uuid::new_v4());
+        let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
+        Ok(redirect_url)
+    }
+
+    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<super::AutoTopupSetupResult> {
+        if !session_id.starts_with("dummy_session_") {
+            return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
+        }
+        let user_id = session_id
+            .strip_prefix("dummy_session_")
+            .and_then(|s| s.split('_').next())
+            .map(String::from);
+
+        Ok(super::AutoTopupSetupResult {
+            customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
+            user_id,
+        })
+    }
+
+    async fn accrue_invoice_item(
+        &self,
+        _amount_cents: i64,
+        customer_id: &str,
+        _description: &str,
+        idempotency_key: &str,
+    ) -> Result<String> {
+        Ok(format!("dummy_ii_{customer_id}_{idempotency_key}"))
+    }
+
+    async fn charge_auto_topup(
+        &self,
+        _amount_cents: i64,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<String> {
+        #[cfg(test)]
+        match _customer_id {
+            "cus_test_soft_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Soft));
+            }
+            "cus_test_hard_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Hard));
+            }
+            "cus_test_provider_error" => {
+                return Err(PaymentError::ProviderApi("simulated provider failure".to_string()));
+            }
+            _ => {}
+        }
+
+        Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        #[cfg(test)]
+        match customer_id {
+            "cus_test_no_payment_method" => return Ok(None),
+            "cus_test_payment_method_lookup_error" => {
+                return Err(PaymentError::ProviderApi("simulated payment method lookup failure".to_string()));
+            }
+            _ => {}
+        }
+
+        Ok(Some(format!("dummy_pm_{}", customer_id)))
+    }
+
+    async fn customer_has_address(&self, _customer_id: &str) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn create_customer(&self, _email: &str, _name: Option<&str>) -> Result<String> {
+        Ok(format!("dummy_cus_{}", uuid::Uuid::new_v4()))
+    }
+
+    async fn create_billing_portal_session(&self, customer_id: &str, return_url: &str) -> Result<String> {
+        Ok(format!("{}?dummy_billing_portal=true&customer_id={}", return_url, customer_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::users::{CurrentUser, Role};
+    use crate::payment_providers::CheckoutPayer;
+    use rust_decimal::Decimal;
+    use sqlx::PgPool;
+
+    fn payer_from(user: &CurrentUser) -> CheckoutPayer {
+        CheckoutPayer {
+            id: user.id,
+            email: user.email.clone(),
+            payment_provider_id: user.payment_provider_id.clone(),
+        }
+    }
+
+    async fn create_test_user(pool: &PgPool) -> CurrentUser {
+        let user = crate::test::utils::create_test_user(pool, Role::StandardUser).await;
+
+        CurrentUser {
+            auth_method: crate::api::models::users::AuthMethod::TrustedSso,
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            display_name: user.display_name,
+            roles: user.roles,
+            payment_provider_id: None,
+            is_admin: false,
+            avatar_url: None,
+            organizations: vec![],
+            active_organization: None,
+            api_key_id: None,
+        }
+    }
+
+    #[test]
+    fn test_dummy_provider_from_config() {
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+        };
+        let provider = DummyProvider::from(config);
+        assert_eq!(provider.config.amount, Decimal::new(100, 0));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_dummy_full_payment_flow(pool: PgPool) {
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(5000, 2),
+        };
+        let provider = DummyProvider::from(config);
+        let user = create_test_user(&pool).await;
+
+        let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
+        let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
+
+        let checkout_url = provider
+            .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
+            .await
+            .unwrap();
+
+        assert!(checkout_url.contains("payment=success"));
+        assert!(checkout_url.contains(&format!("session_id=dummy_session_{}", user.id)));
+
+        let url = url::Url::parse(&checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        let count_before = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count_before.count.unwrap(), 0, "Transaction should not exist before processing");
+
+        let result = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+        assert!(result.is_ok(), "Payment processing should succeed");
+
+        let transaction = sqlx::query!(
+            r#"
+            SELECT amount, user_id, source_id, description
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(transaction.amount, Decimal::new(5000, 2));
+        assert_eq!(transaction.user_id, user.id);
+        assert_eq!(transaction.description, Some("Dummy payment (test)".to_string()));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_dummy_idempotency(pool: PgPool) {
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+        };
+        let provider = DummyProvider::from(config);
+        let user = create_test_user(&pool).await;
+
+        let cancel_url = "http://localhost:3001/cost-management?payment=cancelled&session_id={CHECKOUT_SESSION_ID}";
+        let success_url = "http://localhost:3001/cost-management?payment=success&session_id={CHECKOUT_SESSION_ID}";
+
+        let checkout_url = provider
+            .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
+            .await
+            .unwrap();
+
+        let url = url::Url::parse(&checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        let session_id = query_pairs.get("session_id").unwrap();
+
+        let result1 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+        let result2 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+        let result3 = provider
+            .process_payment_session(&pool, session_id, &crate::config::CreditsConfig::default())
+            .await;
+
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert!(result3.is_ok());
+
+        let count = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
+    }
+
+    #[test]
+    fn test_dummy_webhook_not_supported() {
+        let config = crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+        };
+        let provider = DummyProvider::from(config);
+
+        let headers = axum::http::HeaderMap::new();
+        let body = "{}";
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(provider.validate_webhook(&headers, body));
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+    }
+}

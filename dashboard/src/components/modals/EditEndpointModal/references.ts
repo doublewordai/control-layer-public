@@ -1,0 +1,147 @@
+import type { Model, TrafficRoutingRule } from "../../../api/control-layer/types";
+
+export interface ReferenceEntry {
+  modelId: string;
+  modelAlias: string;
+}
+
+export interface TrafficRuleReference {
+  modelId: string;
+  modelAlias: string;
+  rule: TrafficRoutingRule;
+}
+
+export interface DeploymentReferences {
+  directHosted: ReferenceEntry[];
+  virtualModels: ReferenceEntry[];
+  trafficRules: TrafficRuleReference[];
+}
+
+export function emptyReferences(): DeploymentReferences {
+  return { directHosted: [], virtualModels: [], trafficRules: [] };
+}
+
+export function totalReferenceCount(refs: DeploymentReferences): number {
+  return (
+    refs.directHosted.length +
+    refs.virtualModels.length +
+    refs.trafficRules.length
+  );
+}
+
+export function hasUserConfiguredReferences(refs: DeploymentReferences): boolean {
+  return (
+    refs.directHosted.length > 1 ||
+    refs.virtualModels.length > 0 ||
+    refs.trafficRules.length > 0
+  );
+}
+
+
+export interface ReferenceIndex {
+  hostedByDeployment: Map<string, Model[]>;
+  virtualByComponentId: Map<string, Model[]>;
+  rulesByTarget: Map<string, { model: Model; rule: TrafficRoutingRule }[]>;
+}
+
+const EMPTY_INDEX: ReferenceIndex = {
+  hostedByDeployment: new Map(),
+  virtualByComponentId: new Map(),
+  rulesByTarget: new Map(),
+};
+
+export function emptyReferenceIndex(): ReferenceIndex {
+  return EMPTY_INDEX;
+}
+
+export function buildReferenceIndex(allModels: Model[]): ReferenceIndex {
+  const hostedByDeployment = new Map<string, Model[]>();
+  const virtualByComponentId = new Map<string, Model[]>();
+  const rulesByTarget = new Map<
+    string,
+    { model: Model; rule: TrafficRoutingRule }[]
+  >();
+
+  for (const m of allModels) {
+    if (!m.is_composite && m.hosted_on && m.model_name) {
+      const key = `${m.hosted_on}|${m.model_name}`;
+      const list = hostedByDeployment.get(key);
+      if (list) list.push(m);
+      else hostedByDeployment.set(key, [m]);
+    }
+
+    if (m.is_composite && m.components) {
+      for (const c of m.components) {
+        if (!c.model?.id) continue;
+        const list = virtualByComponentId.get(c.model.id);
+        if (list) list.push(m);
+        else virtualByComponentId.set(c.model.id, [m]);
+      }
+    }
+
+    if (m.traffic_routing_rules) {
+      for (const rule of m.traffic_routing_rules) {
+        if (rule.action.type !== "redirect") continue;
+        const target = rule.action.target;
+        const list = rulesByTarget.get(target);
+        const entry = { model: m, rule };
+        if (list) list.push(entry);
+        else rulesByTarget.set(target, [entry]);
+      }
+    }
+  }
+
+  return { hostedByDeployment, virtualByComponentId, rulesByTarget };
+}
+
+export function lookupReferences(
+  index: ReferenceIndex,
+  endpointId: string,
+  modelName: string,
+): DeploymentReferences {
+  const directHosted =
+    index.hostedByDeployment.get(`${endpointId}|${modelName}`) ?? [];
+
+  const virtualSet = new Map<string, Model>();
+  for (const wrapper of directHosted) {
+    const list = index.virtualByComponentId.get(wrapper.id);
+    if (!list) continue;
+    for (const v of list) virtualSet.set(v.id, v);
+  }
+
+  const trafficRules: TrafficRuleReference[] = [];
+  const seenAliases = new Set<string>();
+  for (const wrapper of directHosted) {
+    if (seenAliases.has(wrapper.alias)) continue;
+    seenAliases.add(wrapper.alias);
+    const list = index.rulesByTarget.get(wrapper.alias);
+    if (!list) continue;
+    for (const r of list) {
+      trafficRules.push({
+        modelId: r.model.id,
+        modelAlias: r.model.alias,
+        rule: r.rule,
+      });
+    }
+  }
+
+  return {
+    directHosted: directHosted.map((m) => ({
+      modelId: m.id,
+      modelAlias: m.alias,
+    })),
+    virtualModels: Array.from(virtualSet.values()).map((m) => ({
+      modelId: m.id,
+      modelAlias: m.alias,
+    })),
+    trafficRules,
+  };
+}
+
+export function computeReferencesForDeployment(
+  endpointId: string,
+  modelName: string,
+  allModels: Model[],
+): DeploymentReferences {
+  return lookupReferences(buildReferenceIndex(allModels), endpointId, modelName);
+}

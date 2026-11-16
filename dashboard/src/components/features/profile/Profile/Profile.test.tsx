@@ -1,0 +1,761 @@
+import { render, screen, within, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+import { ReactNode } from "react";
+import { describe, it, expect, beforeAll, afterEach, afterAll } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { Profile } from "./Profile";
+import { OrganizationProvider } from "../../../../contexts/organization/OrganizationContext";
+import { handlers } from "../../../../api/control-layer/mocks/handlers";
+import type { Webhook } from "../../../../api/control-layer/types";
+
+const server = setupServer(...handlers);
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+async function renderAndWaitForProfile() {
+  const user = userEvent.setup();
+  const result = render(<Profile />, { wrapper: createWrapper() });
+  await waitFor(() => {
+    expect(
+      within(result.container).getByRole("heading", {
+        name: "Profile Settings",
+      }),
+    ).toBeInTheDocument();
+  });
+  return { ...result, user };
+}
+
+function makeWebhook(overrides: Partial<Webhook> = {}): Webhook {
+  return {
+    id: "wh-test-1",
+    user_id: "550e8400-e29b-41d4-a716-446655440001",
+    url: "https://example.com/webhook",
+    enabled: true,
+    event_types: ["batch.completed", "batch.failed"],
+    description: "My test webhook",
+    scope: "own",
+    created_at: "2025-01-01T00:00:00Z",
+    updated_at: "2025-01-01T00:00:00Z",
+    disabled_at: null,
+    ...overrides,
+  };
+}
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+      },
+    },
+  });
+
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <OrganizationProvider>{children}</OrganizationProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+}
+
+describe("Profile Component", () => {
+  it("renders without crashing", async () => {
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    expect(document.querySelector(".animate-pulse")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  const currentUserWithZdr = (zeroDataRetention: boolean) =>
+    http.get("/admin/api/v1/users/:id", () =>
+      HttpResponse.json({
+        id: "550e8400-e29b-41d4-a716-446655440001",
+        username: "sarah",
+        email: "sarah.chen@acme.com",
+        display_name: "Sarah Chen",
+        roles: ["StandardUser"],
+        created_at: "2025-03-10T10:00:00Z",
+        updated_at: "2025-12-20T15:30:00Z",
+        auth_source: "proxy-header",
+        is_admin: false,
+        zero_data_retention: zeroDataRetention,
+      }),
+    );
+
+  it("shows zero data retention as enabled when the account has it on", async () => {
+    server.use(currentUserWithZdr(true));
+
+    const { container } = await renderAndWaitForProfile();
+    expect(container.textContent).toMatch(/zero data retention:\s*enabled/i);
+  });
+
+  it("does not show zero data retention when the account has it off", async () => {
+    server.use(currentUserWithZdr(false));
+
+    const { container } = await renderAndWaitForProfile();
+    expect(container.textContent).not.toMatch(/zero data retention/i);
+  });
+
+  it("renders profile data when loaded", async () => {
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(
+          /Manage your account information and preferences/,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    expect(
+      within(container).getAllByText("sarah.chen@acme.com")[0],
+    ).toBeInTheDocument();
+
+    expect(
+      within(container).getByRole("textbox", { name: "Display Name" }),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("textbox", { name: "Avatar URL" }),
+    ).toBeInTheDocument();
+
+    expect(
+      within(container).getByRole("button", { name: /save changes/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("allows editing display name and avatar url", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    const displayNameInput = within(container).getByRole("textbox", {
+      name: "Display Name",
+    });
+    const avatarUrlInput = within(container).getByRole("textbox", {
+      name: "Avatar URL",
+    });
+
+    expect(displayNameInput).toHaveValue("Sarah Chen");
+    expect(avatarUrlInput).toHaveValue("");
+
+    await user.clear(displayNameInput);
+    await user.type(displayNameInput, "Sarah J. Chen");
+
+    await user.clear(avatarUrlInput);
+    await user.type(avatarUrlInput, "https://example.com/new-avatar.jpg");
+
+    expect(displayNameInput).toHaveValue("Sarah J. Chen");
+    expect(avatarUrlInput).toHaveValue("https://example.com/new-avatar.jpg");
+
+    const saveButton = within(container).getByRole("button", {
+      name: /save changes/i,
+    });
+    expect(saveButton).not.toBeDisabled();
+
+    await user.click(saveButton);
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText(/Profile updated successfully/i),
+      ).toBeInTheDocument();
+    });
+  });
+});
+
+describe("Email Notifications", () => {
+  it("renders the email notifications toggle", async () => {
+    const { container } = await renderAndWaitForProfile();
+
+    expect(within(container).getByText("Notifications")).toBeInTheDocument();
+    expect(within(container).getByText("Email")).toBeInTheDocument();
+    expect(
+      within(container).getByText(
+        /Receive email when a batch completes or fails/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("switch", { name: "Email notifications" }),
+    ).toBeInTheDocument();
+  });
+
+  it("reflects the current user preference", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:id", () => {
+        return HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "github|109540503",
+          email: "sarah.chen@acme.com",
+          display_name: "Sarah Chen",
+          avatar_url: null,
+          roles: ["PlatformManager", "RequestViewer"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "proxy-header",
+          batch_notifications_enabled: true,
+        });
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+    const toggle = within(container).getByRole("switch", {
+      name: "Email notifications",
+    });
+    expect(toggle).toHaveAttribute("data-state", "checked");
+  });
+
+  it("calls the API when toggled", async () => {
+    let patchedData: Record<string, unknown> | null = null;
+
+    server.use(
+      http.patch("/admin/api/v1/users/:id", async ({ request }) => {
+        patchedData = (await request.json()) as Record<string, unknown>;
+        return HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "github|109540503",
+          email: "sarah.chen@acme.com",
+          display_name: "Sarah Chen",
+          avatar_url: null,
+          roles: ["PlatformManager", "RequestViewer"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "proxy-header",
+          batch_notifications_enabled: true,
+        });
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+    const toggle = within(container).getByRole("switch", {
+      name: "Email notifications",
+    });
+
+    await user.click(toggle);
+
+    await waitFor(() => {
+      expect(patchedData).toEqual({ batch_notifications_enabled: false });
+    });
+  });
+});
+
+describe("Webhooks", () => {
+  it("shows empty state when there are no webhooks", async () => {
+    const { container } = await renderAndWaitForProfile();
+
+    expect(within(container).getByText("Webhooks")).toBeInTheDocument();
+    expect(
+      within(container).getByText(
+        /No webhooks configured\. Add one to receive HTTP notifications\./,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    ).toBeInTheDocument();
+  });
+
+  it("displays existing webhooks", async () => {
+    const webhook = makeWebhook();
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("https://example.com/webhook"),
+      ).toBeInTheDocument();
+    });
+
+    expect(within(container).getByText("My test webhook")).toBeInTheDocument();
+
+    expect(within(container).getByText("batch.completed")).toBeInTheDocument();
+    expect(within(container).getByText("batch.failed")).toBeInTheDocument();
+
+    expect(
+      within(container).getByRole("button", {
+        name: `Edit webhook ${webhook.url}`,
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("button", {
+        name: `Delete webhook ${webhook.url}`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a disabled badge for disabled webhooks", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([makeWebhook({ enabled: false })]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText("Disabled")).toBeInTheDocument();
+    });
+  });
+
+  it("shows warning icon for auto-disabled webhooks", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([
+          makeWebhook({ disabled_at: "2025-06-01T00:00:00Z", enabled: false }),
+        ]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(
+        within(container).getByLabelText(
+          "Auto-disabled due to repeated delivery failures",
+        ),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("opens the create webhook dialog and validates URL", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Add Webhook")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        /Configure a URL to receive HTTP POST notifications/,
+      ),
+    ).toBeInTheDocument();
+
+    const checkboxes = within(dialog).getAllByRole("checkbox");
+    expect(checkboxes).toHaveLength(2);
+    checkboxes.forEach((cb) => {
+      expect(cb).toHaveAttribute("data-state", "checked");
+    });
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByText("URL is required")).toBeInTheDocument();
+    });
+
+    const urlInput = within(dialog).getByLabelText("Endpoint URL");
+    await user.type(urlInput, "not-a-url");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(dialog).getByText("Please enter a valid URL"),
+      ).toBeInTheDocument();
+    });
+
+    await user.clear(urlInput);
+    await user.type(urlInput, "http://example.com/hook");
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(dialog).getByText("URL must use HTTPS"),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("creates a webhook and shows the secret", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    const urlInput = within(dialog).getByLabelText("Endpoint URL");
+    await user.type(urlInput, "https://example.com/my-hook");
+
+    const descInput = within(dialog).getByLabelText("Description (optional)");
+    await user.type(descInput, "Test description");
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+
+    await waitFor(() => {
+      expect(within(dialog).getByText("Webhook Created")).toBeInTheDocument();
+    });
+    expect(
+      within(dialog).getByText(/Copy this secret now/),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Copy secret" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Done" }),
+    ).toBeInTheDocument();
+  });
+
+  it("opens the edit dialog pre-filled with webhook data", async () => {
+    const webhook = makeWebhook({
+      url: "https://hooks.slack.com/abc",
+      description: "Slack notifications",
+    });
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("https://hooks.slack.com/abc"),
+      ).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Edit webhook ${webhook.url}`,
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Edit Webhook")).toBeInTheDocument();
+
+    expect(within(dialog).getByLabelText("Endpoint URL")).toHaveValue(
+      "https://hooks.slack.com/abc",
+    );
+    expect(within(dialog).getByLabelText("Description (optional)")).toHaveValue(
+      "Slack notifications",
+    );
+
+    expect(
+      within(dialog).getByRole("button", { name: /Rotate Secret/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows delete confirmation dialog and deletes a webhook", async () => {
+    const webhook = makeWebhook();
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText(webhook.url)).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Delete webhook ${webhook.url}`,
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Delete Webhook")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        /Are you sure you want to delete this webhook\?/,
+      ),
+    ).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Delete webhook ${webhook.url}`,
+      }),
+    );
+    const dialog2 = await screen.findByRole("dialog");
+    await user.click(within(dialog2).getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
+  });
+});
+
+describe("Webhook Scope", () => {
+  it("shows scope selector for PlatformManager users", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Scope")).toBeInTheDocument();
+    expect(within(dialog).getByRole("tab", { name: "Personal" })).toHaveAttribute("data-state", "active");
+    expect(within(dialog).getByRole("tab", { name: "Platform" })).toBeInTheDocument();
+  });
+
+  it("does not show scope selector for non-PM users", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:id", () => {
+        return HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "standard-user",
+          email: "user@acme.com",
+          display_name: "Standard User",
+          avatar_url: null,
+          roles: ["StandardUser"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "native",
+        });
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText("Scope")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Platform" })).not.toBeInTheDocument();
+  });
+
+  it("switches event types when scope changes", async () => {
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    expect(within(dialog).getByText("Batch completed")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch failed")).toBeInTheDocument();
+    expect(within(dialog).queryByText("User created")).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
+    expect(within(dialog).getByText("API key created")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch completed")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("Batch failed")).not.toBeInTheDocument();
+  });
+
+  it("sends scope in create request", async () => {
+    let postedBody: Record<string, unknown> | null = null;
+    server.use(
+      http.post("/admin/api/v1/users/:userId/webhooks", async ({ request }) => {
+        postedBody = (await request.json()) as Record<string, unknown>;
+        const now = new Date().toISOString();
+        return HttpResponse.json(
+          {
+            id: "wh-new",
+            user_id: "550e8400-e29b-41d4-a716-446655440000",
+            url: postedBody.url,
+            enabled: true,
+            event_types: postedBody.event_types,
+            description: null,
+            scope: postedBody.scope || "own",
+            created_at: now,
+            updated_at: now,
+            disabled_at: null,
+            secret: "whsec_test123",
+          },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await user.click(
+      within(container).getByRole("button", { name: "Add webhook" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    await user.click(within(dialog).getByRole("tab", { name: "Platform" }));
+
+    const urlInput = within(dialog).getByLabelText("Endpoint URL");
+    await user.type(urlInput, "https://example.com/platform-hook");
+
+    await user.click(
+      within(dialog).getByRole("button", { name: "Create Webhook" }),
+    );
+
+    await waitFor(() => {
+      expect(postedBody).not.toBeNull();
+    });
+    expect(postedBody).toMatchObject({
+      scope: "platform",
+      event_types: ["user.created", "batch.created", "api_key.created"],
+    });
+  });
+
+  it("shows Platform badge on platform-scoped webhooks", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([
+          makeWebhook({
+            scope: "platform",
+            event_types: ["user.created"],
+          }),
+        ]);
+      }),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText("Platform")).toBeInTheDocument();
+    });
+  });
+
+  it("shows scope as read-only in edit dialog for platform webhooks", async () => {
+    const webhook = makeWebhook({
+      scope: "platform",
+      event_types: ["user.created", "batch.created"],
+    });
+    server.use(
+      http.get("/admin/api/v1/users/:userId/webhooks", () => {
+        return HttpResponse.json([webhook]);
+      }),
+    );
+
+    const { container, user } = await renderAndWaitForProfile();
+
+    await waitFor(() => {
+      expect(within(container).getByText(webhook.url)).toBeInTheDocument();
+    });
+
+    await user.click(
+      within(container).getByRole("button", {
+        name: `Edit webhook ${webhook.url}`,
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+
+    expect(within(dialog).getByText("Platform")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("tab", { name: "Personal" })).not.toBeInTheDocument();
+
+    expect(within(dialog).getByText("User created")).toBeInTheDocument();
+    expect(within(dialog).getByText("Batch created")).toBeInTheDocument();
+  });
+});
+
+describe("Organization Context", () => {
+  const ORG_ID = "org-test-123";
+  const ORG_NAME = "Test Org";
+
+  function useOrgContextHandler(role: string) {
+    return http.get("/admin/api/v1/users/:id", ({ params }) => {
+      if (params.id !== "current") {
+        return HttpResponse.json(
+          { error: "User not found" },
+          { status: 404 },
+        );
+      }
+      return HttpResponse.json({
+        id: "550e8400-e29b-41d4-a716-446655440001",
+        username: "github|109540503",
+        email: "sarah.chen@acme.com",
+        display_name: "Sarah Chen",
+        roles: ["StandardUser"],
+        created_at: "2025-03-10T10:00:00Z",
+        updated_at: "2025-12-20T15:30:00Z",
+        auth_source: "proxy-header",
+        is_admin: false,
+        has_payment_provider_id: false,
+        batch_notifications_enabled: false,
+        low_balance_threshold: null,
+        auto_topup_amount: null,
+        auto_topup_threshold: null,
+        auto_topup_monthly_limit: null,
+        has_auto_topup_payment_method: false,
+        active_organization_id: ORG_ID,
+        organizations: [
+          { id: ORG_ID, name: ORG_NAME, role, zero_data_retention: false },
+        ],
+      });
+    });
+  }
+
+  it("shows org banner instead of notification settings for admin", async () => {
+    server.use(useOrgContextHandler("admin"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByText(/managed at the organization level/),
+    ).toBeInTheDocument();
+    expect(
+      within(container).getByRole("button", { name: "organization settings" }),
+    ).toBeInTheDocument();
+
+    expect(
+      within(container).queryByRole("switch", { name: "Email notifications" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows contact admin message for regular members", async () => {
+    server.use(useOrgContextHandler("member"));
+    const { container } = render(<Profile />, { wrapper: createWrapper() });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: "Profile Settings" }),
+      ).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByText(
+        /Contact an admin of your organization to request changes/,
+      ),
+    ).toBeInTheDocument();
+
+    expect(
+      within(container).queryByRole("button", {
+        name: "organization settings",
+      }),
+    ).not.toBeInTheDocument();
+  });
+});

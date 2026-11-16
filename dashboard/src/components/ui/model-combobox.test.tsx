@@ -1,0 +1,410 @@
+import { render, waitFor, within, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
+import { ReactNode } from "react";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterEach,
+  afterAll,
+  vi,
+} from "vitest";
+import { ModelCombobox } from "./model-combobox";
+import type { Model } from "../../api/control-layer/types";
+
+const mockModels: Model[] = [
+  {
+    id: "model-1",
+    alias: "gpt-4o",
+    model_name: "gpt-4o",
+    model_type: "CHAT",
+    hosted_on: "endpoint-1",
+  },
+  {
+    id: "model-2",
+    alias: "gpt-4o-mini",
+    model_name: "gpt-4o-mini",
+    model_type: "CHAT",
+    hosted_on: "endpoint-1",
+  },
+  {
+    id: "model-3",
+    alias: "text-embedding-3-large",
+    model_name: "text-embedding-3-large",
+    model_type: "EMBEDDINGS",
+    hosted_on: "endpoint-2",
+  },
+  {
+    id: "model-4",
+    alias: "claude-3-opus",
+    model_name: "claude-3-opus-20240229",
+    model_type: "CHAT",
+    hosted_on: "endpoint-3",
+  },
+];
+
+const server = setupServer(
+  http.get("/admin/api/v1/models", ({ request }) => {
+    const url = new URL(request.url);
+    const search = url.searchParams.get("search");
+    const limit = parseInt(url.searchParams.get("limit") || "50", 10);
+
+    let filtered = [...mockModels];
+
+    if (search) {
+      filtered = filtered.filter(
+        (model) =>
+          model.alias.toLowerCase().includes(search.toLowerCase()) ||
+          model.model_name.toLowerCase().includes(search.toLowerCase()),
+      );
+    }
+
+    filtered = filtered.slice(0, limit);
+
+    return HttpResponse.json({
+      data: filtered,
+      total: filtered.length,
+      skip: 0,
+      limit,
+    });
+  }),
+);
+
+beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
+afterEach(() => {
+  server.resetHandlers();
+  vi.clearAllMocks();
+});
+afterAll(() => server.close());
+
+function createWrapper() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+        gcTime: 0,
+      },
+    },
+  });
+
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+describe("ModelCombobox", () => {
+  it("renders with default placeholder", async () => {
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    expect(combobox).toBeInTheDocument();
+    expect(combobox).toHaveTextContent("Select a model...");
+  });
+
+  it("renders with custom placeholder", async () => {
+    const { container } = render(
+      <ModelCombobox value={null} placeholder="Choose your model" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    expect(combobox).toHaveTextContent("Choose your model");
+  });
+
+  it("renders with React node as placeholder", async () => {
+    const { container } = render(
+      <ModelCombobox
+        value={null}
+        placeholder={
+          <div className="flex items-center">
+            <span>Custom Icon</span> Select
+          </div>
+        }
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    expect(combobox).toHaveTextContent("Custom Icon Select");
+  });
+
+  it("displays selected model alias when value is provided", async () => {
+    const { container } = render(<ModelCombobox value={mockModels[0]} />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      const combobox = within(container).getByRole("combobox", {
+        name: /select model/i,
+      });
+      expect(combobox).toHaveTextContent("gpt-4o");
+    });
+  });
+
+  it("opens popover when clicked", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    expect(combobox).toHaveAttribute("aria-expanded", "true");
+
+    await waitFor(() => {
+      expect(
+        screen.getByPlaceholderText(/Search/i),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("displays all models when opened", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
+      expect(screen.getByText("text-embedding-3-large")).toBeInTheDocument();
+      expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+    });
+  });
+
+  it("filters models based on search query", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByPlaceholderText(/Search/i);
+    await user.type(searchInput, "claude");
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+        expect(screen.queryByText("gpt-4o")).not.toBeInTheDocument();
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it("calls onValueChange when model is selected", async () => {
+    const user = userEvent.setup();
+    const handleChange = vi.fn();
+
+    const { container } = render(
+      <ModelCombobox value={null} onValueChange={handleChange} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText("gpt-4o"));
+
+    expect(handleChange).toHaveBeenCalledWith(mockModels[0]);
+    expect(handleChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes popover after model selection", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByText("gpt-4o"));
+
+    await waitFor(() => {
+      expect(combobox).toHaveAttribute("aria-expanded", "false");
+    });
+  });
+
+  it("applies filter function to models", async () => {
+    const user = userEvent.setup();
+    const chatOnlyFilter = (model: Model) => model.model_type === "CHAT";
+
+    const { container } = render(
+      <ModelCombobox value={null} filterFn={chatOnlyFilter} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    expect(screen.getByText("gpt-4o-mini")).toBeInTheDocument();
+    expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+
+    expect(
+      screen.queryByText("text-embedding-3-large"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses custom search placeholder", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <ModelCombobox value={null} searchPlaceholder="Find a model..." />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(
+        screen.getByPlaceholderText("Find a model..."),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("shows empty message when no models match search", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <ModelCombobox value={null} emptyMessage="No matching models found" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByPlaceholderText(/Search/i);
+    await user.type(searchInput, "nonexistent-model-xyz");
+
+    await waitFor(
+      () => {
+        expect(
+          screen.getByText("No matching models found"),
+        ).toBeInTheDocument();
+      },
+      { timeout: 1000 },
+    );
+  });
+
+  it("applies custom className", async () => {
+    const { container } = render(
+      <ModelCombobox value={null} className="custom-width" />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    expect(combobox).toHaveClass("custom-width");
+  });
+
+  it("debounces server search while filtering visible items immediately", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<ModelCombobox value={null} />, {
+      wrapper: createWrapper(),
+    });
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+      expect(screen.getByText("claude-3-opus")).toBeInTheDocument();
+    });
+
+    const searchInput = screen.getByPlaceholderText(/Search/i);
+
+    await user.type(searchInput, "gp");
+
+    expect(screen.queryByText("claude-3-opus")).not.toBeInTheDocument();
+    expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+  });
+
+  it("passes additional query options to useModels", async () => {
+    const user = userEvent.setup();
+
+    const { container } = render(
+      <ModelCombobox value={null} queryOptions={{ accessible: true }} />,
+      {
+        wrapper: createWrapper(),
+      },
+    );
+
+    const combobox = within(container).getByRole("combobox", {
+      name: /select model/i,
+    });
+    await user.click(combobox);
+
+    await waitFor(() => {
+      expect(screen.getByText("gpt-4o")).toBeInTheDocument();
+    });
+  });
+});

@@ -1,0 +1,402 @@
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use onwards::strict::schemas::chat_completions::{
+    ChatCompletionResponse, ChatMessage, Choice, ContentPart as ChatContentPart, MessageContent,
+};
+
+use super::types::{
+    ContentPart, FunctionCallItem, Include, IncompleteDetails, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem,
+    ReasoningContent, ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat,
+    TruncationStrategy,
+};
+use super::util::{chat_usage_to_response_usage, incomplete_reason, merge_reasoning_text};
+
+pub fn to_responses_response(
+    chat_response: &ChatCompletionResponse,
+    request: &ResponsesRequest,
+    response_id: Option<&str>,
+) -> ResponsesResponse {
+    let include_logprobs = request.includes(Include::MessageOutputTextLogprobs);
+    let output = chat_response
+        .choices
+        .iter()
+        .flat_map(|choice| {
+            message_to_items_with_projections(
+                &choice.message,
+                choice.finish_reason.as_deref(),
+                choice.logprobs.as_ref(),
+                include_logprobs,
+            )
+        })
+        .collect();
+
+    let (status, incomplete_details) = determine_response_status(&chat_response.choices);
+
+    let completed_at = if status == ResponseStatus::Completed {
+        Some(chat_response.created)
+    } else {
+        None
+    };
+
+    let tool_choice = request
+        .tool_choice
+        .as_ref()
+        .and_then(|tc| serde_json::to_value(tc).ok())
+        .unwrap_or(serde_json::Value::String("auto".to_string()));
+
+    ResponsesResponse {
+        id: format!("resp_{}", response_id.unwrap_or(&chat_response.id)),
+        object: "response".to_string(),
+        created_at: chat_response.created,
+        completed_at,
+        status,
+        incomplete_details,
+        model: request.model.clone(),
+        previous_response_id: request.previous_response_id.clone(),
+        instructions: request.instructions.clone(),
+        output,
+        error: None,
+        tools: request.tools.clone().unwrap_or_default(),
+        tool_choice,
+        truncation: request.truncation.clone().unwrap_or(TruncationStrategy::Disabled),
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+        text: request.text.clone().unwrap_or(TextConfig {
+            format: Some(TextFormat::Text),
+        }),
+        top_p: request.top_p.unwrap_or(1.0),
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        top_logprobs: request.top_logprobs.unwrap_or(0),
+        temperature: request.temperature.unwrap_or(1.0),
+        reasoning: serde_json::to_value(&request.reasoning).unwrap_or(serde_json::Value::Null),
+        usage: chat_response.usage.as_ref().map(chat_usage_to_response_usage),
+        max_output_tokens: request.max_output_tokens,
+        max_tool_calls: None,
+        store: request.store.unwrap_or(false),
+        background: false,
+        service_tier: chat_response.service_tier.clone().unwrap_or_else(|| "default".to_string()),
+        metadata: request.metadata.clone(),
+        safety_identifier: None,
+        prompt_cache_key: request.prompt_cache_key.clone(),
+    }
+}
+
+pub fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<Item> {
+    message_to_items_with_projections(message, finish_reason, None, false)
+}
+
+fn message_to_items_with_projections(
+    message: &ChatMessage,
+    finish_reason: Option<&str>,
+    chat_logprobs: Option<&serde_json::Value>,
+    include_logprobs: bool,
+) -> Vec<Item> {
+    let mut items = Vec::new();
+    let status = match incomplete_reason(finish_reason) {
+        Some(_) => Some(ItemStatus::Incomplete),
+        None => Some(ItemStatus::Completed),
+    };
+
+    let reasoning_text = merge_reasoning_text(
+        message.reasoning.as_ref(),
+        message.reasoning_content.as_ref(),
+        message.reasoning_details.as_ref(),
+    );
+
+    if !reasoning_text.is_empty() {
+        items.push(Item::Reasoning(ReasoningItem {
+            id: Some(generate_item_id()),
+            content: Some(vec![ReasoningContent::Text {
+                text: reasoning_text.clone(),
+            }]),
+            encrypted_content: None,
+            summary: Some(vec![SummaryContent::Text { text: reasoning_text }]),
+            status,
+        }));
+    }
+
+    if let Some(ref content) = message.content {
+        let content_text = match content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ChatContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        };
+
+        if !content_text.is_empty() {
+            items.push(Item::Message(MessageItem {
+                id: Some(generate_item_id()),
+                role: message.role.clone(),
+                content: ResponseMessageContent::Parts(vec![ContentPart::OutputText {
+                    text: content_text,
+                    annotations: vec![],
+                    logprobs: projected_logprobs(chat_logprobs, include_logprobs),
+                }]),
+                status,
+            }));
+        }
+    }
+
+    if let Some(ref tool_calls) = message.tool_calls {
+        for call in tool_calls {
+            items.push(Item::FunctionCall(FunctionCallItem {
+                id: Some(generate_item_id()),
+                call_id: call.id.clone(),
+                name: call.function.name.clone(),
+                arguments: call.function.arguments.clone(),
+                status,
+            }));
+        }
+    }
+
+    items
+}
+
+fn projected_logprobs(chat_logprobs: Option<&serde_json::Value>, include: bool) -> Vec<serde_json::Value> {
+    if !include {
+        return Vec::new();
+    }
+    chat_logprobs
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn determine_response_status(choices: &[Choice]) -> (ResponseStatus, Option<IncompleteDetails>) {
+    if choices.is_empty() {
+        return (ResponseStatus::Failed, None);
+    }
+
+    match choices.iter().find_map(|choice| incomplete_reason(choice.finish_reason.as_deref())) {
+        Some(reason) => (
+            ResponseStatus::Incomplete,
+            Some(IncompleteDetails {
+                reason: reason.to_string(),
+            }),
+        ),
+        None => (ResponseStatus::Completed, None),
+    }
+}
+
+static ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn generate_item_id() -> String {
+    let count = ITEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("item_{count:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onwards::strict::schemas::chat_completions::{FunctionCall, ToolCall, Usage};
+
+    fn assistant(content: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: content.map(|c| MessageContent::Text(c.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn text_message_becomes_single_message_item() {
+        let items = message_to_items(&assistant(Some("Hello!")), Some("stop"));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Item::Message(_)));
+        if let Item::Message(ref msg) = items[0] {
+            assert_eq!(msg.status, Some(ItemStatus::Completed));
+        }
+    }
+
+    #[test]
+    fn tool_calls_become_function_call_items() {
+        let mut message = assistant(None);
+        message.tool_calls = Some(vec![ToolCall {
+            id: "call_123".to_string(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: "get_weather".to_string(),
+                arguments: r#"{"location": "Paris"}"#.to_string(),
+            },
+        }]);
+
+        let items = message_to_items(&message, Some("tool_calls"));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Item::FunctionCall(_)));
+    }
+
+    #[test]
+    fn reasoning_field_becomes_leading_reasoning_item() {
+        let mut message = assistant(Some("The answer is 42."));
+        message.reasoning = Some("Let me think step by step...".to_string());
+
+        let items = message_to_items(&message, Some("stop"));
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], Item::Reasoning(_)));
+        assert!(matches!(items[1], Item::Message(_)));
+        if let Item::Reasoning(ref r) = items[0] {
+            let summary = r.summary.as_ref().unwrap();
+            let SummaryContent::Text { text } = &summary[0];
+            assert_eq!(text, "Let me think step by step...");
+        }
+    }
+
+    #[test]
+    fn reasoning_details_are_joined() {
+        let mut message = assistant(Some("Done"));
+        message.reasoning_details = Some(vec![
+            serde_json::json!({"type": "text", "text": "step 1"}),
+            serde_json::json!({"type": "text", "text": "step 2"}),
+        ]);
+
+        let items = message_to_items(&message, Some("stop"));
+        if let Item::Reasoning(ref r) = items[0] {
+            let summary = r.summary.as_ref().unwrap();
+            let SummaryContent::Text { text } = &summary[0];
+            assert_eq!(text, "step 1\nstep 2");
+        } else {
+            panic!("first item should be reasoning");
+        }
+    }
+
+    #[test]
+    fn status_maps_from_finish_reason() {
+        let stop = vec![Choice {
+            index: 0,
+            message: assistant(Some("Done")),
+            finish_reason: Some("stop".to_string()),
+            logprobs: None,
+        }];
+        assert_eq!(determine_response_status(&stop).0, ResponseStatus::Completed);
+
+        let mut tool_msg = assistant(None);
+        tool_msg.tool_calls = Some(vec![]);
+        let tool_calls = vec![Choice {
+            index: 0,
+            message: tool_msg,
+            finish_reason: Some("tool_calls".to_string()),
+            logprobs: None,
+        }];
+        let (status, details) = determine_response_status(&tool_calls);
+        assert_eq!(status, ResponseStatus::Completed, "OpenAI reports a tool-calling turn as completed");
+        assert!(details.is_none());
+
+        for (finish_reason, reason) in [("length", "max_output_tokens"), ("content_filter", "content_filter")] {
+            let cut = vec![Choice {
+                index: 0,
+                message: assistant(Some("Do")),
+                finish_reason: Some(finish_reason.to_string()),
+                logprobs: None,
+            }];
+            let (status, details) = determine_response_status(&cut);
+            assert_eq!(status, ResponseStatus::Incomplete, "{finish_reason}");
+            assert_eq!(details.map(|d| d.reason).as_deref(), Some(reason), "{finish_reason}");
+        }
+    }
+
+    fn chat_response_with_usage(prompt: u32, completion: u32) -> ChatCompletionResponse {
+        ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4o".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: assistant(Some("done")),
+                finish_reason: Some("stop".to_string()),
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            service_tier: None,
+        }
+    }
+
+    fn minimal_request() -> ResponsesRequest {
+        serde_json::from_value(serde_json::json!({ "model": "gpt-4o", "input": "Hello" })).unwrap()
+    }
+
+    #[test]
+    fn response_echoes_request_and_maps_usage() {
+        let mut chat = chat_response_with_usage(100, 50);
+        chat.usage = Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(serde_json::json!({ "cached_tokens": 42 })),
+            completion_tokens_details: Some(serde_json::json!({ "reasoning_tokens": 30 })),
+        });
+
+        let response = to_responses_response(&chat, &minimal_request(), None);
+
+        assert_eq!(response.object, "response");
+        assert_eq!(response.model, "gpt-4o");
+        assert_eq!(response.status, ResponseStatus::Completed);
+        assert!(response.id.starts_with("resp_"));
+
+        let usage = response.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.input_tokens_details.cached_tokens, 42);
+        assert_eq!(usage.output_tokens_details.reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn generated_item_ids_are_unique() {
+        let ids: Vec<String> = (0..100).map(|_| generate_item_id()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(ids.len(), unique.len());
+    }
+
+    #[test]
+    fn output_text_logprobs_include_projects_chat_content_logprobs() {
+        let mut chat = chat_response_with_usage(10, 5);
+        let token_logprob = serde_json::json!({
+            "token": "done",
+            "logprob": -0.1,
+            "bytes": [100, 111, 110, 101],
+            "top_logprobs": []
+        });
+        chat.choices[0].logprobs = Some(serde_json::json!({"content": [token_logprob.clone()]}));
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 2
+        }))
+        .unwrap();
+
+        let response = to_responses_response(&chat, &request, None);
+        assert_eq!(response.top_logprobs, 2);
+        let Item::Message(message) = &response.output[0] else {
+            panic!("first output item should be a message");
+        };
+        let ResponseMessageContent::Parts(parts) = &message.content else {
+            panic!("message content should be parts");
+        };
+        let ContentPart::OutputText { logprobs, .. } = &parts[0] else {
+            panic!("message content should be output_text");
+        };
+        assert_eq!(logprobs, &vec![token_logprob]);
+    }
+}

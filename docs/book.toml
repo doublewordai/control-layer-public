@@ -1,0 +1,11 @@
+[book]
+title = "Doubleword Control Layer"
+description = "Documentation for the Doubleword Control Layer"
+authors = ["Doubleword"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/doublewordai/control-layer"
+edit-url-template = "https://github.com/doublewordai/control-layer/edit/main/docs/{path}"
+additional-js = ["sidebar-links.js"]

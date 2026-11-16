@@ -1,0 +1,2195 @@
+
+use sqlx_pool_router::PoolProvider;
+
+use crate::{
+    AppState,
+    api::handlers::validate_toleration_preset,
+    api::models::{
+        groups::GroupResponse,
+        pagination::PaginatedResponse,
+        users::{CurrentUser, GetUserQuery, ListUsersQuery, Role, UserCreate, UserResponse, UserUpdate},
+    },
+    auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
+    db::{
+        handlers::{Credits, Groups, Organizations, Repository, Users, users::UserFilter},
+        models::users::{UserCreateDBRequest, UserUpdateDBRequest},
+    },
+    errors::{Error, Result},
+    types::{GroupId, Operation, Permission, Resource, UserId, UserIdOrCurrent},
+};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::Json,
+};
+use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use tracing::error;
+
+#[utoipa::path(
+    get,
+    path = "/users",
+    tag = "users",
+    summary = "List users",
+    description = "List all users (admin only)",
+    params(
+        ("skip" = Option<i64>, Query, description = "Number of users to skip"),
+        ("limit" = Option<i64>, Query, description = "Maximum number of users to return"),
+        ("include" = Option<String>, Query, description = "Comma-separated list of related entities to include (e.g., 'groups', 'billing')"),
+        ("search" = Option<String>, Query, description = "Search query to filter users by display_name, username, or email (case-insensitive substring match)"),
+    ),
+    responses(
+        (status = 200, description = "List of users", body = [UserResponse]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - admin access required"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn list_users<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Query(query): Query<ListUsersQuery>,
+    current_user: CurrentUser,
+    _: RequiresPermission<resource::Users, operation::ReadAll>,
+) -> Result<Json<PaginatedResponse<UserResponse>>> {
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let skip = query.pagination.skip();
+    let limit = query.pagination.limit();
+
+    let mut filter = UserFilter::new(skip, limit);
+    if let Some(search) = query.search.as_ref()
+        && !search.trim().is_empty()
+    {
+        filter = filter.with_search(search.trim().to_string());
+    }
+
+    let users;
+    let total_count;
+    {
+        let mut repo = Users::new(&mut conn);
+        users = repo.list(&filter).await?;
+        total_count = repo.count(&filter).await?;
+    }
+    let includes: Vec<&str> = query
+        .include
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut response_users = Vec::new();
+
+    let user_ids: Vec<_> = users.iter().map(|u| u.id).collect();
+
+    let can_view_billing = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
+
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+
+    let (balances_map, purchased_ids) = if includes.contains(&"billing") && can_view_billing {
+        let mut credits_repo = Credits::new(&mut conn);
+        let balances = credits_repo.get_users_balances_bulk(&user_ids).await?;
+        let purchased = credits_repo.has_purchased_bulk(&user_ids).await?;
+        (Some(balances), Some(purchased))
+    } else {
+        (None, None)
+    };
+
+    let (groups_map, user_groups_map) = if includes.contains(&"groups") {
+        let mut groups_repo = Groups::new(&mut conn);
+        let user_groups_map = groups_repo.get_users_groups_bulk(&user_ids).await?;
+        let all_group_ids: Vec<GroupId> = user_groups_map
+            .values()
+            .flatten()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let groups_map = groups_repo.get_bulk(all_group_ids).await?;
+        (Some(groups_map), Some(user_groups_map))
+    } else {
+        (None, None)
+    };
+
+    for user in users {
+        let toleration_preset = if can_update_all_users {
+            user.toleration_preset.clone()
+        } else {
+            None
+        };
+        let mut response_user = UserResponse::from(user).with_toleration_preset(toleration_preset);
+        if let Some(groups_map) = &groups_map
+            && let Some(user_groups_map) = &user_groups_map
+        {
+            let group_ids = user_groups_map.get(&response_user.id).cloned().unwrap_or_default();
+            let groups: Vec<GroupResponse> = group_ids
+                .iter()
+                .filter_map(|group_id| groups_map.get(group_id))
+                .cloned()
+                .map(|group| group.into())
+                .collect();
+            response_user = response_user.with_groups(groups);
+        }
+
+        if let Some(balances_map) = &balances_map {
+            let balance = balances_map.get(&response_user.id).and_then(|b| b.to_f64()).unwrap_or(0.0);
+            response_user = response_user.with_credit_balance(balance);
+        }
+        if let Some(purchased_ids) = &purchased_ids {
+            let has_purchased = purchased_ids.contains(&response_user.id);
+            response_user = response_user.with_has_purchased(has_purchased);
+        }
+
+        response_users.push(response_user);
+    }
+
+    let paginated_response = PaginatedResponse::new(response_users, total_count, skip, limit);
+    Ok(Json(paginated_response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}",
+    tag = "users",
+    summary = "Get user",
+    description = "Get a specific user by ID or current user",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+        ("includes" = Option<String>, Query, description = "Data to include, currently only 'billing' is supported"),
+    ),
+    responses(
+        (status = 200, description = "User information", body = UserResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - can only view own user data unless admin"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn get_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserIdOrCurrent>,
+    Query(query): Query<GetUserQuery>,
+    current_user: CurrentUser,
+) -> Result<Json<UserResponse>> {
+    let is_current = matches!(user_id, UserIdOrCurrent::Current(_));
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => {
+            if !can_read_own_resource(&current_user, Resource::Users, current_user.id) {
+                return Err(Error::InsufficientPermissions {
+                    required: Permission::Allow(Resource::Users, Operation::ReadOwn),
+                    action: Operation::ReadOwn,
+                    resource: "current user data".to_string(),
+                });
+            }
+            current_user.id
+        }
+        UserIdOrCurrent::Id(uuid) => {
+            let can_read_all_users = can_read_all_resources(&current_user, Resource::Users);
+            let can_read_own_user = can_read_own_resource(&current_user, Resource::Users, uuid);
+
+            if !can_read_all_users && !can_read_own_user {
+                let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+                let is_member = permissions::is_org_member(&current_user, uuid, &mut conn)
+                    .await
+                    .map_err(Error::Database)?;
+                if !is_member {
+                    return Err(Error::InsufficientPermissions {
+                        required: Permission::Any(vec![
+                            Permission::Allow(Resource::Users, Operation::ReadAll),
+                            Permission::Allow(Resource::Users, Operation::ReadOwn),
+                        ]),
+                        action: Operation::ReadAll,
+                        resource: format!("user data for user {uuid}"),
+                    });
+                }
+            }
+            uuid
+        }
+    };
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Users::new(&mut pool_conn);
+
+    let user = repo.get_by_id(target_user_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "User".to_string(),
+        id: target_user_id.to_string(),
+    })?;
+
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
+    if target_user_id == current_user.id {
+        response.roles = current_user.roles.clone();
+        response.is_admin = current_user.is_admin;
+    }
+
+    let is_org_member = current_user.organizations.iter().any(|o| o.id == target_user_id);
+    if query.include.as_deref().is_some_and(|includes| includes.contains("billing"))
+        && (permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll)
+            || (target_user_id == current_user.id && permissions::has_permission(&current_user, Resource::Credits, Operation::ReadOwn))
+            || is_org_member)
+    {
+        let mut credits_repo = Credits::new(&mut pool_conn);
+        let balance = credits_repo.get_user_balance(target_user_id).await?.to_f64().unwrap_or_else(|| {
+            error!("Failed to convert balance to f64 for user_id {}", target_user_id);
+            0.0
+        });
+        response = response.with_credit_balance(balance);
+        let has_purchased = credits_repo.has_purchased(target_user_id).await?;
+        response = response.with_has_purchased(has_purchased);
+    }
+
+    if query.include.as_deref().is_some_and(|includes| includes.contains("organizations")) {
+        let mut org_repo = Organizations::new(&mut pool_conn);
+        let memberships = org_repo.list_user_organizations(target_user_id).await?;
+        let manage_keys_orgs = org_repo.user_manage_keys_org_ids(target_user_id).await?;
+
+        let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
+        if !org_ids.is_empty() {
+            let mut users_repo = Users::new(&mut pool_conn);
+            let org_map = users_repo.get_bulk(org_ids).await?;
+
+            let summaries: Vec<crate::api::models::organizations::OrganizationSummary> = memberships
+                .iter()
+                .filter_map(|m| {
+                    org_map
+                        .get(&m.organization_id)
+                        .map(|org| crate::api::models::organizations::OrganizationSummary {
+                            id: m.organization_id,
+                            name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
+                            can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&m.organization_id),
+                            role: m.role.clone(),
+                            zero_data_retention: org.zero_data_retention,
+                            verified: org.verified,
+                        })
+                })
+                .collect();
+
+            response = response.with_organizations(summaries);
+        } else {
+            response = response.with_organizations(vec![]);
+        }
+    }
+
+    if is_current {
+        response = response.with_active_organization(current_user.active_organization);
+
+        let is_first_login = response.last_login.is_none()
+            || response
+                .last_login
+                .is_some_and(|ll| (ll - response.created_at).num_seconds().abs() < 10);
+        let config = state.current_config();
+        if is_first_login && let Some(url) = &config.onboarding_url {
+            response = response.with_onboarding_redirect_url(url.clone());
+        }
+    }
+
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/users",
+    tag = "users",
+    summary = "Create user",
+    description = "Create a new user (admin only)",
+    responses(
+        (status = 201, description = "User created successfully", body = UserResponse),
+        (status = 400, description = "Bad request - invalid user data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - admin access required"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    actor: RequiresPermission<resource::Users, operation::CreateAll>,
+    Json(user_data): Json<UserCreate>,
+) -> Result<(StatusCode, Json<UserResponse>)> {
+    if !actor.is_system()
+        && user_data.roles.iter().any(|role| {
+            !matches!(
+                role,
+                Role::StandardUser | Role::BatchAPIUser | Role::ConnectionsUser | Role::BackgroundInferenceUser
+            )
+        })
+    {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::SystemAccess),
+            action: Operation::CreateAll,
+            resource: "privileged user roles".to_string(),
+        });
+    }
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+
+    let mut repo = Users::new(&mut tx);
+    let db_request = UserCreateDBRequest::from(user_data);
+
+    let user = repo.create(&db_request).await?;
+
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+
+    Ok((StatusCode::CREATED, Json(UserResponse::from(user))))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/users/{user_id}",
+    tag = "users",
+    summary = "Update user",
+    description = "Update an existing user (admin can update any user, users can update their own profile)",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID to update"),
+    ),
+    responses(
+        (status = 200, description = "User updated successfully", body = UserResponse),
+        (status = 400, description = "Bad request - invalid user data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - can only update own user data unless admin"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn update_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserId>,
+    current_user: CurrentUser,
+    Json(user_data): Json<UserUpdate>,
+) -> Result<Json<UserResponse>> {
+    let can_update_all_users = permissions::can_update_all_resources(&current_user, Resource::Users);
+    let can_update_own_user = permissions::can_update_own_resource(&current_user, Resource::Users, user_id);
+
+    let support_zdr = current_user.can_manage_platform() && user_data.is_enable_zdr_only();
+    if !can_update_all_users && !can_update_own_user && !support_zdr {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Any(vec![
+                Permission::Allow(Resource::Users, Operation::UpdateAll),
+                Permission::Allow(Resource::Users, Operation::UpdateOwn),
+            ]),
+            action: Operation::UpdateAll,
+            resource: format!("user data for user {user_id}"),
+        });
+    }
+
+    if !can_update_all_users && user_data.roles.is_some() {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "user roles".to_string(),
+        });
+    }
+
+    if !can_update_all_users && (user_data.self_hosted_only.is_some() || user_data.toleration_preset.is_some()) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "serving settings".to_string(),
+        });
+    }
+    if let Some(Some(preset)) = &user_data.toleration_preset {
+        validate_toleration_preset(&state, preset)?;
+    }
+
+    if let Some(Some(amount)) = &user_data.auto_topup_amount
+        && *amount <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up amount must be positive".to_string(),
+        });
+    }
+    if let Some(Some(threshold)) = &user_data.auto_topup_threshold
+        && *threshold < 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up threshold must be non-negative".to_string(),
+        });
+    }
+    if let Some(Some(limit)) = &user_data.auto_topup_monthly_limit
+        && *limit <= 0.0
+    {
+        return Err(Error::BadRequest {
+            message: "Auto top-up monthly limit must be positive".to_string(),
+        });
+    }
+
+    let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
+
+    let mut repo = Users::new(&mut conn);
+    let zero_data_retention = user_data.zero_data_retention;
+    let db_request = UserUpdateDBRequest::new(user_data);
+
+    let user = repo.update(user_id, &db_request).await?;
+    if let Some(enabled) = zero_data_retention {
+        tracing::info!(actor_id = %current_user.id, target_user_id = %user_id,
+            zero_data_retention = enabled, "zero data retention updated");
+    }
+    let toleration_preset = if can_update_all_users {
+        user.toleration_preset.clone()
+    } else {
+        None
+    };
+    let mut response = UserResponse::from(user).with_toleration_preset(toleration_preset);
+    if user_id == current_user.id {
+        response.roles = current_user.roles.clone();
+        response.is_admin = current_user.is_admin;
+    }
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/users/{user_id}",
+    tag = "users",
+    summary = "Delete user",
+    description = "Delete a user (admin only)",
+    params(
+        ("user_id" = uuid::Uuid, Path, description = "User ID to delete"),
+    ),
+    responses(
+        (status = 204, description = "User deleted successfully"),
+        (status = 400, description = "Bad request - cannot delete yourself"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - admin access required"),
+        (status = 404, description = "User not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn delete_user<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserId>,
+    current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
+) -> Result<StatusCode> {
+    if user_id == current_user.id {
+        return Err(Error::BadRequest {
+            message: "You cannot delete your own account".to_string(),
+        });
+    }
+
+    let user_id_str = user_id.to_string();
+    cancel_active_batches(&state, &user_id_str).await?;
+
+    let member_org_ids = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Organizations::new(&mut conn).list_member_organization_ids(user_id).await?
+    };
+
+    let deleted = {
+        let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
+        let mut repo = Users::new(&mut conn);
+        repo.delete(user_id).await?
+    };
+
+    if !deleted {
+        return Err(Error::NotFound {
+            resource: "User".to_string(),
+            id: user_id.to_string(),
+        });
+    }
+
+    enqueue_purge_user_data(&state, user_id_str).await;
+
+    for org_id in member_org_ids {
+        let closed = {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            Users::new(&mut conn).get_by_id(org_id).await?.is_none()
+        };
+        if closed {
+            let org_id_str = org_id.to_string();
+            if let Err(e) = cancel_active_batches(&state, &org_id_str).await {
+                tracing::warn!(
+                    org_id = %org_id,
+                    error = %e,
+                    "Failed to cancel batches for a workspace closed with its owner; purging anyway"
+                );
+            }
+            enqueue_purge_user_data(&state, org_id_str).await;
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn cancel_active_batches<P: PoolProvider>(state: &AppState<P>, owner_id: &str) -> Result<()> {
+    use fusillade::Storage;
+
+    let batches = state
+        .request_manager
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by: Some(owner_id.to_string()),
+            limit: Some(i64::MAX),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(owner_id = %owner_id, error = %e, "Failed to list batches for deletion");
+            Error::Internal {
+                operation: "list batches for deletion".to_string(),
+            }
+        })?;
+
+    for batch in batches {
+        if batch.completed_at.is_none()
+            && let Err(e) = state.request_manager.cancel_batch(batch.id).await
+        {
+            tracing::warn!(
+                batch_id = %batch.id,
+                owner_id = %owner_id,
+                error = %e,
+                "Failed to cancel batch during deletion"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PurgeUserDataInput {
+    pub user_id: String,
+}
+
+pub async fn build_purge_user_data_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<PurgeUserDataInput, crate::tasks::TaskState<P>>> {
+    use fusillade::Storage;
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    const BATCH_SIZE: i64 = 1000;
+
+    Job::<PurgeUserDataInput, _>::builder()
+        .state(state)
+        .step(|cx, input: PurgeUserDataInput| async move {
+            let mut total: u64 = 0;
+            loop {
+                match cx.state.request_manager.bulk_delete_data(&input.user_id, BATCH_SIZE).await {
+                    Ok(0) => {
+                        if total > 0 {
+                            tracing::info!(user_id = %input.user_id, rows = total, "Purged user fusillade data");
+                        }
+                        return To::done();
+                    }
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        tracing::error!(user_id = %input.user_id, error = %e, "Failed to purge user fusillade data");
+                        return Err(TaskError::Retryable(e.to_string()));
+                    }
+                }
+            }
+        })
+        .name("purge-user-data")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+async fn enqueue_purge_user_data<P: PoolProvider>(state: &AppState<P>, user_id: String) {
+    if let Err(e) = state
+        .task_runner
+        .purge_user_data_job
+        .enqueue(&PurgeUserDataInput { user_id: user_id.clone() })
+        .await
+    {
+        crate::background_error!(
+            crate::metrics::errors::component::TASK_WORKER,
+            "purge_user_data_enqueue",
+            Error,
+            user_id = %user_id,
+            error = %e,
+            "Failed to enqueue purge-user-data job; fusillade data will NOT be erased until retried (right-to-erasure gap)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::pagination::MAX_LIMIT;
+    use crate::api::models::users::Role;
+    use crate::db::handlers::{Credits, Groups, Repository};
+    use crate::db::models::{
+        credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+        groups::GroupCreateDBRequest,
+    };
+    use crate::test::utils::*;
+    use rust_decimal::Decimal;
+    use serde_json::{Value, json};
+    use sqlx::PgPool;
+    use std::collections::HashSet;
+    use std::str::FromStr;
+    use uuid::Uuid;
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_current_user_info(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert_eq!(current_user.id, user.id);
+        assert_eq!(current_user.email, user.email);
+        assert_eq!(current_user.roles, user.roles);
+        assert!(!current_user.verified, "a fresh account has not proven a payment method");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_current_user_reports_verified_once_set(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let fetch_verified = async |app: &axum_test::TestServer| -> bool {
+            let response = app
+                .get("/admin/api/v1/users/current")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            response.assert_status_ok();
+            response.json::<UserResponse>().verified
+        };
+
+        assert!(!fetch_verified(&app).await, "starts unverified");
+
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(user.id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(fetch_verified(&app).await, "verification is visible to the client");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_current_user_verified_is_read_after_write_consistent(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(user.id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        assert!(
+            response.json::<UserResponse>().verified,
+            "a read immediately after set_verified must not be served stale"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_as_admin(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(!paginated.data.is_empty());
+        assert!(paginated.total_count > 0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_as_non_admin_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_create_user_as_admin(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let new_user = json!({
+            "username": "newuser",
+            "email": "newuser@example.com",
+            "display_name": "New User",
+            "avatar_url": null,
+            "roles": ["StandardUser"]
+        });
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&new_user)
+            .await;
+
+        response.assert_status(StatusCode::CREATED);
+        assert_eq!(response.json::<serde_json::Value>()["email"], "newuser@example.com");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_unauthenticated_request(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool, false).await;
+
+        let response = app.get("/admin/api/v1/users/current").await;
+        response.assert_status_unauthorized();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_with_pagination(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        for _ in 0..5 {
+            create_test_user(&pool, Role::StandardUser).await;
+        }
+
+        let response = app
+            .get("/admin/api/v1/users?limit=3")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert_eq!(paginated.data.len(), 3);
+        assert_eq!(paginated.limit, 3);
+        assert_eq!(paginated.skip, 0);
+
+        let response = app
+            .get("/admin/api/v1/users?skip=2&limit=2")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.len() <= 2);
+        assert_eq!(paginated.skip, 2);
+        assert_eq!(paginated.limit, 2);
+
+        let response = app
+            .get("/admin/api/v1/users?skip=1000&limit=10")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.is_empty());
+        assert_eq!(paginated.skip, 1000);
+
+        let response = app
+            .get("/admin/api/v1/users?limit=2000")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        assert!(paginated.data.len() <= MAX_LIMIT as usize);
+        assert_eq!(paginated.limit, MAX_LIMIT);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_other_user_as_admin(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let user_response: UserResponse = response.json();
+        assert_eq!(user_response.id, regular_user.id);
+        assert_eq!(user_response.email, regular_user.email);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_other_user_as_non_admin_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", user2.id))
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_user_not_found(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let nonexistent_id = uuid::Uuid::new_v4();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{nonexistent_id}"))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_not_found();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_with_groups_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire database connection");
+        let mut group_repo = Groups::new(&mut conn);
+        let group_create = GroupCreateDBRequest {
+            name: "Test Group".to_string(),
+            description: Some("Test group for user include".to_string()),
+            created_by: admin_user.id,
+        };
+        let group = group_repo.create(&group_create).await.expect("Failed to create test group");
+        group_repo
+            .add_user_to_group(regular_user.id, group.id)
+            .await
+            .expect("Failed to add user to group");
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.groups.is_none());
+
+        let response = app
+            .get("/admin/api/v1/users?include=groups")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.groups.is_some());
+        let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
+        assert!(groups.contains(&group.id));
+
+        let response = app
+            .get("/admin/api/v1/users?include=groups&limit=10")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.groups.is_some());
+        let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
+        assert!(groups.contains(&group.id));
+
+        let response = app
+            .get("/admin/api/v1/users?include=invalid,groups")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.groups.is_some());
+        let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
+        assert!(groups.contains(&group.id));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_with_billing_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, regular_user.id, "250.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_none());
+
+        let response = app
+            .get("/admin/api/v1/users?include=billing")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
+
+        let response = app
+            .get("/admin/api/v1/users?include=billing&limit=10")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
+
+        let response = app
+            .get("/admin/api/v1/users?include=invalid,billing")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 250.0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_with_groups_and_billing_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire database connection");
+        let mut group_repo = Groups::new(&mut conn);
+        let group_create = GroupCreateDBRequest {
+            name: "Test Group".to_string(),
+            description: Some("Test group for combined include".to_string()),
+            created_by: admin_user.id,
+        };
+        let group = group_repo.create(&group_create).await.expect("Failed to create test group");
+        group_repo
+            .add_user_to_group(regular_user.id, group.id)
+            .await
+            .expect("Failed to add user to group");
+
+        create_initial_credit_transaction(&pool, regular_user.id, "500.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users?include=groups,billing")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+
+        assert!(found_user.groups.is_some());
+        let groups = found_user.groups.as_ref().unwrap().iter().map(|x| x.id).collect::<HashSet<_>>();
+        assert!(groups.contains(&group.id));
+
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 500.0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_billing_with_zero_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+
+        let response = app
+            .get("/admin/api/v1/users?include=billing")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 0.0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_billing_with_multiple_transactions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+        let user3 = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user1.id, "100.0").await;
+        create_initial_credit_transaction(&pool, user2.id, "200.0").await;
+        create_initial_credit_transaction(&pool, user3.id, "300.0").await;
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = Credits::new(&mut conn);
+        let request = CreditTransactionCreateDBRequest::admin_grant(
+            user1.id,
+            admin_user.id,
+            Decimal::from_str("50.0").unwrap(),
+            Some("Additional grant".to_string()),
+        );
+        credits_repo
+            .create_transaction(&request)
+            .await
+            .expect("Failed to create transaction");
+
+        let response = app
+            .get("/admin/api/v1/users?include=billing")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+
+        let found_user1 = paginated.data.iter().find(|u| u.id == user1.id).expect("User1 not found");
+        assert_eq!(found_user1.credit_balance.unwrap(), 150.0);
+
+        let found_user2 = paginated.data.iter().find(|u| u.id == user2.id).expect("User2 not found");
+        assert_eq!(found_user2.credit_balance.unwrap(), 200.0);
+
+        let found_user3 = paginated.data.iter().find(|u| u.id == user3.id).expect("User3 not found");
+        assert_eq!(found_user3.credit_balance.unwrap(), 300.0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_billing_manager_can_view_billing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_admin_user(&pool, Role::BillingManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, regular_user.id, "350.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users?include=billing")
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<UserResponse> = response.json();
+        let found_user = paginated.data.iter().find(|u| u.id == regular_user.id).expect("User not found");
+        assert!(found_user.credit_balance.is_some());
+        assert_eq!(found_user.credit_balance.unwrap(), 350.0);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_user_as_admin(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let update_data = json!({
+            "display_name": "Updated Display Name",
+            "avatar_url": "https://example.com/new-avatar.jpg"
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_own_user_as_standard_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let update_data = json!({
+            "display_name": "My New Display Name",
+            "avatar_url": "https://example.com/my-avatar.jpg"
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_ok();
+        let updated_user: UserResponse = response.json();
+        assert_eq!(updated_user.id, user.id);
+        assert_eq!(updated_user.display_name.as_deref(), Some("My New Display Name"));
+        assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/my-avatar.jpg"));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_users_cannot_touch_their_own_serving_settings_or_customer_serving_settings(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        for body in [
+            json!({ "self_hosted_only": true }),
+            json!({ "display_name": "Renamed", "self_hosted_only": true }),
+        ] {
+            let response = app
+                .patch(&format!("/admin/api/v1/users/{}", user.id))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .json(&body)
+                .await;
+            response.assert_status_forbidden();
+        }
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let current: UserResponse = response.json();
+        assert!(!current.self_hosted_only);
+        assert_ne!(current.display_name.as_deref(), Some("Renamed"));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .json(&json!({ "self_hosted_only": true }))
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_user_as_non_admin_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let update_data = json!({
+            "display_name": "Should Not Work"
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user2.id))
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_nonexistent_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let nonexistent_id = uuid::Uuid::new_v4();
+
+        let update_data = json!({
+            "display_name": "Should Not Work"
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{nonexistent_id}"))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_user_as_admin(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+
+        let get_response = app
+            .get(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        get_response.assert_status_ok();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_user_as_non_admin_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}", user2.id))
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_nonexistent_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let nonexistent_id = uuid::Uuid::new_v4();
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{nonexistent_id}"))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_delete_self_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}", admin_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_user_permissions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let standard_user = create_test_user(&pool, Role::StandardUser).await;
+        let other_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", standard_user.id))
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", other_user.id))
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let new_user = json!({
+            "username": "should_not_work",
+            "email": "shouldnotwork@example.com",
+            "roles": ["StandardUser"]
+        });
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .json(&new_user)
+            .await;
+        response.assert_status_forbidden();
+
+        let update_data = json!({"display_name": "Should Not Work"});
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", other_user.id))
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .json(&update_data)
+            .await;
+        response.assert_status_forbidden();
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}", other_user.id))
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_request_viewer_permissions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let request_viewer = create_test_user(&pool, Role::RequestViewer).await;
+        let other_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", other_user.id))
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let new_user = json!({
+            "username": "should_not_work",
+            "email": "shouldnotwork@example.com",
+            "roles": ["StandardUser"]
+        });
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&request_viewer)[0].0, &add_auth_headers(&request_viewer)[0].1)
+            .add_header(&add_auth_headers(&request_viewer)[1].0, &add_auth_headers(&request_viewer)[1].1)
+            .json(&new_user)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_platform_manager_user_permissions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
+        let standard_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", standard_user.id))
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let new_user = json!({
+            "username": "created_by_pm",
+            "email": "createdbypm@example.com",
+            "roles": ["StandardUser"]
+        });
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .json(&new_user)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+
+        let update_data = json!({"display_name": "Updated by PM"});
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", standard_user.id))
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .json(&update_data)
+            .await;
+        response.assert_status_forbidden();
+
+        let response = app
+            .delete(&format!("/admin/api/v1/users/{}", standard_user.id))
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_multi_role_user_permissions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let multi_role_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
+        let other_user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", other_user.id))
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
+            .await;
+        response.assert_status_forbidden();
+
+        let new_user = json!({
+            "username": "should_not_work",
+            "email": "shouldnotwork@example.com",
+            "roles": ["StandardUser"]
+        });
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&multi_role_user)[0].0, &add_auth_headers(&multi_role_user)[0].1)
+            .add_header(&add_auth_headers(&multi_role_user)[1].0, &add_auth_headers(&multi_role_user)[1].1)
+            .json(&new_user)
+            .await;
+        response.assert_status_forbidden();
+
+        let full_admin = create_test_user_with_roles(&pool, vec![Role::PlatformManager, Role::RequestViewer]).await;
+
+        let response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let response = app
+            .post("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&full_admin)[0].0, &add_auth_headers(&full_admin)[0].1)
+            .add_header(&add_auth_headers(&full_admin)[1].0, &add_auth_headers(&full_admin)[1].1)
+            .json(&new_user)
+            .await;
+        response.assert_status(StatusCode::CREATED);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_user_access_isolation(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+        let user3 = create_test_user(&pool, Role::RequestViewer).await;
+
+        let users = vec![&user1, &user2, &user3];
+        let targets = vec![&user1, &user2, &user3];
+
+        for user in &users {
+            for target in &targets {
+                let response = app
+                    .get(&format!("/admin/api/v1/users/{}", target.id))
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+
+                if user.id == target.id {
+                    response.assert_status_ok();
+                    let user_response: UserResponse = response.json();
+                    assert_eq!(user_response.id, target.id);
+                } else {
+                    response.assert_status_forbidden();
+                }
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_role_layering_user_access(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let role_tests = vec![
+            (vec![Role::StandardUser], false, true, false, "StandardUser only"),
+            (vec![Role::RequestViewer], false, true, false, "RequestViewer only"),
+            (vec![Role::PlatformManager], true, true, true, "PlatformManager only"),
+            (
+                vec![Role::StandardUser, Role::RequestViewer],
+                false,
+                true,
+                false,
+                "StandardUser + RequestViewer",
+            ),
+            (
+                vec![Role::PlatformManager, Role::RequestViewer],
+                true,
+                true,
+                true,
+                "PlatformManager + RequestViewer",
+            ),
+            (
+                vec![Role::PlatformManager, Role::StandardUser],
+                true,
+                true,
+                true,
+                "PlatformManager + StandardUser",
+            ),
+        ];
+
+        for (roles, can_list_users, can_read_own, can_create_users, _description) in role_tests {
+            let user = create_test_user_with_roles(&pool, roles).await;
+
+            let response = app
+                .get("/admin/api/v1/users")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+
+            if can_list_users {
+                response.assert_status_ok();
+            } else {
+                response.assert_status_forbidden();
+            }
+
+            let response = app
+                .get("/admin/api/v1/users/current")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+
+            if can_read_own {
+                response.assert_status_ok();
+            } else {
+                response.assert_status_forbidden();
+            }
+
+            let new_user = json!({
+                "username": format!("test_user_{}", uuid::Uuid::new_v4()),
+                "email": format!("test{}@example.com", uuid::Uuid::new_v4()),
+                "roles": ["StandardUser"]
+            });
+
+            let response = app
+                .post("/admin/api/v1/users")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .json(&new_user)
+                .await;
+
+            if can_create_users {
+                response.assert_status(axum::http::StatusCode::CREATED);
+                let created_user: UserResponse = response.json();
+                app.delete(&format!("/admin/api/v1/users/{}", created_user.id))
+                    .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                    .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                    .await
+                    .assert_status_forbidden();
+            } else {
+                response.assert_status_forbidden();
+            }
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_admin_bypass_vs_role_permissions(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+
+        let admin_user = create_test_admin_user(&pool, Role::RequestViewer).await;
+        let non_admin_pm = create_test_user(&pool, Role::PlatformManager).await;
+
+
+        let admin_response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        admin_response.assert_status_ok();
+
+        let pm_response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&non_admin_pm)[0].0, &add_auth_headers(&non_admin_pm)[0].1)
+            .add_header(&add_auth_headers(&non_admin_pm)[1].0, &add_auth_headers(&non_admin_pm)[1].1)
+            .await;
+        pm_response.assert_status_ok();
+
+        let standard_user = create_test_user(&pool, Role::StandardUser).await;
+        let standard_response = app
+            .get("/admin/api/v1/users")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        standard_response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_update_user_roles_backend_protection(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+
+        let update_data = json!({
+            "roles": ["RequestViewer"]
+        });
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_admin_can_enable_but_not_disable_zero_data_retention(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+
+        assert!(!regular_user.zero_data_retention);
+
+        let update_data = json!({ "zero_data_retention": true });
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update_data)
+            .await;
+
+        response.assert_status_ok();
+        let updated_user: UserResponse = response.json();
+        assert!(updated_user.zero_data_retention, "admin should be able to enable ZDR");
+
+        let update_data = json!({ "zero_data_retention": false });
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", regular_user.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&update_data)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_standard_user_can_toggle_own_zero_data_retention(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "zero_data_retention": true }))
+            .await;
+
+        response.assert_status_ok();
+        assert!(response.json::<UserResponse>().zero_data_retention);
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "zero_data_retention": false }))
+            .await;
+
+        response.assert_status_ok();
+        assert!(!response.json::<UserResponse>().zero_data_retention);
+    }
+
+    async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> Uuid {
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+        let mut credits_repo = Credits::new(&mut conn);
+
+        let amount_decimal = Decimal::from_str(amount).expect("Invalid decimal amount");
+        let request = CreditTransactionCreateDBRequest::admin_grant(
+            user_id,
+            uuid::Uuid::nil(),
+            amount_decimal,
+            Some("Initial credit grant".to_string()),
+        );
+
+        credits_repo
+            .create_transaction(&request)
+            .await
+            .expect("Failed to create transaction")
+            .id
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_own_balance_as_standard_user(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user.id, "150.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(150.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_billing_include_reports_first_purchase_state(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user.id, "1.0").await;
+
+        let headers = add_auth_headers(&user);
+        let before: UserResponse = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .json();
+        assert_eq!(before.credit_balance, Some(1.0));
+        assert_eq!(before.has_purchased, Some(false));
+
+        let mut conn = pool.acquire().await.unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("30.0").unwrap(),
+                source_id: "sess-1".to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .expect("insert purchase");
+        drop(conn);
+
+        let after: UserResponse = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .json();
+        assert_eq!(after.has_purchased, Some(true));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_users_billing_include_reports_first_purchase_state(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_user(&pool, Role::PlatformManager).await;
+        let buyer = create_test_user(&pool, Role::StandardUser).await;
+        let non_buyer = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: buyer.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("30.0").unwrap(),
+                source_id: "sess-1".to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .expect("insert purchase");
+        drop(conn);
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/users?include=billing&limit=100")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let rows = body["data"].as_array().expect("data array");
+
+        let purchased_for = |id: UserId| -> Option<bool> {
+            rows.iter()
+                .find(|r| r["id"].as_str() == Some(&id.to_string()))
+                .and_then(|r| r["has_purchased"].as_bool())
+        };
+
+        assert_eq!(purchased_for(buyer.id), Some(true));
+        assert_eq!(purchased_for(non_buyer.id), Some(false));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_first_purchase_state_is_omitted_without_the_billing_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(response.json::<UserResponse>().has_purchased, None);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_current_user_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_other_user_balance_forbidden(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user1 = create_test_user(&pool, Role::StandardUser).await;
+        let user2 = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user2.id))
+            .add_header(&add_auth_headers(&user1)[0].0, &add_auth_headers(&user1)[0].1)
+            .add_header(&add_auth_headers(&user1)[1].0, &add_auth_headers(&user1)[1].1)
+            .await;
+
+        response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_own_balance_as_request_viewer(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::RequestViewer).await;
+
+        create_initial_credit_transaction(&pool, user.id, "150.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(150.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_current_user_balance_request_viewer(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::RequestViewer).await;
+
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_get_current_user_balance_platform_manager(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+
+        create_initial_credit_transaction(&pool, user.id, "125.0").await;
+
+        let response = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(125.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_platform_manager_can_view_any_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user.id, "300.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(300.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_billing_manager_can_view_any_balance(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        create_initial_credit_transaction(&pool, user.id, "300.0").await;
+
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}?include=billing", user.id))
+            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
+            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let balance: UserResponse = response.json();
+        assert_eq!(balance.id, user.id);
+        assert_eq!(balance.credit_balance, Some(300.0));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_redirect_for_new_user_with_null_last_login(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert_eq!(
+            current_user.onboarding_redirect_url.as_deref(),
+            Some("https://onboarding.example.com"),
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_onboarding_redirect_for_recently_created_user_with_last_login_set(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '1 second' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert_eq!(
+            current_user.onboarding_redirect_url.as_deref(),
+            Some("https://onboarding.example.com"),
+            "Should still redirect when last_login is within 10 seconds of created_at"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_no_onboarding_redirect_for_returning_user(pool: PgPool) {
+        let mut config = create_test_config();
+        config.onboarding_url = Some("https://onboarding.example.com".to_string());
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            "UPDATE users SET last_login = created_at + interval '2 hours' WHERE id = $1",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert!(
+            current_user.onboarding_redirect_url.is_none(),
+            "Returning user should not get onboarding redirect"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_no_onboarding_redirect_when_not_configured(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let current_user: UserResponse = response.json();
+        assert!(
+            current_user.onboarding_redirect_url.is_none(),
+            "Should not include redirect when onboarding_url is not configured"
+        );
+    }
+}

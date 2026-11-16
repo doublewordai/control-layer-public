@@ -1,0 +1,17 @@
+# Adds mock LLM server for testing
+# Used by both local tests (just test) and CI (just test docker)
+
+services:
+  control-layer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev  # or production target
+    environment:
+      # Tests create models at runtime and expect them routable within seconds.
+      # Shrink the onwards-sync fallback resync so new models land in onwards'
+      # route cache quickly even if LISTEN/NOTIFY is slow in this ephemeral stack.
+      - DWCTL_BACKGROUND_SERVICES__ONWARDS_SYNC__FALLBACK_INTERVAL_MILLISECONDS=2000
+  mock-llm-server:
+    # pinned image of zerob13/mock-openai-api  
+    image: zerob13/mock-openai-api@sha256:9c9fdcf4eb412f6a821e693e44d299db0d79abbfb398debf3b619dc49f243cff

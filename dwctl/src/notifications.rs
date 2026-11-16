@@ -1,0 +1,2286 @@
+
+use crate::metrics::errors::component::{AUTO_TOPUP, NOTIFICATIONS};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use fusillade_arsenal::PostgresRequestManager;
+use metrics::counter;
+use opentelemetry::{Array, StringValue, Value};
+use rust_decimal::prelude::ToPrimitive;
+use sqlx::postgres::PgListener;
+use sqlx_pool_router::DbPools;
+use tokio_util::sync::CancellationToken;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use uuid::Uuid;
+
+use crate::config::NotificationsConfig;
+use crate::db::handlers::repository::Repository;
+use crate::db::handlers::users::{AutoTopupUser, LowBalanceUser, Users};
+use crate::db::handlers::{Credits, Organizations, Webhooks};
+use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
+use crate::email::EmailService;
+use crate::payment_providers::{self, AutoTopupDeclineKind, PaymentError, PaymentProvider};
+use crate::telemetry::span_account_name;
+use crate::webhooks::WebhookDispatcher;
+use crate::webhooks::events::{WebhookEvent, WebhookEventType};
+
+const WEBHOOK_EVENT_CHANNEL: &str = "webhook_event";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOutcome {
+    Completed,
+    PartiallyCompleted,
+    Failed,
+}
+
+pub struct BatchNotificationInfo {
+    pub batch_id: String,
+    pub batch_uuid: Uuid,
+    pub user_id: Uuid,
+    pub endpoint: String,
+    pub model: String,
+    pub outcome: BatchOutcome,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub total_requests: i64,
+    pub completed_requests: i64,
+    pub failed_requests: i64,
+    pub cancelled_requests: i64,
+    pub completion_window: String,
+    pub filename: Option<String>,
+    pub description: Option<String>,
+    pub output_file_id: Option<Uuid>,
+    pub error_file_id: Option<Uuid>,
+}
+
+impl BatchNotificationInfo {
+    fn try_from_batch(notif: &fusillade::batch::BatchNotification) -> Option<Self> {
+        let batch = &notif.batch;
+        let batch_id_str = batch.id.to_string();
+
+        let created_by = &batch.created_by;
+        if created_by.is_empty() {
+            tracing::debug!(batch_id = %batch_id_str, "Batch has no creator, skipping notification");
+            return None;
+        }
+
+        let user_id: Uuid = match created_by.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!(batch_id = %batch_id_str, created_by = %created_by, "Invalid creator UUID, skipping notification");
+                return None;
+            }
+        };
+
+        let outcome = if batch.completed_at.is_none() && batch.failed_at.is_none() {
+            tracing::warn!(batch_id = %batch_id_str, "Batch has no outcome, skipping notification");
+            return None;
+        } else if batch.failed_requests == 0 {
+            BatchOutcome::Completed
+        } else if batch.completed_requests == 0 {
+            BatchOutcome::Failed
+        } else {
+            BatchOutcome::PartiallyCompleted
+        };
+
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background".to_string()
+        } else {
+            batch
+                .completion_window
+                .clone()
+                .expect("non-background batch must have a completion window")
+        };
+
+        Some(Self {
+            batch_id: format!("{}", *batch.id),
+            batch_uuid: *batch.id,
+            user_id,
+            endpoint: batch.endpoint.clone(),
+            model: notif.model.clone(),
+            outcome,
+            created_at: batch.created_at,
+            finished_at: batch.completed_at.or(batch.failed_at),
+            total_requests: batch.total_requests,
+            completed_requests: batch.completed_requests,
+            failed_requests: batch.failed_requests,
+            cancelled_requests: batch.canceled_requests,
+            completion_window,
+            filename: notif.input_file_name.clone(),
+            description: notif.input_file_description.clone(),
+            output_file_id: batch.output_file_id.map(|f| f.0),
+            error_file_id: batch.error_file_id.map(|f| f.0),
+        })
+    }
+}
+
+fn batch_span_outcome(completed: i64, failed: i64, canceled: i64) -> &'static str {
+    if failed == 0 && canceled == 0 {
+        "completed"
+    } else if completed == 0 {
+        "failed"
+    } else {
+        "partially_completed"
+    }
+}
+
+fn batch_outcome(batch: &fusillade::batch::Batch) -> &'static str {
+    batch_span_outcome(batch.completed_requests, batch.failed_requests, batch.canceled_requests)
+}
+
+const SMALL_BATCH_REQUESTS: i64 = 10;
+
+fn batch_size_class(total_requests: i64) -> &'static str {
+    if total_requests < SMALL_BATCH_REQUESTS { "small" } else { "large" }
+}
+
+fn batch_deadline(expires_at: Option<DateTime<Utc>>, finished_at: Option<DateTime<Utc>>) -> Option<(&'static str, i64)> {
+    let (finished_at, expires_at) = (finished_at?, expires_at?);
+    let late_seconds = (finished_at - expires_at).num_seconds().max(0);
+    Some((if finished_at > expires_at { "missed" } else { "met" }, late_seconds))
+}
+
+fn batch_models(notif: &fusillade::batch::BatchNotification) -> Vec<&str> {
+    notif.model.split(", ").filter(|model| !model.is_empty()).collect()
+}
+
+async fn emit_batch_finalized_spans<P: sqlx_pool_router::PoolProvider>(
+    request_manager: &PostgresRequestManager<P>,
+    conn: &mut sqlx::PgConnection,
+    batches: &[fusillade::batch::BatchNotification],
+) {
+    let owners: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|n| n.batch.created_by.parse().ok())
+        .collect::<HashSet<Uuid>>()
+        .into_iter()
+        .collect();
+    let names: std::collections::HashMap<Uuid, String> = if owners.is_empty() {
+        Default::default()
+    } else {
+        match Users::new(conn).get_bulk(owners).await {
+            Ok(users) => users
+                .into_iter()
+                .map(|(id, user)| (id, span_account_name(user.display_name.as_deref(), &user.username)))
+                .collect(),
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "batch_span_account_names", Warning, error = %e, "Failed to look up account names for batch spans");
+                Default::default()
+            }
+        }
+    };
+
+    let fully_failed: Vec<_> = batches
+        .iter()
+        .filter(|n| batch_outcome(&n.batch) == "failed")
+        .map(|n| n.batch.id)
+        .collect();
+    let samples = if fully_failed.is_empty() {
+        Default::default()
+    } else {
+        request_manager.failed_batch_sample_classes(&fully_failed).await.unwrap_or_else(|e| {
+            crate::background_error!(NOTIFICATIONS, "batch_span_failure_sample", Warning, error = %e, "Failed to sample failures for batch spans");
+            Default::default()
+        })
+    };
+
+    for notif in batches {
+        let batch = &notif.batch;
+        let outcome = batch_outcome(batch);
+        let account_name = batch.created_by.parse::<Uuid>().ok().and_then(|id| names.get(&id));
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background"
+        } else {
+            batch.completion_window.as_deref().unwrap_or_default()
+        };
+        let sample_error = (outcome == "failed").then(|| match samples.get(&batch.id) {
+            Some(class) => class.as_str(),
+            None if batch.failed_requests == 0 => "canceled",
+            None => "unknown",
+        });
+        let finished_at = batch.completed_at.or(batch.failed_at);
+        let finalized_at = finished_at.map(|at| at.to_rfc3339());
+        let deadline = batch_deadline(batch.expires_at, finished_at);
+        let span = tracing::info_span!(
+            parent: None,
+            "fusillade.batch_finalized",
+            otel.name = "fusillade.batch_finalized",
+            otel.kind = "producer",
+            batch_id = %batch.id,
+            doubleword.account_id = %batch.created_by,
+            doubleword.account_name = account_name.map(String::as_str),
+            gen_ai.request.model = %notif.model,
+            completion_window = completion_window,
+            batch.total_requests = batch.total_requests,
+            batch.completed_requests = batch.completed_requests,
+            batch.failed_requests = batch.failed_requests,
+            batch.canceled_requests = batch.canceled_requests,
+            batch.outcome = outcome,
+            batch.sample_error = sample_error,
+            batch.finalized_at = finalized_at.as_deref(),
+            batch.size_class = batch_size_class(batch.total_requests),
+            batch.deadline = deadline.map(|(met, _)| met),
+            batch.late_seconds = deadline.map(|(_, late)| late),
+        );
+        let models = batch_models(notif)
+            .into_iter()
+            .map(|model| StringValue::from(model.to_string()))
+            .collect();
+        span.set_attribute("batch.models", Value::Array(Array::String(models)));
+    }
+}
+
+pub async fn run_notification_poller(
+    config: NotificationsConfig,
+    app_config: crate::config::Config,
+    request_manager: Arc<PostgresRequestManager<DbPools>>,
+    dwctl_pool: impl sqlx_pool_router::PoolProvider,
+    listener_pool: impl sqlx_pool_router::PoolProvider,
+    shutdown: CancellationToken,
+) {
+    let dwctl_pool = sqlx_pool_router::DynPools::new(dwctl_pool);
+    let listener_pool = sqlx_pool_router::DynPools::new(listener_pool);
+    let mut dispatcher = if config.webhooks.enabled {
+        Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
+    } else {
+        None
+    };
+
+    let payment_provider: Option<Box<dyn PaymentProvider>> =
+        app_config.payment.as_ref().map(|pc| payment_providers::create_provider(pc.clone()));
+
+    let email_service = if config.enabled {
+        match EmailService::new(&app_config) {
+            Ok(svc) => {
+                tracing::info!("Launched email service successfully");
+                Some(svc)
+            }
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "email_service_init", Critical, error = %e, "Failed to create email service, email notifications disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut listener = if dispatcher.is_some() {
+        match PgListener::connect_with(&listener_pool.write()).await {
+            Ok(mut l) => match l.listen(WEBHOOK_EVENT_CHANNEL).await {
+                Ok(()) => {
+                    tracing::info!("Listening on PG channel '{WEBHOOK_EVENT_CHANNEL}' for platform webhook events");
+                    Some(l)
+                }
+                Err(e) => {
+                    crate::background_error!(NOTIFICATIONS, "listener_setup", Critical, error = %e, "Failed to subscribe to {WEBHOOK_EVENT_CHANNEL} channel");
+                    None
+                }
+            },
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "listener_setup", Critical, error = %e, "Failed to connect PG listener for webhook events");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut pending_webhook_events: Vec<(String, Uuid)> = Vec::new();
+
+    tracing::info!(
+        poll_interval = ?config.poll_interval,
+        notifications = config.enabled,
+        webhooks = dispatcher.is_some(),
+        email = email_service.is_some(),
+        webhook_listener = listener.is_some(),
+        "Starting notification poller"
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(config.poll_interval) => {}
+            result = async {
+                match listener.as_mut() {
+                    Some(l) => l.try_recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Ok(Some(notification)) => {
+                        if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
+                            pending_webhook_events.push((table, id));
+                        }
+                        if let Some(ref mut l) = listener {
+                            while let Ok(Ok(Some(notification))) = tokio::time::timeout(Duration::from_millis(10), l.try_recv()).await {
+                                if let Some((table, id)) = parse_webhook_event_payload(notification.payload()) {
+                                    pending_webhook_events.push((table, id));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!("Webhook event listener connection lost, will reconnect");
+                        listener = None;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Webhook event listener error, will reconnect");
+                        listener = None;
+                    }
+                }
+            }
+            _ = shutdown.cancelled() => {
+                tracing::info!("Notification poller shutting down");
+                return;
+            }
+        }
+
+        if listener.is_none()
+            && dispatcher.is_some()
+            && let Ok(mut l) = PgListener::connect_with(&listener_pool.write()).await
+            && l.listen(WEBHOOK_EVENT_CHANNEL).await.is_ok()
+        {
+            tracing::info!("Reconnected webhook event listener");
+            listener = Some(l);
+        }
+
+        tracing::debug!("Notification poller tick");
+
+        let mut conn = match dwctl_pool.write().acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "db_acquire", Warning, error = %e, "Failed to acquire database connection for notification poller tick");
+                continue;
+            }
+        };
+
+        if dispatcher.is_some() && !pending_webhook_events.is_empty() {
+            let events = std::mem::take(&mut pending_webhook_events);
+            let _ = process_platform_events(&mut conn, &events)
+                .await
+                .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "platform_event_process", Warning, error = %e, "Failed to process platform webhook events"));
+        }
+
+        match request_manager.claim_batch_notifications().await {
+            Ok(batches) => {
+                if !batches.is_empty() {
+                    tracing::info!(count = batches.len(), "Claimed finalized batches for notification");
+
+                    emit_batch_finalized_spans(&request_manager, &mut conn, &batches).await;
+
+                    let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
+
+                    if dispatcher.is_some() {
+                        let _ = create_batch_deliveries(&mut conn, &infos)
+                            .await
+                            .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "batch_delivery_create", Warning, error = %e, "Failed to create webhook delivery records"));
+                    }
+
+                    if let Some(ref email_service) = email_service {
+                        send_email_notifications(email_service, &infos, &mut conn).await;
+                    }
+                }
+            }
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "claim_batch_notifications", Warning, error = %e, "Failed to claim finalized batches for notification");
+            }
+        }
+
+        if dispatcher.is_some() {
+            let _ = process_new_batches(&mut conn)
+                .await
+                .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "new_batch_process", Warning, error = %e, "Failed to process new batch webhooks"));
+        }
+
+        if let Some(ref email_service) = email_service {
+            let candidates = {
+                let mut users = Users::new(&mut conn);
+                users.users_with_low_balance_threshold().await.unwrap_or_else(|e| {
+                    crate::background_error!(NOTIFICATIONS, "low_balance_fetch", Warning, error = %e, "Failed to fetch low-balance threshold users");
+                    vec![]
+                })
+            };
+
+            if !candidates.is_empty() {
+                let balance_for = |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
+
+                let to_notify: Vec<_> = candidates
+                    .iter()
+                    .filter(|u| !u.low_balance_notification_sent && balance_for(u).map(|b| b < u.low_balance_threshold).unwrap_or(false))
+                    .collect();
+
+                if !to_notify.is_empty() {
+                    tracing::info!(count = to_notify.len(), "Found users with low balance");
+                    send_low_balance_notifications(email_service, &to_notify, &balance_for, &mut conn).await;
+                }
+
+                let recovered: Vec<Uuid> = candidates
+                    .iter()
+                    .filter(|u| u.low_balance_notification_sent && balance_for(u).map(|b| b >= u.low_balance_threshold).unwrap_or(false))
+                    .map(|u| u.id)
+                    .collect();
+
+                if !recovered.is_empty() {
+                    let mut users = Users::new(&mut conn);
+                    let _ = users
+                        .clear_low_balance_notification_sent(&recovered)
+                        .await
+                        .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "low_balance_flag_clear", Warning, error = %e, "Failed to clear recovered low-balance flags"));
+                }
+            }
+        }
+
+        if config.enabled
+            && let Some(ref provider) = payment_provider
+        {
+            process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref(), &app_config.credits).await;
+        }
+
+        if let Some(ref mut dispatcher) = dispatcher {
+            dispatcher.tick().await;
+        }
+    }
+}
+
+async fn create_batch_deliveries(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    infos: &[BatchNotificationInfo],
+) -> anyhow::Result<()> {
+    if infos.is_empty() {
+        return Ok(());
+    }
+
+    let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
+    let webhooks_by_user = {
+        let mut repo = Webhooks::new(&mut *conn);
+        repo.get_enabled_webhooks_for_users(user_ids).await?
+    };
+
+    let mut repo = Webhooks::new(&mut *conn);
+
+    for info in infos {
+        let Some(webhooks) = webhooks_by_user.get(&info.user_id) else {
+            tracing::debug!(user_id = %info.user_id, "No webhooks configured, skipping");
+            continue;
+        };
+
+        let webhook_status = match info.outcome {
+            BatchOutcome::Completed | BatchOutcome::PartiallyCompleted => WebhookEventType::BatchCompleted,
+            BatchOutcome::Failed => WebhookEventType::BatchFailed,
+        };
+
+        let webhook_event = WebhookEvent::batch_terminal(webhook_status, info);
+        let payload_json = serde_json::to_value(&webhook_event)?;
+
+        for webhook in webhooks.iter().filter(|w| w.accepts_event(webhook_status)) {
+            let event_id = Uuid::new_v4();
+
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id,
+                event_type: webhook_status.to_string(),
+                payload: payload_json.clone(),
+                resource_id: Some(info.batch_uuid),
+                next_attempt_at: None,
+            };
+
+            repo.create_delivery(&delivery_request).await?;
+
+            tracing::debug!(
+                webhook_id = %webhook.id,
+                batch_id = %info.batch_uuid,
+                "Webhook delivery record created"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_webhook_event_payload(payload: &str) -> Option<(String, Uuid)> {
+    let (table, id_str) = payload.split_once(':')?;
+    let id = Uuid::parse_str(id_str).ok()?;
+    Some((table.to_string(), id))
+}
+
+async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>, events: &[(String, Uuid)]) -> anyhow::Result<()> {
+    let pm_webhooks = {
+        let mut repo = Webhooks::new(&mut *conn);
+        repo.get_enabled_platform_webhooks().await?
+    };
+
+    if pm_webhooks.is_empty() {
+        return Ok(());
+    }
+
+    for (table, id) in events {
+        let (event, event_type) = match table.as_str() {
+            "users" => {
+                let row = sqlx::query!(r#"SELECT id, email, auth_source FROM users WHERE id = $1"#, id,)
+                    .fetch_optional(&mut **conn)
+                    .await?;
+
+                let Some(row) = row else {
+                    tracing::debug!(user_id = %id, "User not found for webhook event, skipping");
+                    continue;
+                };
+
+                (
+                    WebhookEvent::user_created(row.id, &row.email, &row.auth_source),
+                    WebhookEventType::UserCreated,
+                )
+            }
+            "api_keys" => {
+                let row = sqlx::query!(r#"SELECT id, user_id, created_by, name FROM api_keys WHERE id = $1"#, id,)
+                    .fetch_optional(&mut **conn)
+                    .await?;
+
+                let Some(row) = row else {
+                    tracing::debug!(api_key_id = %id, "API key not found for webhook event, skipping");
+                    continue;
+                };
+
+                (
+                    WebhookEvent::api_key_created(row.id, row.user_id, row.created_by, &row.name),
+                    WebhookEventType::ApiKeyCreated,
+                )
+            }
+            _ => {
+                tracing::warn!(table = %table, "Unknown table in webhook event notification, skipping");
+                continue;
+            }
+        };
+
+        let payload = serde_json::to_value(&event)?;
+
+        let mut repo = Webhooks::new(&mut *conn);
+        for webhook in pm_webhooks.iter().filter(|w| w.accepts_event(event_type)) {
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id: Uuid::new_v4(),
+                event_type: event_type.to_string(),
+                payload: payload.clone(),
+                resource_id: Some(*id),
+                next_attempt_at: None,
+            };
+
+            let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
+                crate::background_error!(
+                    NOTIFICATIONS, "delivery_create", Warning,
+                    error = %e,
+                    webhook_id = %webhook.id,
+                    event_type = %event_type,
+                    "Failed to create platform webhook delivery"
+                );
+            });
+        }
+
+        tracing::debug!(
+            table = %table,
+            resource_id = %id,
+            event_type = %event_type,
+            webhooks = pm_webhooks.iter().filter(|w| w.accepts_event(event_type)).count(),
+            "Platform webhook event processed"
+        );
+    }
+
+    Ok(())
+}
+
+struct NewBatch {
+    id: Uuid,
+    created_by: String,
+    endpoint: String,
+}
+
+async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>) -> anyhow::Result<()> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
+        r#"
+        SELECT b.id, b.created_by, b.endpoint
+        FROM fusillade.batches b
+        LEFT JOIN webhook_deliveries wd
+            ON wd.resource_id = b.id AND wd.event_type = 'batch.created'
+        WHERE wd.id IS NULL
+          AND b.created_at > now() - interval '5 minutes'
+        ORDER BY b.created_at
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(&mut **conn)
+    .await?;
+
+    let new_batches: Vec<NewBatch> = rows
+        .into_iter()
+        .map(|(id, created_by, endpoint)| NewBatch { id, created_by, endpoint })
+        .collect();
+
+    if new_batches.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(count = new_batches.len(), "Found new batches for webhook delivery");
+
+    let pm_webhooks = {
+        let mut repo = Webhooks::new(&mut *conn);
+        repo.get_enabled_platform_webhooks().await?
+    };
+
+    if pm_webhooks.is_empty() {
+        return Ok(());
+    }
+
+    let event_type = WebhookEventType::BatchCreated;
+
+    for batch in &new_batches {
+        if batch.created_by.is_empty() {
+            tracing::debug!(
+                batch_id = %batch.id,
+                "Skipping batch webhook delivery for empty creator"
+            );
+            continue;
+        }
+
+        let user_id: Uuid = match batch.created_by.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    batch_id = %batch.id,
+                    created_by = %batch.created_by,
+                    "Failed to parse batch.created_by as UUID; skipping batch for webhook delivery"
+                );
+                continue;
+            }
+        };
+
+        let event = WebhookEvent::batch_created(batch.id, user_id, &batch.endpoint);
+        let payload = serde_json::to_value(&event)?;
+
+        let mut repo = Webhooks::new(&mut *conn);
+        for webhook in pm_webhooks.iter().filter(|w| w.accepts_event(event_type)) {
+            let delivery_request = WebhookDeliveryCreateDBRequest {
+                webhook_id: webhook.id,
+                event_id: Uuid::new_v4(),
+                event_type: event_type.to_string(),
+                payload: payload.clone(),
+                resource_id: Some(batch.id),
+                next_attempt_at: None,
+            };
+
+            let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
+                crate::background_error!(
+                    NOTIFICATIONS, "delivery_create", Warning,
+                    error = %e,
+                    webhook_id = %webhook.id,
+                    batch_id = %batch.id,
+                    "Failed to create batch.created webhook delivery"
+                );
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_email_notifications(
+    email_service: &EmailService,
+    infos: &[BatchNotificationInfo],
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    let user_ids: Vec<Uuid> = infos.iter().map(|i| i.user_id).collect::<HashSet<_>>().into_iter().collect();
+
+    let users_by_id = {
+        let mut users = Users::new(&mut *conn);
+        match users.get_bulk(user_ids).await {
+            Ok(u) => u,
+            Err(e) => {
+                crate::background_error!(NOTIFICATIONS, "user_fetch", Warning, error = %e, "Failed to fetch users for email notifications");
+                return;
+            }
+        }
+    };
+
+    for info in infos {
+        let Some(user) = users_by_id.get(&info.user_id) else {
+            continue;
+        };
+
+        let is_first_batch = !user.first_batch_email_sent && info.outcome == BatchOutcome::Completed;
+
+        if !is_first_batch && !user.batch_notifications_enabled {
+            continue;
+        }
+
+        let name = user.display_name.as_deref().unwrap_or(&user.username);
+
+        if let Err(e) = email_service
+            .send_batch_completion_email(&user.email, Some(name), info, is_first_batch)
+            .await
+        {
+            crate::background_error!(
+                NOTIFICATIONS, "email_send", Warning,
+                batch_id = %info.batch_id,
+                email = %user.email,
+                error = %e,
+                first_batch = is_first_batch,
+                "Failed to send batch completion email"
+            );
+            continue;
+        }
+
+        tracing::debug!(
+            batch_id = %info.batch_id,
+            email = %user.email,
+            outcome = ?info.outcome,
+            first_batch = is_first_batch,
+            "Sent batch completion notification"
+        );
+
+        if is_first_batch {
+            let mut users = Users::new(&mut *conn);
+            if let Err(e) = users.mark_first_batch_email_sent(info.user_id).await {
+                crate::background_error!(
+                    NOTIFICATIONS, "mark_email_sent", Warning,
+                    user_id = %info.user_id,
+                    error = %e,
+                    "Failed to mark first batch email as sent"
+                );
+            }
+        }
+    }
+}
+
+async fn process_auto_topups(
+    provider: &dyn PaymentProvider,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    email_service: Option<&EmailService>,
+    credits_config: &crate::config::CreditsConfig,
+) {
+    let candidates = {
+        let mut users = Users::new(&mut *conn);
+        users.users_with_auto_topup_enabled().await.unwrap_or_else(|e| {
+            crate::background_error!(AUTO_TOPUP, "eligible_fetch", Warning, error = %e, "Failed to fetch auto-topup eligible users");
+            vec![]
+        })
+    };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
+
+    let to_charge: Vec<_> = candidates
+        .iter()
+        .filter(|u| balance_for(u).map(|b| b < u.auto_topup_threshold).unwrap_or(false))
+        .collect();
+
+    if to_charge.is_empty() {
+        return;
+    }
+
+    tracing::info!(count = to_charge.len(), "Found users eligible for auto top-up");
+
+    let limit_user_ids: Vec<Uuid> = to_charge
+        .iter()
+        .filter(|u| u.auto_topup_monthly_limit.is_some())
+        .map(|u| u.id)
+        .collect();
+
+    let monthly_spends = if !limit_user_ids.is_empty() {
+        let mut credits = Credits::new(&mut *conn);
+        match credits.get_monthly_auto_topup_spend_bulk(&limit_user_ids).await {
+            Ok(spends) => spends,
+            Err(e) => {
+                crate::background_error!(AUTO_TOPUP, "monthly_spend_fetch", Error, error = %e, "Failed to batch-fetch monthly auto-topup spend, aborting auto-topup run");
+                return;
+            }
+        }
+    } else {
+        Default::default()
+    };
+
+    for user in &to_charge {
+        let (charge_amount, description) = if let Some(monthly_limit) = user.auto_topup_monthly_limit {
+            let monthly_spend = monthly_spends.get(&user.id).copied().unwrap_or(rust_decimal::Decimal::ZERO);
+            let headroom = monthly_limit - monthly_spend;
+
+            if headroom <= rust_decimal::Decimal::ZERO {
+                tracing::info!(
+                    user_id = %user.id,
+                    monthly_spend = %monthly_spend,
+                    monthly_limit = %monthly_limit,
+                    "Auto top-up skipped: monthly limit fully exhausted"
+                );
+                counter!("dwctl_auto_topup_limit_reached_total").increment(1);
+                if !user.auto_topup_limit_notification_sent
+                    && let Some(email_svc) = email_service
+                {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let balance = balance_for(user).unwrap_or_default();
+                    if let Err(e) = email_svc
+                        .send_auto_topup_limit_reached_email(&user.email, Some(name), &monthly_limit, &balance)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up limit reached email");
+                    } else {
+                        let mut users = Users::new(&mut *conn);
+                        let _ = users.mark_auto_topup_limit_notification_sent(&[user.id]).await.inspect_err(
+                            |e| crate::background_error!(AUTO_TOPUP, "mark_limit_notified", Warning, user_id = %user.id, error = %e, "Failed to mark auto-topup limit notification as sent"),
+                        );
+                    }
+                }
+                continue;
+            } else if headroom < user.auto_topup_amount {
+                tracing::info!(
+                    user_id = %user.id,
+                    requested = %user.auto_topup_amount,
+                    capped_to = %headroom,
+                    monthly_spend = %monthly_spend,
+                    monthly_limit = %monthly_limit,
+                    "Auto top-up capped to remaining monthly headroom"
+                );
+                counter!("dwctl_auto_topup_limit_reached_total").increment(1);
+                (headroom, "Automatic top-up (capped by monthly limit)")
+            } else {
+                if user.auto_topup_limit_notification_sent {
+                    let mut users = Users::new(&mut *conn);
+                    let _ = users.clear_auto_topup_limit_notification_sent(&[user.id]).await.inspect_err(
+                        |e| crate::background_error!(AUTO_TOPUP, "clear_limit_flag", Warning, user_id = %user.id, error = %e, "Failed to clear auto-topup limit notification flag"),
+                    );
+                }
+                (user.auto_topup_amount, "Automatic top-up")
+            }
+        } else {
+            (user.auto_topup_amount, "Automatic top-up")
+        };
+
+        let amount_cents = (charge_amount * rust_decimal::Decimal::new(100, 0))
+            .round_dp(0)
+            .to_i64()
+            .unwrap_or(0);
+
+        if amount_cents <= 0 {
+            tracing::warn!(user_id = %user.id, "Auto top-up amount resolved to zero cents, skipping");
+            continue;
+        }
+
+        let now_minute = chrono::Utc::now().format("%Y-%m-%dT%H:%M");
+        let source_id = format!("auto_topup_{}_{}", user.id, now_minute);
+
+        {
+            let mut credits = Credits::new(&mut *conn);
+            match credits.transaction_exists_by_source_id(&source_id).await {
+                Ok(true) => {
+                    tracing::warn!(user_id = %user.id, "Auto top-up already processed this minute, skipping");
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    crate::background_error!(AUTO_TOPUP, "idempotency_check", Error, user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
+                    continue;
+                }
+            }
+        }
+
+        if user.invoicing_enabled {
+            match provider
+                .accrue_invoice_item(amount_cents, &user.payment_provider_id, description, &source_id)
+                .await
+            {
+                Ok(invoice_item_id) => {
+                    tracing::info!(
+                        user_id = %user.id,
+                        %invoice_item_id,
+                        amount_cents,
+                        "Accrued auto top-up onto the account's next invoice"
+                    );
+                }
+                Err(e) => {
+                    crate::background_error!(
+                        AUTO_TOPUP, "invoice_accrual", Error,
+                        user_id = %user.id,
+                        error = %e,
+                        "Failed to accrue auto top-up onto the next invoice"
+                    );
+                    continue;
+                }
+            }
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: charge_amount,
+                source_id,
+                description: Some(description.to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            };
+            if let Err(e) = Credits::new(&mut *conn).create_transaction(&request).await {
+                crate::background_error!(
+                    AUTO_TOPUP, "invoice_credit_grant", Critical,
+                    user_id = %user.id,
+                    error = %e,
+                    "Accrued an invoice item but failed to grant the credits"
+                );
+            }
+            continue;
+        }
+
+        let payment_method_id = match provider.get_default_payment_method(&user.payment_provider_id).await {
+            Ok(Some(pm_id)) => pm_id,
+            Ok(None) => {
+                tracing::warn!(user_id = %user.id, "No default payment method found, disabling auto top-up");
+                let transition_applied = match Users::new(&mut *conn).disable_auto_topup_after_hard_decline(user.id).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "decline_state", Error,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to disable auto top-up without a default payment method"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Missing payment method was already handled by another poller"
+                    );
+                    continue;
+                }
+
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_disabled_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up disabled email");
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                crate::background_error!(AUTO_TOPUP, "payment_method_lookup", Error, user_id = %user.id, error = %e, "Failed to fetch default payment method");
+                if let Err(state_error) = Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
+                    crate::background_error!(
+                        AUTO_TOPUP, "provider_backoff_state", Error,
+                        user_id = %user.id,
+                        error = %state_error,
+                        "Failed to pause auto top-up after payment method lookup failure"
+                    );
+                }
+                continue;
+            }
+        };
+
+        let payment_intent_id = match provider
+            .charge_auto_topup(amount_cents, &user.payment_provider_id, &payment_method_id, &source_id)
+            .await
+        {
+            Ok(id) => id,
+            Err(PaymentError::AlreadyProcessed) => {
+                tracing::debug!(user_id = %user.id, "Auto top-up already in flight elsewhere, skipping");
+                continue;
+            }
+            Err(PaymentError::AutoTopupDeclined(kind)) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    decline_kind = ?kind,
+                    "Auto top-up payment was declined"
+                );
+
+                let transition_applied = {
+                    let mut users = Users::new(&mut *conn);
+                    match kind {
+                        AutoTopupDeclineKind::Soft => {
+                            users
+                                .apply_auto_topup_soft_decline(
+                                    user.id,
+                                    user.auto_topup_soft_failure_count,
+                                    credits_config.auto_topup_retry_delay,
+                                )
+                                .await
+                        }
+                        AutoTopupDeclineKind::Hard => users.disable_auto_topup_after_hard_decline(user.id).await,
+                    }
+                };
+
+                let transition_applied = match transition_applied {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "decline_state", Error,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to persist auto top-up decline state"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Auto top-up decline was already handled by another poller"
+                    );
+                    continue;
+                }
+
+                let disabled = kind == AutoTopupDeclineKind::Hard || user.auto_topup_soft_failure_count > 0;
+                if disabled {
+                    let decline_kind = match kind {
+                        AutoTopupDeclineKind::Soft => "soft",
+                        AutoTopupDeclineKind::Hard => "hard",
+                    };
+                    counter!("dwctl_auto_topup_decline_disabled_total", "kind" => decline_kind).increment(1);
+                } else {
+                    counter!("dwctl_auto_topup_decline_paused_total").increment(1);
+                }
+
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let email_result = if disabled {
+                        email_svc
+                            .send_auto_topup_disabled_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                            .await
+                    } else {
+                        email_svc
+                            .send_auto_topup_retry_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                            .await
+                    };
+
+                    if let Err(e) = email_result {
+                        crate::background_error!(
+                            AUTO_TOPUP, "email_send", Warning,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to send auto top-up decline email"
+                        );
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                crate::background_error!(
+                    AUTO_TOPUP, "charge", Warning,
+                    user_id = %user.id,
+                    error = %e,
+                    "Failed to charge auto top-up"
+                );
+
+                let transition_applied = match Users::new(&mut *conn)
+                    .pause_auto_topup_after_provider_failure(user.id, credits_config.auto_topup_retry_delay)
+                    .await
+                {
+                    Ok(applied) => applied,
+                    Err(state_error) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "provider_backoff_state", Error,
+                            user_id = %user.id,
+                            error = %state_error,
+                            "Failed to pause auto top-up after provider failure"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Auto top-up provider failure was already handled by another poller"
+                    );
+                    continue;
+                }
+
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
+                continue;
+            }
+        };
+
+        let request = CreditTransactionCreateDBRequest {
+            user_id: user.id,
+            transaction_type: CreditTransactionType::Purchase,
+            amount: charge_amount,
+            source_id,
+            description: Some(description.to_string()),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+
+        if let Err(e) = Users::new(&mut *conn).reset_auto_topup_failure_state(user.id).await {
+            crate::background_error!(
+                AUTO_TOPUP, "decline_state_reset", Warning,
+                user_id = %user.id,
+                error = %e,
+                "Failed to reset auto top-up decline state after a successful charge"
+            );
+        }
+
+        if let Err(e) = Users::new(&mut *conn).set_verified(user.id).await {
+            crate::background_error!(AUTO_TOPUP, "mark_verified", Warning, user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
+        }
+
+        let mut credits = Credits::new(&mut *conn);
+        match credits.create_transaction(&request).await {
+            Ok(_) => {
+                tracing::info!(
+                    user_id = %user.id,
+                    amount = %charge_amount,
+                    "Auto top-up charged successfully"
+                );
+                counter!("dwctl_auto_topup_success_total").increment(1);
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let new_balance = balance_for(user).unwrap_or_default() + charge_amount;
+                    if let Err(e) = email_svc
+                        .send_auto_topup_success_email(&user.email, Some(name), &charge_amount, &user.auto_topup_threshold, &new_balance)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up success email");
+                    }
+                }
+                if let Err(e) = credits
+                    .grant_first_payment_match(credits_config.first_payment_match_up_to, user.id, charge_amount, &request.source_id)
+                    .await
+                {
+                    crate::background_error!(AUTO_TOPUP, "first_payment_match", Critical, user_id = %user.id, error = %e, "First-payment match failed after auto top-up; purchase unaffected, grant manually if needed");
+                }
+            }
+            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
+                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
+            {
+                tracing::info!(user_id = %user.id, "Auto top-up credit transaction already exists (race), treating as success");
+            }
+            Err(e) => {
+                crate::background_error!(
+                    AUTO_TOPUP, "credit_record", Critical,
+                    user_id = %user.id,
+                    payment_intent_id = %payment_intent_id,
+                    amount = %user.auto_topup_amount,
+                    error = %e,
+                    "Auto top-up payment succeeded but credit transaction failed. \
+                     User was charged but did not receive credits. Manual reconciliation required."
+                );
+            }
+        }
+    }
+}
+
+async fn send_low_balance_notifications(
+    email_service: &EmailService,
+    users: &[&LowBalanceUser],
+    balance_for: &impl Fn(&LowBalanceUser) -> Option<rust_decimal::Decimal>,
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    let mut sent_ids = Vec::new();
+
+    for user in users {
+        let Some(balance) = balance_for(user) else { continue };
+        let name = user.display_name.as_deref().unwrap_or(&user.username);
+
+        let admin_emails = Organizations::new(&mut *conn).list_admin_emails(user.id).await.unwrap_or_else(|e| {
+            crate::background_error!(
+                NOTIFICATIONS, "low_balance_recipients", Warning,
+                user_id = %user.id,
+                error = %e,
+                "Failed to list organization admins for a low-balance notification"
+            );
+            Vec::new()
+        });
+
+        let mut delivered = false;
+        for recipient in low_balance_recipients(&user.email, admin_emails) {
+            if let Err(e) = email_service.send_low_balance_email(&recipient, Some(name), &balance).await {
+                crate::background_error!(
+                    NOTIFICATIONS, "email_send", Warning,
+                    user_id = %user.id,
+                    email = %recipient,
+                    error = %e,
+                    "Failed to send low-balance notification email"
+                );
+                continue;
+            }
+            tracing::info!(user_id = %user.id, email = %recipient, balance = %balance, "Sent low-balance notification");
+            delivered = true;
+        }
+
+        if delivered {
+            sent_ids.push(user.id);
+        }
+    }
+
+    if !sent_ids.is_empty() {
+        let mut users_repo = Users::new(&mut *conn);
+        if let Err(e) = users_repo.mark_low_balance_notification_sent(&sent_ids).await {
+            crate::background_error!(NOTIFICATIONS, "mark_low_balance_sent", Warning, error = %e, "Failed to mark low-balance notifications as sent");
+        }
+    }
+}
+
+fn low_balance_recipients(account_email: &str, admin_emails: Vec<String>) -> Vec<String> {
+    let mut recipients: Vec<String> = Vec::with_capacity(admin_emails.len() + 1);
+    for email in std::iter::once(account_email.to_string()).chain(admin_emails) {
+        if !recipients.iter().any(|r| r.eq_ignore_ascii_case(&email)) {
+            recipients.push(email);
+        }
+    }
+    recipients
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::users::Role;
+    use crate::config::{CreditsConfig, DummyConfig};
+    use crate::payment_providers;
+    use rust_decimal::Decimal;
+
+    async fn configure_auto_topup_decline_test_user(pool: &sqlx::PgPool, user_id: Uuid, customer_id: &str, failure_count: i32) {
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 100.0,
+                auto_topup_soft_failure_count = $2,
+                auto_topup_retry_after = CASE
+                    WHEN $2 = 0 THEN NULL
+                    ELSE NOW() - INTERVAL '1 minute'
+                END,
+                payment_provider_id = $3
+            WHERE id = $1
+            "#,
+            user_id,
+            failure_count,
+            customer_id,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn dummy_payment_provider() -> Box<dyn PaymentProvider> {
+        payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }))
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_invoices_instead_of_charging(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let credited = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(credited, 1, "credits are granted at accrual, not on payment");
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, Some(25.0), "auto top-up must stay enabled");
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert!(state.auto_topup_retry_after.is_none(), "must not be paused for a decline");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_defaults_to_charging_a_card(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+
+        let invoicing = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!invoicing, "new accounts are not invoice-billed");
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query_scalar!("SELECT auto_topup_soft_failure_count FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, 1, "unchanged behaviour for card-billed accounts");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, Some(25.0));
+        assert_eq!(state.auto_topup_threshold, Some(10.0));
+        assert_eq!(state.auto_topup_soft_failure_count, 1);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_hard_decline_disables_immediately(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_hard_decline", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_provider_error", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 1);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 0);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_payment_method_lookup_error", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_no_payment_method", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert_eq!(state.auto_topup_retry_after, None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_success_resets_soft_decline_state(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_success_after_decline", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert_eq!(state.auto_topup_retry_after, None);
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 1);
+    }
+
+    fn background_batch_notification() -> fusillade::batch::BatchNotification {
+        let now = Utc::now();
+        fusillade::batch::BatchNotification {
+            batch: fusillade::Batch {
+                id: fusillade::BatchId(Uuid::new_v4()),
+                file_id: Some(fusillade::FileId(Uuid::new_v4())),
+                created_at: now,
+                metadata: None,
+                service_tier: Some("background".to_string()),
+                completion_window: None,
+                endpoint: "/v1/chat/completions".to_string(),
+                output_file_id: None,
+                error_file_id: None,
+                created_by: Uuid::new_v4().to_string(),
+                expires_at: None,
+                cancelling_at: None,
+                errors: None,
+                total_requests: 1,
+                pending_requests: 0,
+                in_progress_requests: 0,
+                completed_requests: 1,
+                failed_requests: 0,
+                canceled_requests: 0,
+                requests_started_at: Some(now),
+                finalizing_at: Some(now),
+                completed_at: Some(now),
+                failed_at: None,
+                cancelled_at: None,
+                deleted_at: None,
+                notification_sent_at: Some(now),
+                api_key_id: None,
+            },
+            model: "model".to_string(),
+            input_file_name: None,
+            input_file_description: None,
+        }
+    }
+
+    #[test]
+    fn background_batch_notification_uses_the_tier_as_its_window_label() {
+        let notification = background_batch_notification();
+
+        let info = BatchNotificationInfo::try_from_batch(&notification).unwrap();
+        assert_eq!(info.completion_window, "background");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_notification_requires_a_completion_window() {
+        let mut notification = background_batch_notification();
+        notification.batch.service_tier = None;
+        notification.batch.expires_at = Some(Utc::now());
+
+        let _ = BatchNotificationInfo::try_from_batch(&notification);
+    }
+
+    struct AlreadyChargingProvider;
+
+    #[async_trait::async_trait]
+    impl PaymentProvider for AlreadyChargingProvider {
+        async fn accrue_invoice_item(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn charge_auto_topup(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            Err(PaymentError::AlreadyProcessed)
+        }
+
+        async fn get_default_payment_method(&self, customer_id: &str) -> crate::payment_providers::Result<Option<String>> {
+            Ok(Some(format!("pm_{customer_id}")))
+        }
+
+        async fn create_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn get_payment_session(&self, _: &str) -> crate::payment_providers::Result<crate::payment_providers::PaymentSession> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_payment_session(&self, _: &sqlx::PgPool, _: &str, _: &CreditsConfig) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn validate_webhook(
+            &self,
+            _: &axum::http::HeaderMap,
+            _: &str,
+        ) -> crate::payment_providers::Result<Option<crate::payment_providers::WebhookEvent>> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_webhook_event(
+            &self,
+            _: &sqlx::PgPool,
+            _: &crate::payment_providers::WebhookEvent,
+            _: &CreditsConfig,
+        ) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_billing_portal_session(&self, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_setup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_auto_topup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_auto_topup_session(
+            &self,
+            _: &sqlx::PgPool,
+            _: &str,
+        ) -> crate::payment_providers::Result<crate::payment_providers::AutoTopupSetupResult> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn customer_has_address(&self, _: &str) -> crate::payment_providers::Result<bool> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_customer(&self, _: &str, _: Option<&str>) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(&AlreadyChargingProvider, &mut conn, None, &CreditsConfig::default()).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as \"count!\" FROM credits_transactions WHERE user_id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count, 0, "must not credit the user when another replica owns the charge");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_charges_below_threshold(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let txn = sqlx::query!("SELECT amount, source_id FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(txn.amount, Decimal::new(2500, 2));
+        assert!(txn.source_id.starts_with("auto_topup_"), "source_id should start with auto_topup_");
+        assert!(txn.source_id.contains(&user.id.to_string()), "source_id should contain user ID");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_skips_above_threshold(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 5.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        {
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(5000, 2),
+                    source_id: "seed_balance".to_string(),
+                    description: Some("Test seed".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let count = sqlx::query!("SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count.count.unwrap(), 1, "Should only have the seed transaction");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_idempotent(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count.count.unwrap(),
+            1,
+            "Should only create one transaction per minute (idempotent)"
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_respects_monthly_limit(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 50.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(2500, 2),
+                    source_id: format!("auto_topup_{}_2026-03-01T00:00", user.id),
+                    description: Some("Auto top-up".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::AdminRemoval,
+                    amount: Decimal::new(2000, 2),
+                    source_id: "drain_1".to_string(),
+                    description: Some("Drain".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.count.unwrap(), 2, "Should have charged (total $50 = limit)");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 40.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(2500, 2),
+                    source_id: format!("auto_topup_{}_2026-03-01T00:00", user.id),
+                    description: Some("Auto top-up".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::AdminRemoval,
+                    amount: Decimal::new(2000, 2),
+                    source_id: "drain_2".to_string(),
+                    description: Some("Drain".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let rows = sqlx::query!(
+            "SELECT amount, description FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%' ORDER BY created_at",
+            user.id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "Should have charged partial amount to stay within limit");
+        assert_eq!(rows[1].amount, Decimal::new(1500, 2));
+        assert_eq!(rows[1].description.as_deref(), Some("Automatic top-up (capped by monthly limit)"));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_process_auto_topups_skips_when_limit_fully_exhausted(pool: sqlx::PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 25.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut credits = Credits::new(&mut conn);
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::Purchase,
+                    amount: Decimal::new(2500, 2),
+                    source_id: format!("auto_topup_{}_2026-03-01T00:00", user.id),
+                    description: Some("Auto top-up".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user.id,
+                    transaction_type: CreditTransactionType::AdminRemoval,
+                    amount: Decimal::new(2000, 2),
+                    source_id: "drain_3".to_string(),
+                    description: Some("Drain".to_string()),
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let provider = payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(provider.as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as count FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count.count.unwrap(),
+            1,
+            "Should NOT have charged (limit fully exhausted, zero headroom)"
+        );
+    }
+
+    #[test]
+    fn test_low_balance_recipients_lists_each_address_once() {
+        let recipients = low_balance_recipients(
+            "Billing@Example.com",
+            vec!["billing@example.com".into(), "owner@example.com".into(), "OWNER@example.com".into()],
+        );
+        assert_eq!(recipients, vec!["Billing@Example.com".to_string(), "owner@example.com".to_string()]);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_low_balance_notification_reaches_org_owners_and_admins(pool: sqlx::PgPool) {
+        let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-low-balance-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut config = crate::test::utils::create_test_config();
+        config.email.transport = crate::config::EmailTransportConfig::File {
+            path: scratch.to_string_lossy().to_string(),
+        };
+        let email_service = EmailService::new(&config).unwrap();
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let admin = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let org = {
+            let mut orgs = Organizations::new(&mut conn);
+            let org = orgs
+                .create(
+                    &crate::db::models::organizations::OrganizationCreateDBRequest {
+                        name: "low-balance-org".into(),
+                        email: "billing@low-balance.example.com".into(),
+                        display_name: Some("Low Balance Org".into()),
+                        avatar_url: None,
+                        created_by: owner.id,
+                    },
+                    &[Role::StandardUser],
+                )
+                .await
+                .unwrap();
+            orgs.add_member(org.id, admin.id, "admin").await.unwrap();
+            orgs.add_member(org.id, member.id, "member").await.unwrap();
+            org
+        };
+
+        let org_user = LowBalanceUser {
+            id: org.id,
+            email: org.email.clone(),
+            username: org.username.clone(),
+            display_name: org.display_name.clone(),
+            low_balance_threshold: Decimal::from(10),
+            low_balance_notification_sent: false,
+            checkpoint_balance: Some(Decimal::from(2)),
+        };
+        send_low_balance_notifications(&email_service, &[&org_user], &|u: &LowBalanceUser| u.checkpoint_balance, &mut conn).await;
+
+        let to_addresses: Vec<String> = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("eml"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("To: ").map(|rest| rest.trim().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for expected in [&org.email, &owner.email, &admin.email] {
+            let hits = to_addresses.iter().filter(|to| to.contains(expected.as_str())).count();
+            assert_eq!(hits, 1, "{expected} gets exactly one email; got {to_addresses:?}");
+        }
+        assert_eq!(to_addresses.len(), 3, "nobody else is mailed; got {to_addresses:?}");
+        assert!(
+            !to_addresses.iter().any(|to| to.contains(member.email.as_str())),
+            "a plain member cannot add credits and is not mailed"
+        );
+
+        let sent: bool = sqlx::query_scalar("SELECT low_balance_notification_sent FROM users WHERE id = $1")
+            .bind(org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sent, "the org is marked as notified");
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[derive(Clone, Default, Debug)]
+    struct ExportedSpans(Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+    impl opentelemetry_sdk::trace::SpanExporter for ExportedSpans {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    fn span_attr(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes.iter().find(|a| a.key.as_str() == key).map(|a| a.value.to_string())
+    }
+
+    fn span_models(span: &opentelemetry_sdk::trace::SpanData) -> Vec<String> {
+        let value = span.attributes.iter().find(|a| a.key.as_str() == "batch.models").map(|a| &a.value);
+        let Some(Value::Array(Array::String(models))) = value else {
+            panic!("batch.models is not a string array: {value:?}");
+        };
+        let mut models: Vec<String> = models.iter().map(|model| model.to_string()).collect();
+        models.sort();
+        models
+    }
+
+    #[test]
+    fn batch_span_classification() {
+        assert_eq!(batch_span_outcome(5, 0, 0), "completed");
+        assert_eq!(batch_span_outcome(0, 5, 0), "failed");
+        assert_eq!(batch_span_outcome(3, 2, 0), "partially_completed");
+        assert_eq!(batch_span_outcome(0, 0, 5), "failed");
+        assert_eq!(batch_span_outcome(3, 0, 2), "partially_completed");
+    }
+
+    #[test]
+    fn batch_span_size_class() {
+        assert_eq!(batch_size_class(1), "small");
+        assert_eq!(batch_size_class(9), "small");
+        assert_eq!(batch_size_class(10), "large");
+    }
+
+    #[test]
+    fn batch_span_deadline() {
+        let expires_at = Utc::now();
+        let at = |millis| Some(expires_at + chrono::Duration::milliseconds(millis));
+        assert_eq!(batch_deadline(Some(expires_at), at(-60_000)), Some(("met", 0)));
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(0)),
+            Some(("met", 0)),
+            "finishing at the deadline is on time"
+        );
+        assert_eq!(
+            batch_deadline(Some(expires_at), at(500)),
+            Some(("missed", 0)),
+            "late by less than a second"
+        );
+        assert_eq!(batch_deadline(Some(expires_at), at(90_500)), Some(("missed", 90)));
+        assert_eq!(batch_deadline(None, at(0)), None);
+        assert_eq!(batch_deadline(Some(expires_at), None), None);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_batch_finalized_span_emitted_once_per_claim(pool: sqlx::PgPool) {
+        use fusillade::{DaemonStorage, Storage};
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exported = ExportedSpans::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("batch-span-test"))),
+        );
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET display_name = 'Example Analytics Ltd' WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let manager = PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        );
+
+        let mut batch_ids = Vec::new();
+        let one_model = ["span-test-model", "span-test-model"];
+        for (name, state, status, models) in [
+            ("all-failed", "failed", 422, one_model),
+            ("all-completed", "completed", 200, one_model),
+            ("all-canceled", "canceled", 0, ["span-model-a", "span-model-b"]),
+        ] {
+            let templates = models
+                .iter()
+                .enumerate()
+                .map(|(i, model)| fusillade::RequestTemplateInput {
+                    custom_id: Some(format!("{name}-{i}")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                })
+                .collect();
+            let file_id = manager.create_file(format!("{name}-file"), None, templates).await.unwrap();
+            let batch = manager
+                .create_batch(fusillade::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    created_by: Some(owner.id.to_string()),
+                    api_key_id: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "UPDATE requests SET state = $2, response_status = NULLIF($3, 0), \
+                 completed_at = CASE WHEN $2 <> 'canceled' THEN NOW() END, failed_at = CASE WHEN $2 = 'failed' THEN NOW() END, \
+                 canceled_at = CASE WHEN $2 = 'canceled' THEN NOW() END, \
+                 response_body = CASE WHEN $2 = 'completed' THEN '{}' END, error = CASE WHEN $2 = 'failed' THEN 'secret detail' END \
+                 WHERE batch_id = $1",
+            )
+            .bind(*batch.id)
+            .bind(state)
+            .bind(status as i16)
+            .execute(&fusillade_pool)
+            .await
+            .unwrap();
+            if name == "all-failed" {
+                sqlx::query("UPDATE batches SET expires_at = NOW() - INTERVAL '1 hour' WHERE id = $1")
+                    .bind(*batch.id)
+                    .execute(&fusillade_pool)
+                    .await
+                    .unwrap();
+            }
+            batch_ids.push(batch.id);
+        }
+        manager.finalize_terminal_batches().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let claimed = manager.claim_batch_notifications().await.unwrap();
+        assert_eq!(claimed.len(), 3);
+        emit_batch_finalized_spans(&manager, &mut conn, &claimed).await;
+        let again = manager.claim_batch_notifications().await.unwrap();
+        assert!(again.is_empty());
+        emit_batch_finalized_spans(&manager, &mut conn, &again).await;
+
+        provider.force_flush().unwrap();
+        let spans = exported.0.lock().unwrap();
+        let spans: Vec<_> = spans.iter().filter(|s| s.name == "fusillade.batch_finalized").collect();
+        assert_eq!(spans.len(), 3, "one span per claimed batch");
+        for span in &spans {
+            assert_eq!(span.span_kind, opentelemetry::trace::SpanKind::Producer);
+            assert_eq!(span_attr(span, "otel.kind"), None, "otel.kind must not leak as an attribute");
+        }
+        let span_of = |batch_id: fusillade::BatchId| {
+            spans
+                .iter()
+                .find(|s| span_attr(s, "batch_id") == Some(batch_id.to_string()))
+                .expect("span for batch")
+        };
+        for (batch_id, outcome, completed, failed) in [(batch_ids[0], "failed", "0", "2"), (batch_ids[1], "completed", "2", "0")] {
+            let span = span_of(batch_id);
+            assert_eq!(span_attr(span, "doubleword.account_id"), Some(owner.id.to_string()));
+            assert_eq!(span_attr(span, "doubleword.account_name").as_deref(), Some("Example Analytics Ltd"));
+            assert_eq!(span_attr(span, "gen_ai.request.model").as_deref(), Some("span-test-model"));
+            assert_eq!(span_models(span), vec!["span-test-model"]);
+            assert_eq!(span_attr(span, "completion_window").as_deref(), Some("24h"));
+            assert_eq!(span_attr(span, "batch.total_requests").as_deref(), Some("2"));
+            assert_eq!(span_attr(span, "batch.completed_requests").as_deref(), Some(completed));
+            assert_eq!(span_attr(span, "batch.failed_requests").as_deref(), Some(failed));
+            assert_eq!(span_attr(span, "batch.outcome").as_deref(), Some(outcome));
+            assert!(span_attr(span, "batch.finalized_at").is_some(), "the batch's own finish time");
+            assert_eq!(span_attr(span, "batch.size_class").as_deref(), Some("small"));
+            let late_seconds: i64 = span_attr(span, "batch.late_seconds").expect("late_seconds").parse().unwrap();
+            if outcome == "failed" {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("missed"));
+                assert!(late_seconds >= 3600, "finished an hour after its deadline, got {late_seconds}");
+            } else {
+                assert_eq!(span_attr(span, "batch.deadline").as_deref(), Some("met"));
+                assert_eq!(late_seconds, 0);
+            }
+            let sample = span_attr(span, "batch.sample_error");
+            if outcome == "failed" {
+                assert_eq!(sample.as_deref(), Some("http_422"), "status class only, never the message");
+            } else {
+                assert_eq!(sample, None);
+            }
+        }
+
+        let canceled = span_of(batch_ids[2]);
+        assert_eq!(span_attr(canceled, "batch.outcome").as_deref(), Some("failed"));
+        assert_eq!(span_attr(canceled, "batch.canceled_requests").as_deref(), Some("2"));
+        assert_eq!(span_attr(canceled, "batch.sample_error").as_deref(), Some("canceled"));
+        assert_eq!(
+            span_attr(canceled, "gen_ai.request.model").as_deref(),
+            Some("span-model-a, span-model-b")
+        );
+        assert_eq!(span_models(canceled), vec!["span-model-a", "span-model-b"]);
+    }
+}

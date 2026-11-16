@@ -1,0 +1,2043 @@
+
+use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
+use crate::metrics::errors::component::ONWARDS_SYNC;
+use crate::telemetry::span_account_name;
+use crate::types::UserId;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
+
+use metrics::histogram;
+use onwards::affinity::AffinityConfig;
+use onwards::aimd::AimdConfig;
+use onwards::auth::KeyHash;
+use onwards::target::{
+    Auth, BackoffConfig as OnwardsBackoffConfig, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
+    ProviderSpec, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream, inheritable_routing_rules,
+};
+use onwards::{AccountServing, ProviderKind, ServingOverlay};
+use sqlx::{PgPool, postgres::PgListener};
+use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncStatus {
+    Connecting,
+    Connected,
+    Disconnected,
+    Reconnecting,
+}
+
+use crate::{
+    config::ONWARDS_CONFIG_CHANGED_CHANNEL,
+    db::models::deployments::LoadBalancingStrategy,
+    reasoning::{ReasoningTranslationConfig, resolve_reasoning_translation},
+    types::{ApiKeyId, DeploymentId},
+};
+
+fn parse_notify_payload(payload: &str) -> Option<(&str, std::time::Duration)> {
+    let parts: Vec<&str> = payload.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let table_name = parts[0];
+    let epoch_micros: i64 = parts[1].parse().ok()?;
+
+    let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_micros() as i64;
+
+    let lag_micros = now_micros.saturating_sub(epoch_micros);
+    Some((table_name, std::time::Duration::from_micros(lag_micros as u64)))
+}
+
+#[derive(Debug, Clone)]
+struct OnwardsTarget {
+    model_name: String,
+    alias: String,
+    sanitize_responses: bool,
+    trusted: bool,
+    reasoning_translation: Option<ReasoningTranslationConfig>,
+    routing_rules: Vec<RoutingRule>,
+
+    fallback_enabled: bool,
+    fallback_on_rate_limit: bool,
+    fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
+    fallback_with_replacement: bool,
+    fallback_max_attempts: Option<i32>,
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
+
+    endpoint_url: url::Url,
+    endpoint_api_key: Option<String>,
+    auth_header_name: String,
+    auth_header_prefix: String,
+    endpoint_accepts_scheduling_priority: bool,
+    endpoint_kind: ProviderKind,
+
+    api_keys: Vec<OnwardsApiKey>,
+    has_key_grants: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OnwardsApiKey {
+    id: ApiKeyId,
+    secret_hash: KeyHash,
+    purpose: String,
+    zero_data_retention: bool,
+    user_id: UserId,
+    username: String,
+    display_name: Option<String>,
+}
+
+type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
+
+type AccountsById = HashMap<String, AccountServing>;
+
+type InflightOverridesByAlias = HashMap<String, HashMap<String, u32>>;
+
+fn parse_provider_kind(value: &str) -> ProviderKind {
+    value.parse().unwrap_or_else(|err: String| {
+        warn!(%err, "ignoring unknown endpoint kind stored in the database; treating as external");
+        ProviderKind::External
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct StoredTargets {
+    ttft_ms: u32,
+    itl_ms: u32,
+    #[serde(default)]
+    priority: i32,
+}
+
+fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<StoredTargets> {
+    let value = value?;
+    match serde_json::from_value(value) {
+        Ok(targets) => Some(targets),
+        Err(err) => {
+            warn!(%err, "ignoring malformed overlay targets stored in the database");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Overlays {
+    model_level: OverlaysByAlias,
+    by_target: OverlaysByAlias,
+}
+
+impl Overlays {
+    fn for_class(&self, alias: &str, class: &str) -> HashMap<String, ServingOverlay> {
+        let key = class_target_key(alias, class);
+        self.by_target
+            .get(&key)
+            .or_else(|| self.model_level.get(alias))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn class_target_key(alias: &str, class: &str) -> String {
+    if class == STANDARD_CLASS {
+        alias.to_owned()
+    } else {
+        format!("{alias}:{class}")
+    }
+}
+
+const STANDARD_CLASS: &str = "standard";
+
+async fn load_overlays_from_db(db: &PgPool) -> Result<Overlays, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT mo.user_id, dm.alias, mo.targets, mo.self_hosted_only
+        FROM model_overlays mo
+        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
+        INNER JOIN users u ON u.id = mo.user_id
+        WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut model_level: OverlaysByAlias = HashMap::new();
+    for row in rows {
+        let targets = parse_stored_targets(row.targets);
+        model_level.entry(row.alias).or_default().insert(
+            row.user_id.to_string(),
+            ServingOverlay {
+                self_hosted_only: row.self_hosted_only,
+                priority: targets.as_ref().map(|t| t.priority),
+                ttft_ms: targets.as_ref().map(|t| t.ttft_ms),
+                itl_ms: targets.as_ref().map(|t| t.itl_ms),
+            },
+        );
+    }
+
+    let policies = sqlx::query!(
+        r#"
+        SELECT p.user_id, dm.alias, p.serving_class, p.priority, p.ttft_ms, p.itl_ms
+        FROM account_model_policies p
+        INNER JOIN deployed_models dm ON dm.id = p.deployed_model_id
+        INNER JOIN users u ON u.id = p.user_id
+        WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
+        ORDER BY p.serving_class NULLS FIRST
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    let mut class_rows = Vec::new();
+    for row in policies {
+        match row.serving_class {
+            None => {
+                let overlay = model_level
+                    .entry(row.alias)
+                    .or_default()
+                    .entry(row.user_id.to_string())
+                    .or_default();
+                if row.priority.is_some() {
+                    overlay.priority = row.priority;
+                }
+            }
+            Some(class) => class_rows.push((row.alias, class, row.user_id.to_string(), row.priority, row.ttft_ms, row.itl_ms)),
+        }
+    }
+
+    let mut by_target = model_level.clone();
+    for (alias, class, account, priority, ttft_ms, itl_ms) in class_rows {
+        let base = model_level.get(&alias).and_then(|overlays| overlays.get(&account)).cloned();
+        let overlay = by_target
+            .entry(class_target_key(&alias, &class))
+            .or_insert_with(|| model_level.get(&alias).cloned().unwrap_or_default())
+            .entry(account)
+            .or_insert_with(|| base.unwrap_or_default());
+        if priority.is_some() {
+            overlay.priority = priority;
+        }
+        if let Some(ttft) = ttft_ms.and_then(|v| u32::try_from(v).ok()) {
+            overlay.ttft_ms = Some(ttft);
+        }
+        if let Some(itl) = itl_ms.and_then(|v| u32::try_from(v).ok()) {
+            overlay.itl_ms = Some(itl);
+        }
+    }
+    Ok(Overlays { model_level, by_target })
+}
+
+async fn load_inflight_overrides_from_db(db: &PgPool) -> Result<InflightOverridesByAlias, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, o.user_id, o.inflight_limit
+        FROM realtime_inflight_limit_overrides o
+        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overrides: InflightOverridesByAlias = HashMap::new();
+    for row in rows {
+        overrides
+            .entry(row.alias)
+            .or_default()
+            .insert(row.user_id.to_string(), row.inflight_limit as u32);
+    }
+
+    let class_rows = sqlx::query!(
+        r#"
+        SELECT dm.alias, o.class_key, o.user_id, o.inflight_limit
+        FROM realtime_inflight_class_overrides o
+        INNER JOIN deployed_models dm ON dm.id = o.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    for row in class_rows {
+        overrides
+            .entry(class_target_key(&row.alias, &row.class_key))
+            .or_default()
+            .insert(row.user_id.to_string(), row.inflight_limit as u32);
+    }
+    Ok(overrides)
+}
+
+async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, self_hosted_only, scheduling_priority
+        FROM users
+        WHERE is_deleted = FALSE
+          AND (self_hosted_only OR scheduling_priority IS NOT NULL)
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id.to_string(),
+                AccountServing {
+                    self_hosted_only: row.self_hosted_only,
+                    priority: row.scheduling_priority,
+                },
+            )
+        })
+        .collect())
+}
+
+fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
+    let display_name = span_account_name(api_key.display_name.as_deref(), &api_key.username);
+    HashMap::from([
+        (ACCOUNT_DISPLAY_NAME_LABEL.to_string(), display_name),
+        ("purpose".to_string(), api_key.purpose.clone()),
+        ("zdr".to_string(), api_key.zero_data_retention.to_string()),
+        (onwards::serving::ACCOUNT_LABEL.to_string(), api_key.user_id.to_string()),
+        (onwards::serving::ACCOUNT_NAME_LABEL.to_string(), api_key.username.clone()),
+        ("api_key_id".to_string(), api_key.id.to_string()),
+    ])
+}
+
+fn key_hash(api_key_id: ApiKeyId, secret_hash: Option<Vec<u8>>) -> Option<KeyHash> {
+    let hash = secret_hash.as_deref().and_then(|bytes| KeyHash::try_from(bytes).ok());
+    if hash.is_none() {
+        crate::background_error!(
+            ONWARDS_SYNC,
+            "api_key_without_hash",
+            Error,
+            api_key_id = %api_key_id,
+            "API key has no valid secret_hash; leaving it out of the onwards config"
+        );
+    }
+    hash
+}
+
+const ACCOUNT_DISPLAY_NAME_LABEL: &str = onwards::serving::ACCOUNT_DISPLAY_NAME_LABEL;
+
+const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const RELOAD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct NotificationLag {
+    table: String,
+    age_at_receipt: std::time::Duration,
+    received_at: tokio::time::Instant,
+}
+
+impl NotificationLag {
+    fn at_publication(&self, now: tokio::time::Instant) -> std::time::Duration {
+        self.age_at_receipt + now.duration_since(self.received_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    Published,
+    Retry,
+    Closed,
+}
+
+struct ReloadSchedule {
+    next_allowed: tokio::time::Instant,
+    pending: Option<(tokio::time::Instant, &'static str)>,
+}
+
+impl ReloadSchedule {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            next_allowed: now + MIN_RELOAD_INTERVAL,
+            pending: None,
+        }
+    }
+
+    fn notify(&mut self, now: tokio::time::Instant) {
+        self.pending.get_or_insert((
+            now.max(self.next_allowed),
+            if now < self.next_allowed { "coalesced" } else { "listen_notify" },
+        ));
+    }
+
+    fn fallback(&mut self, now: tokio::time::Instant) {
+        if now >= self.next_allowed {
+            self.pending.get_or_insert((now, "fallback"));
+        }
+    }
+
+    fn completed(&mut self, now: tokio::time::Instant, outcome: ReloadOutcome) {
+        self.next_allowed = now
+            + if outcome == ReloadOutcome::Retry {
+                RELOAD_RETRY_INTERVAL
+            } else {
+                MIN_RELOAD_INTERVAL
+            };
+        self.pending = (outcome == ReloadOutcome::Retry).then_some((self.next_allowed, "retry"));
+    }
+}
+
+#[cfg(test)]
+struct ReloadCheckpoint {
+    outcome: ReloadOutcome,
+    resume: tokio::sync::oneshot::Sender<()>,
+}
+
+pub struct OnwardsConfigSync {
+    db: sqlx_pool_router::DynPools,
+    listener_db: sqlx_pool_router::DynPools,
+    sender: watch::Sender<Targets>,
+    #[cfg(test)]
+    reload_checkpoint: Option<mpsc::Sender<ReloadCheckpoint>>,
+    daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+    default_batch_capacity: usize,
+    default_batch_inflight_capacity: Option<u32>,
+    escalation_models: Vec<String>,
+    cache_info_state: crate::metrics::CacheInfoState,
+    strict_mode: bool,
+}
+
+pub struct SyncConfig {
+    pub status_tx: Option<mpsc::Sender<SyncStatus>>,
+    pub fallback_interval_milliseconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            status_tx: None,
+            fallback_interval_milliseconds: 10000,
+        }
+    }
+}
+
+impl OnwardsConfigSync {
+    #[cfg(test)]
+    #[instrument(skip(db))]
+    pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        Self::new_with_daemon_limits(
+            db.clone(),
+            db,
+            None,
+            10,
+            Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+            Vec::new(),
+            false,
+        )
+        .await
+    }
+
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models))]
+    pub async fn new_with_daemon_limits(
+        db: impl sqlx_pool_router::PoolProvider,
+        listener_db: impl sqlx_pool_router::PoolProvider,
+        daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
+        default_batch_capacity: usize,
+        default_batch_inflight_capacity: Option<u32>,
+        escalation_models: Vec<String>,
+        strict_mode: bool,
+    ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        let db = sqlx_pool_router::DynPools::new(db);
+        let initial_targets =
+            load_targets_from_db_with_batch_default(&db.write(), &escalation_models, strict_mode, default_batch_inflight_capacity).await?;
+
+        if let Some(ref limits) = daemon_capacity_limits {
+            update_daemon_capacity_limits(&db.write(), limits, default_batch_capacity).await?;
+        }
+
+        let mut cache_info_state = crate::metrics::CacheInfoState::new();
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db.write(), &initial_targets, &mut cache_info_state).await {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "cache_info_metrics",
+                Error,
+                "Failed to update cache info metrics: {}",
+                e
+            );
+        }
+
+        let (sender, receiver) = watch::channel(initial_targets.clone());
+
+        let integration = Self {
+            db,
+            listener_db: sqlx_pool_router::DynPools::new(listener_db),
+            sender,
+            #[cfg(test)]
+            reload_checkpoint: None,
+            daemon_capacity_limits,
+            default_batch_capacity,
+            default_batch_inflight_capacity,
+            escalation_models,
+            cache_info_state,
+            strict_mode,
+        };
+        let stream = WatchTargetsStream::new(receiver);
+
+        Ok((integration, initial_targets, stream))
+    }
+
+    pub fn sender(&self) -> watch::Sender<Targets> {
+        self.sender.clone()
+    }
+
+    #[instrument(skip(self, config, shutdown_token), err)]
+    pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
+        let mut schedule = ReloadSchedule::new(tokio::time::Instant::now());
+        let mut notification_lag = None;
+
+        let fallback_interval = if config.fallback_interval_milliseconds > 0 {
+            Some(std::time::Duration::from_millis(config.fallback_interval_milliseconds))
+        } else {
+            None
+        };
+
+        'outer: loop {
+            if let Some(tx) = &config.status_tx {
+                tx.send(SyncStatus::Connecting).await?;
+            }
+            let mut listener = PgListener::connect_with(&self.listener_db.write()).await?;
+            listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
+
+            if let Some(tx) = &config.status_tx {
+                tx.send(SyncStatus::Connected).await?;
+            }
+            info!("Started onwards configuration listener");
+
+            let mut fallback_timer = fallback_interval.map(|interval| {
+                let mut timer = tokio::time::interval(interval);
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                timer
+            });
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => {
+                        info!("Received shutdown signal, stopping onwards configuration listener");
+                        break 'outer;
+                    }
+
+                    notification_result = listener.try_recv() => {
+                        debug!("Received notification from database");
+                        match notification_result {
+                            Ok(None) => {
+                                info!("Connection lost, attempting to reconnect");
+                                if let Some(tx) = &config.status_tx {
+                                    debug!("Sending Disconnected status");
+                                    tx.send(SyncStatus::Disconnected).await?;
+                                }
+                                if let Some(tx) = &config.status_tx {
+                                    debug!("Sending Reconnecting status");
+                                    tx.send(SyncStatus::Reconnecting).await?;
+                                }
+                                break;
+
+                            },
+                            Ok(Some(notification)) => {
+                                debug!("Received notification on channel: {} with payload: {:?}",
+                                      notification.channel(), notification.payload());
+
+                                schedule.notify(tokio::time::Instant::now());
+                                if let Some((table_name, lag)) = parse_notify_payload(notification.payload()) {
+                                    notification_lag.get_or_insert(NotificationLag {
+                                        table: table_name.to_string(),
+                                        age_at_receipt: lag,
+                                        received_at: tokio::time::Instant::now(),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                error!("Error receiving notification: {}", e);
+                                if let Some(tx) = &config.status_tx {
+                                    tx.send(SyncStatus::Disconnected).await?;
+                                }
+                                if let Some(tx) = &config.status_tx {
+                                    tx.send(SyncStatus::Reconnecting).await?;
+                                }
+
+                                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                                    error!("Database connection closed, exiting sync task");
+                                    return Err(e.into());
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    _ = async {
+                        match schedule.pending {
+                            Some((deadline, _)) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let (_, source) = schedule.pending.take().expect("reload deadline was scheduled");
+                        let outcome = self.full_reload(source).await?;
+                        schedule.completed(tokio::time::Instant::now(), outcome);
+                        if outcome == ReloadOutcome::Published
+                            && let Some(lag) = notification_lag.take()
+                        {
+                            let seconds = lag.at_publication(tokio::time::Instant::now()).as_secs_f64();
+                            histogram!("dwctl_cache_sync_lag_seconds", "table" => lag.table).record(seconds);
+                        }
+                        if outcome == ReloadOutcome::Closed {
+                            break 'outer;
+                        }
+                    }
+
+                    _ = async {
+                        match &mut fallback_timer {
+                            Some(timer) => timer.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        schedule.fallback(tokio::time::Instant::now());
+                    }
+                }
+            }
+        }
+
+        info!("Onwards configuration listener stopped gracefully");
+        Ok(())
+    }
+
+    async fn full_reload(&mut self, source: &'static str) -> Result<ReloadOutcome, anyhow::Error> {
+        let new_targets = match load_targets_from_db_with_batch_default(
+            &self.db.write(),
+            &self.escalation_models,
+            self.strict_mode,
+            self.default_batch_inflight_capacity,
+        )
+        .await
+        {
+            Ok(targets) => targets,
+            Err(e) => {
+                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                    error!("Database pool closed, exiting sync task");
+                    return Err(e);
+                }
+                #[cfg(test)]
+                self.checkpoint(ReloadOutcome::Retry).await;
+                return Ok(ReloadOutcome::Retry);
+            }
+        };
+        #[cfg(test)]
+        self.checkpoint(ReloadOutcome::Published).await;
+        debug!("Loaded {} targets from database", new_targets.targets.len());
+
+        if let Some(ref limits) = self.daemon_capacity_limits
+            && let Err(e) = update_daemon_capacity_limits(&self.db.write(), limits, self.default_batch_capacity).await
+        {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "capacity_limits",
+                Error,
+                "Failed to update daemon capacity limits: {}",
+                e
+            );
+        }
+
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db.write(), &new_targets, &mut self.cache_info_state).await {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "cache_info_metrics",
+                Error,
+                "Failed to update cache info metrics: {}",
+                e
+            );
+        }
+
+        if let Err(e) = self.sender.send(new_targets) {
+            error!("Failed to send targets update: {}", e);
+            return Ok(ReloadOutcome::Closed);
+        }
+
+        metrics::counter!("dwctl_cache_sync_total", "source" => source).increment(1);
+        info!("Updated onwards configuration successfully ({source})");
+        Ok(ReloadOutcome::Published)
+    }
+
+    #[cfg(test)]
+    async fn checkpoint(&self, outcome: ReloadOutcome) {
+        if let Some(tx) = &self.reload_checkpoint {
+            let (resume, wait) = tokio::sync::oneshot::channel();
+            if tx.send(ReloadCheckpoint { outcome, resume }).await.is_ok() {
+                let _ = wait.await;
+            }
+        }
+    }
+}
+
+
+#[derive(Debug, Clone)]
+struct CompositeModelComponent {
+    weight: i32,
+    pool: String,
+    target: OnwardsTarget,
+}
+
+#[derive(Debug, Clone)]
+struct OnwardsCompositeModel {
+    #[allow(dead_code)]
+    id: DeploymentId,
+    alias: String,
+    realtime_inflight_limit: i32,
+    batch_capacity: Option<i32>,
+    lb_strategy: LoadBalancingStrategy,
+    fallback_enabled: bool,
+    fallback_on_rate_limit: bool,
+    fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
+    fallback_with_replacement: bool,
+    fallback_max_attempts: Option<i32>,
+    backoff_enabled: bool,
+    backoff_initial_ms: i32,
+    backoff_max_ms: i32,
+    backoff_factor: f64,
+    backoff_jitter: String,
+    backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
+    affinity: Option<AffinityConfig>,
+    sanitize_responses: bool,
+    #[allow(dead_code)]
+    trusted: bool,
+    routing_rules: Vec<RoutingRule>,
+    components: Vec<CompositeModelComponent>,
+    api_keys: Vec<OnwardsApiKey>,
+    has_key_grants: bool,
+    class_api_keys: HashMap<String, Vec<OnwardsApiKey>>,
+    routing_mode: String,
+    classes: Vec<OnwardsClassRoute>,
+}
+
+#[derive(Debug, Clone)]
+struct OnwardsClassRoute {
+    class_key: String,
+    realtime_inflight_limit: Option<i32>,
+    target: OnwardsTarget,
+}
+
+#[tracing::instrument(skip(db, escalation_models))]
+async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+    debug!(
+        "Loading composite models from database (escalation_models: {:?})",
+        escalation_models
+    );
+
+    let component_rows = sqlx::query!(
+        r#"
+        SELECT
+            cm.id as composite_model_id,
+            cm.alias,
+            cm.lb_strategy,
+            cm.fallback_enabled,
+            cm.fallback_on_rate_limit,
+            cm.fallback_on_status,
+            cm.fallback_with_replacement,
+            cm.fallback_max_attempts,
+            cm.sanitize_responses as composite_sanitize_responses,
+            cm.trusted as composite_trusted,
+            -- Component info
+            dmc.deployed_model_id,
+            dmc.weight,
+            dmc.pool as component_pool,
+            -- Underlying deployment info
+            dm.model_name,
+            dm.alias as deployment_alias,
+            dm.sanitize_responses as deployment_sanitize_responses,
+            dm.trusted as deployment_trusted,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
+            -- Endpoint info
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
+        FROM deployed_models cm
+        INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
+        INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
+        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        WHERE cm.is_composite = TRUE
+          AND cm.deleted = FALSE
+          AND dmc.enabled = TRUE
+          AND dm.deleted = FALSE
+        -- Deterministic priority order: sort_order is the failover order onwards
+        -- uses (Priority strategy iterates providers in definition order). The
+        -- weight/created_at keys break any residual sort_order tie the same way
+        -- the admin API does, so the provider shown as "Primary" is the one
+        -- onwards actually tries first.
+        ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let api_key_rows = sqlx::query!(
+        r#"
+        SELECT
+            cm.id as composite_model_id,
+            target.class_key as "class_key?",
+            ak.id as api_key_id,
+            ak.secret_hash as "api_key_secret_hash?",
+            ak.purpose as api_key_purpose,
+            ak.user_zero_data_retention,
+            ak.user_id,
+            ak.user_username,
+            ak.user_display_name as "user_display_name?"
+        FROM deployed_models cm
+        CROSS JOIN LATERAL (
+            -- NULL: the legacy route. Otherwise one target per serving class.
+            SELECT NULL::text AS class_key WHERE NOT class_routes_active(cm.id)
+            UNION ALL
+            SELECT c.class_key FROM model_serving_classes c
+            WHERE c.deployed_model_id = cm.id AND class_routes_active(cm.id)
+        ) target
+        CROSS JOIN LATERAL (
+            SELECT DISTINCT
+                ak.id,
+                ak.secret_hash,
+                ak.purpose,
+                ak.user_id,
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username,
+                u.display_name as user_display_name
+            FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
+            WHERE (
+                -- System user always has access
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- OR user is in a group assigned to this composite model (via deployment_groups)
+                OR EXISTS (
+                    SELECT 1 FROM user_groups ug
+                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+                    WHERE dg.deployment_id = cm.id
+                      AND ug.user_id = ak.user_id
+                )
+                -- OR composite model is in public group (nil UUID)
+                OR EXISTS (
+                    SELECT 1 FROM deployment_groups dg
+                    WHERE dg.deployment_id = cm.id
+                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+                -- OR this is a batch API key and composite model is an escalation target
+                OR (
+                    ak.purpose = 'batch'
+                    AND cm.alias = ANY($1::text[])
+                )
+            )
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- Positive balance read directly from the total
+                -- user_balance_checkpoints read model (kept current by the
+                -- writers folding synchronously with each charge). The
+                -- is_deleted guard mirrors the old balance CTE, which only
+                -- contained non-deleted users; key deletion is not implied by
+                -- user deletion, so this check is load-bearing.
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
+                    SELECT 1 FROM user_balance_checkpoints ub
+                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
+                )))
+                OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                          -- The legacy route: class-less prices. A class target: its
+                          -- class's prices; the standard target also the class-less ones.
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
+                )
+            )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
+            AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                          AND (mt.serving_class IS NOT DISTINCT FROM target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND (target.class_key IS NULL OR mt.serving_class = target.class_key
+                               OR (mt.serving_class IS NULL AND target.class_key = 'standard'))
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
+                )
+            )
+            -- Inference data plane only: platform (management) keys must never
+            -- enter onwards' key set. Mirrors is_inference_purpose in
+            -- db::models::api_keys (SQL cannot call it). The system key is
+            -- purpose 'platform' (it calls admin endpoints, see migration 071)
+            -- but is used internally for onwards inference, so it is exempt.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
+            )
+        ) ak
+        WHERE cm.is_composite = TRUE
+          AND cm.deleted = FALSE
+        ORDER BY cm.id, target.class_key, ak.id
+        "#,
+        escalation_models
+    )
+    .fetch_all(db)
+    .await?;
+
+    let composite_metadata_rows = sqlx::query!(
+        r#"
+        SELECT
+            id as composite_model_id,
+            alias,
+            realtime_inflight_limit,
+            batch_capacity,
+            lb_strategy,
+            fallback_enabled,
+            fallback_on_rate_limit,
+            fallback_on_status,
+            fallback_realtime_on_status,
+            fallback_with_replacement,
+            fallback_max_attempts,
+            backoff_enabled,
+            backoff_initial_ms,
+            backoff_max_ms,
+            backoff_factor,
+            backoff_jitter,
+            backoff_max_total_ms,
+            first_token_timeout_ms,
+            aimd,
+            affinity,
+            sanitize_responses,
+            trusted,
+            routing_mode
+        FROM deployed_models
+        WHERE is_composite = TRUE
+          AND deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut composite_map: HashMap<DeploymentId, OnwardsCompositeModel> = HashMap::new();
+    for row in composite_metadata_rows {
+        let lb_strategy = row
+            .lb_strategy
+            .as_deref()
+            .and_then(LoadBalancingStrategy::try_parse)
+            .unwrap_or_default();
+
+        composite_map.insert(
+            row.composite_model_id,
+            OnwardsCompositeModel {
+                id: row.composite_model_id,
+                alias: row.alias,
+                realtime_inflight_limit: row.realtime_inflight_limit,
+                batch_capacity: row.batch_capacity,
+                lb_strategy,
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status,
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter,
+                backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd: row.aimd.map(serde_json::from_value).transpose()?,
+                affinity: row.affinity.map(serde_json::from_value).transpose()?,
+                sanitize_responses: row.sanitize_responses,
+                trusted: row.trusted,
+                routing_rules: Vec::new(),
+                components: Vec::new(),
+                api_keys: Vec::new(),
+                has_key_grants: false,
+                class_api_keys: HashMap::new(),
+                routing_mode: row.routing_mode,
+                classes: Vec::new(),
+            },
+        );
+    }
+
+    let class_rows = sqlx::query!(
+        r#"
+        SELECT
+            c.deployed_model_id,
+            c.class_key,
+            c.upstream_model_name,
+            c.realtime_inflight_limit,
+            dm.alias,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
+        FROM model_serving_classes c
+        INNER JOIN deployed_models dm ON dm.id = c.deployed_model_id
+        INNER JOIN inference_endpoints ie ON ie.id = c.inference_endpoint_id
+        WHERE dm.routing_mode = 'class_routes'
+          AND dm.deleted = FALSE
+        ORDER BY c.deployed_model_id, c.class_key
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+    for row in class_rows {
+        let Some(composite) = composite_map.get_mut(&row.deployed_model_id) else {
+            continue;
+        };
+        let endpoint_url = match url::Url::parse(&row.endpoint_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(alias = %row.alias, class = %row.class_key, "Skipping class with an invalid endpoint URL: {e}");
+                continue;
+            }
+        };
+        let target_key = class_target_key(&row.alias, &row.class_key);
+        composite.classes.push(OnwardsClassRoute {
+            class_key: row.class_key,
+            realtime_inflight_limit: row.realtime_inflight_limit,
+            target: OnwardsTarget {
+                model_name: row.upstream_model_name,
+                reasoning_translation: resolve_reasoning_translation(
+                    row.endpoint_reasoning_translation,
+                    row.model_reasoning_translation_overrides,
+                    &target_key,
+                ),
+                alias: target_key,
+                sanitize_responses: composite.sanitize_responses,
+                trusted: parse_provider_kind(&row.endpoint_kind) != ProviderKind::External,
+                routing_rules: Vec::new(),
+                fallback_enabled: false,
+                fallback_on_rate_limit: false,
+                fallback_on_status: Vec::new(),
+                fallback_realtime_on_status: Vec::new(),
+                fallback_with_replacement: false,
+                fallback_max_attempts: None,
+                backoff_enabled: false,
+                backoff_initial_ms: 100,
+                backoff_max_ms: 5_000,
+                backoff_factor: 2.0,
+                backoff_jitter: "full".to_string(),
+                backoff_max_total_ms: None,
+                first_token_timeout_ms: None,
+                aimd: None,
+                endpoint_url,
+                endpoint_api_key: row.endpoint_api_key,
+                auth_header_name: row.auth_header_name,
+                auth_header_prefix: row.auth_header_prefix,
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
+                api_keys: Vec::new(),
+                has_key_grants: false,
+            },
+        });
+    }
+
+    for row in component_rows {
+        let endpoint_url = match url::Url::parse(&row.endpoint_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!(
+                    "Skipping component for composite model '{}': invalid endpoint URL '{}': {}",
+                    row.alias, row.endpoint_url, e
+                );
+                continue;
+            }
+        };
+
+        if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            composite.components.push(CompositeModelComponent {
+                weight: row.weight,
+                pool: row.component_pool.clone(),
+                target: OnwardsTarget {
+                    model_name: row.model_name.clone(),
+                    alias: row.deployment_alias.clone(),
+                    sanitize_responses: row.deployment_sanitize_responses,
+                    trusted: row.deployment_trusted,
+                    reasoning_translation: resolve_reasoning_translation(
+                        row.endpoint_reasoning_translation,
+                        row.model_reasoning_translation_overrides,
+                        &row.deployment_alias,
+                    ),
+                    routing_rules: Vec::new(),
+                    fallback_enabled: false,
+                    fallback_on_rate_limit: false,
+                    fallback_on_status: Vec::new(),
+                    fallback_realtime_on_status: Vec::new(),
+                    fallback_with_replacement: false,
+                    fallback_max_attempts: None,
+                    backoff_enabled: false,
+                    backoff_initial_ms: 100,
+                    backoff_max_ms: 5_000,
+                    backoff_factor: 2.0,
+                    backoff_jitter: "full".to_string(),
+                    backoff_max_total_ms: None,
+                    first_token_timeout_ms: None,
+                    aimd: None,
+                    endpoint_url,
+                    endpoint_api_key: row.endpoint_api_key.clone(),
+                    auth_header_name: row.auth_header_name.clone(),
+                    auth_header_prefix: row.auth_header_prefix.clone(),
+                    endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                    endpoint_kind: parse_provider_kind(&row.endpoint_kind),
+                    api_keys: Vec::new(),
+                    has_key_grants: false,
+                },
+            });
+        }
+    }
+
+    for row in api_key_rows {
+        if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            let keys = match row.class_key {
+                Some(class) => composite.class_api_keys.entry(class).or_default(),
+                None => {
+                    composite.has_key_grants = true;
+                    &mut composite.api_keys
+                }
+            };
+            if !keys.iter().any(|k| k.id == row.api_key_id)
+                && let Some(secret_hash) = key_hash(row.api_key_id, row.api_key_secret_hash)
+            {
+                keys.push(OnwardsApiKey {
+                    id: row.api_key_id,
+                    secret_hash,
+                    purpose: row.api_key_purpose.clone(),
+                    zero_data_retention: row.user_zero_data_retention,
+                    user_id: row.user_id,
+                    username: row.user_username,
+                    display_name: row.user_display_name,
+                });
+            }
+        }
+    }
+
+    let composites: Vec<_> = composite_map.into_values().collect();
+    debug!(
+        "Loaded {} composite models with {} total components",
+        composites.len(),
+        composites.iter().map(|c| c.components.len()).sum::<usize>()
+    );
+
+    Ok(composites)
+}
+
+fn effective_batch_inflight_limit(batch_capacity: Option<i32>, default_batch_inflight_capacity: Option<u32>, alias: &str) -> Option<u32> {
+    match batch_capacity {
+        Some(capacity) if capacity > 0 => Some(capacity as u32),
+        Some(capacity) => {
+            match default_batch_inflight_capacity {
+                Some(default) => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    default_capacity = default,
+                    "Invalid non-positive batch_capacity on a virtual model; capping batch at the default instead"
+                ),
+                None => warn!(
+                    alias = %alias,
+                    batch_capacity = capacity,
+                    "Invalid non-positive batch_capacity on a virtual model and no default cap is configured; batch is uncapped"
+                ),
+            }
+            default_batch_inflight_capacity
+        }
+        None => default_batch_inflight_capacity,
+    }
+}
+
+fn composite_fallback(composite: &OnwardsCompositeModel) -> Option<OnwardsFallbackConfig> {
+    if composite.fallback_enabled {
+        let backoff = composite.backoff_enabled.then_some(OnwardsBackoffConfig {
+            initial_ms: composite.backoff_initial_ms.max(1) as u64,
+            max_ms: composite.backoff_max_ms.max(composite.backoff_initial_ms.max(1)) as u64,
+            factor: composite.backoff_factor.max(1.0),
+            jitter: match composite.backoff_jitter.as_str() {
+                "none" => OnwardsJitterStrategy::None,
+                _ => OnwardsJitterStrategy::Full,
+            },
+        });
+        let max_total_backoff_ms = composite.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
+        Some(OnwardsFallbackConfig {
+            enabled: true,
+            on_rate_limit: composite.fallback_on_rate_limit,
+            on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
+            with_replacement: composite.fallback_with_replacement,
+            max_attempts: composite
+                .fallback_max_attempts
+                .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+            backoff,
+            max_total_backoff_ms,
+            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
+            aimd: composite.aimd.clone(),
+            affinity: composite.affinity.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+fn convert_class_routes(
+    composite: &OnwardsCompositeModel,
+    key_definitions: &mut HashMap<String, KeyDefinition>,
+    overlays: &Overlays,
+    inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
+) -> Option<Vec<(String, TargetSpecOrList)>> {
+    let has_standard = composite.classes.iter().any(|class| class.class_key == STANDARD_CLASS);
+    let redirects = composite
+        .routing_rules
+        .iter()
+        .any(|rule| matches!(rule.action, RoutingAction::Redirect { .. }));
+    if !has_standard || redirects {
+        crate::background_error!(
+            ONWARDS_SYNC,
+            "invalid_class_activation",
+            Error,
+            alias = %composite.alias,
+            has_standard,
+            redirects,
+            "Class-routed model has no standard class or redirects traffic; serving its legacy route"
+        );
+        return None;
+    }
+    for api_key in composite.class_api_keys.values().flatten() {
+        key_definitions.insert(
+            api_key.id.to_string(),
+            KeyDefinition {
+                key: api_key.secret_hash,
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: key_labels(api_key),
+            },
+        );
+    }
+    let class_keys = |class: &str| -> Option<std::collections::HashSet<_>> {
+        composite
+            .class_api_keys
+            .get(class)
+            .map(|keys| keys.iter().map(|k| k.secret_hash).collect())
+    };
+    let fallback = composite_fallback(composite).map(|mut config| {
+        config.affinity = None;
+        config
+    });
+    let reasoning_translation = composite
+        .classes
+        .iter()
+        .find(|class| class.class_key == STANDARD_CLASS)
+        .and_then(|class| class.target.reasoning_translation.clone());
+    let targets = composite
+        .classes
+        .iter()
+        .map(|class| {
+            let target = &class.target;
+            let standard = class.class_key == STANDARD_CLASS;
+            let provider = ProviderSpec {
+                url: target.endpoint_url.clone(),
+                onwards_key: target.endpoint_api_key.clone(),
+                onwards_model: Some(target.model_name.clone()),
+                rate_limit: None,
+                concurrency_limit: None,
+                upstream_auth_header_name: (target.auth_header_name != "Authorization").then(|| target.auth_header_name.clone()),
+                upstream_auth_header_prefix: (target.auth_header_prefix != "Bearer ").then(|| target.auth_header_prefix.clone()),
+                response_headers: None,
+                weight: 1,
+                sanitize_response: composite.sanitize_responses,
+                request_timeout_secs: None,
+                trusted: Some(target.trusted),
+                propagate_trace_context: None,
+                reasoning_translation: reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
+            };
+            let pool = PoolSpec {
+                keys: class_keys(&class.class_key),
+                rate_limit: None,
+                concurrency_limit: None,
+                fallback: fallback.clone(),
+                strategy: OnwardsLoadBalanceStrategy::Priority,
+                providers: vec![provider],
+                response_headers: None,
+                sanitize_response: composite.sanitize_responses,
+                trusted: false,
+                routing_rules: composite.routing_rules.clone(),
+                overlays: overlays.for_class(&composite.alias, &class.class_key),
+                inflight_limit: Some(class.realtime_inflight_limit.unwrap_or(composite.realtime_inflight_limit) as u32),
+                batch_inflight_limit: standard
+                    .then(|| effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias))
+                    .flatten(),
+                class_route_of: (!standard).then(|| composite.alias.clone()),
+                account_inflight_limits: inflight_overrides.get(&target.alias).cloned().unwrap_or_default(),
+            };
+            debug!(alias = %target.alias, upstream = %target.model_name, "Class route configured");
+            (target.alias.clone(), TargetSpecOrList::Pool(pool))
+        })
+        .collect();
+    Some(targets)
+}
+
+fn convert_composite_to_target_spec(
+    composite: &OnwardsCompositeModel,
+    key_definitions: &mut HashMap<String, KeyDefinition>,
+    overlays: &OverlaysByAlias,
+    inflight_overrides: &InflightOverridesByAlias,
+    default_batch_inflight_capacity: Option<u32>,
+) -> (String, TargetSpecOrList) {
+    for api_key in &composite.api_keys {
+        key_definitions.insert(
+            api_key.id.to_string(),
+            KeyDefinition {
+                key: api_key.secret_hash,
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: key_labels(api_key),
+            },
+        );
+    }
+
+    let keys = if !composite.has_key_grants {
+        None
+    } else {
+        Some(composite.api_keys.iter().map(|k| k.secret_hash).collect())
+    };
+
+    let strategy = match composite.lb_strategy {
+        LoadBalancingStrategy::WeightedRandom => OnwardsLoadBalanceStrategy::WeightedRandom,
+        LoadBalancingStrategy::Priority => OnwardsLoadBalanceStrategy::Priority,
+    };
+
+    let fallback = composite_fallback(composite);
+
+    let mut pool_providers: BTreeMap<String, Vec<ProviderSpec>> = BTreeMap::new();
+    for component in composite.components.iter() {
+        let provider = {
+            let target = &component.target;
+
+            {
+                debug!(
+                    "  Provider '{}' ({}): weight={}, sanitize_response={}, trusted={}",
+                    target.alias, target.model_name, component.weight, composite.sanitize_responses, target.trusted
+                );
+                ProviderSpec {
+                    url: target.endpoint_url.clone(),
+                    onwards_key: target.endpoint_api_key.clone(),
+                    onwards_model: Some(target.model_name.clone()),
+                    weight: component.weight.max(1) as u32,
+                    rate_limit: None,
+                    concurrency_limit: None,
+                    upstream_auth_header_name: if target.auth_header_name != "Authorization" {
+                        Some(target.auth_header_name.clone())
+                    } else {
+                        None
+                    },
+                    upstream_auth_header_prefix: if target.auth_header_prefix != "Bearer " {
+                        Some(target.auth_header_prefix.clone())
+                    } else {
+                        None
+                    },
+                    response_headers: None,
+                    sanitize_response: composite.sanitize_responses,
+                    request_timeout_secs: None,
+                    trusted: Some(target.trusted),
+                    propagate_trace_context: None,
+                    reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                    accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                    kind: target.endpoint_kind,
+                }
+            }
+        };
+        pool_providers.entry(component.pool.clone()).or_default().push(provider);
+    }
+
+    pool_providers.entry(DEFAULT_COMPONENT_POOL.to_string()).or_default();
+
+    debug!(
+        "Composite model '{}' configured with {} pool(s) ({} providers), strategy: {:?}, fallback: {}, sanitize_responses: {}",
+        composite.alias,
+        pool_providers.len(),
+        pool_providers.values().map(Vec::len).sum::<usize>(),
+        strategy,
+        composite.fallback_enabled,
+        composite.sanitize_responses
+    );
+
+    let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
+        keys: keys.clone(),
+        rate_limit: None,
+        concurrency_limit: None,
+        fallback: fallback.clone().map(|mut config| {
+            if pool_name != DEFAULT_COMPONENT_POOL {
+                config.aimd = Some(AimdConfig {
+                    enabled: false,
+                    ..AimdConfig::default()
+                });
+                config.affinity = None;
+            }
+            config
+        }),
+        strategy: if pool_name == DEFAULT_COMPONENT_POOL {
+            strategy
+        } else {
+            OnwardsLoadBalanceStrategy::Priority
+        },
+        providers,
+        response_headers: None,
+        sanitize_response: composite.sanitize_responses,
+        trusted: false,
+        routing_rules: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.routing_rules.clone()
+        } else {
+            inheritable_routing_rules(&composite.routing_rules)
+        },
+        overlays: if pool_name == DEFAULT_COMPONENT_POOL {
+            overlays.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
+        inflight_limit: (pool_name == DEFAULT_COMPONENT_POOL).then_some(composite.realtime_inflight_limit as u32),
+        batch_inflight_limit: if pool_name == DEFAULT_COMPONENT_POOL {
+            effective_batch_inflight_limit(composite.batch_capacity, default_batch_inflight_capacity, &composite.alias)
+        } else {
+            None
+        },
+        class_route_of: None,
+        account_inflight_limits: if pool_name == DEFAULT_COMPONENT_POOL {
+            inflight_overrides.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
+    };
+
+    let mut pools: HashMap<String, PoolSpec> = pool_providers
+        .into_iter()
+        .map(|(name, p)| {
+            let spec = make_pool(&name, p);
+            (name, spec)
+        })
+        .collect();
+
+    let spec = if pools.len() == 1 {
+        TargetSpecOrList::Pool(pools.remove(DEFAULT_COMPONENT_POOL).expect("default pool is always present"))
+    } else {
+        TargetSpecOrList::Pools(PoolsSpec { pools })
+    };
+
+    (composite.alias.clone(), spec)
+}
+
+#[tracing::instrument(skip(targets, composites))]
+fn convert_to_config_file(
+    targets: Vec<OnwardsTarget>,
+    composites: Vec<OnwardsCompositeModel>,
+    strict_mode: bool,
+    overlays: &Overlays,
+    inflight_overrides: &InflightOverridesByAlias,
+    accounts: AccountsById,
+    default_batch_inflight_capacity: Option<u32>,
+) -> ConfigFile {
+    let mut key_definitions = HashMap::new();
+
+    let mut target_specs: HashMap<String, TargetSpecOrList> = targets
+        .into_iter()
+        .map(|target| {
+            for api_key in &target.api_keys {
+                key_definitions.insert(
+                    api_key.id.to_string(),
+                    KeyDefinition {
+                        key: api_key.secret_hash,
+                        rate_limit: None,
+                        concurrency_limit: None,
+                        labels: key_labels(api_key),
+                    },
+                );
+            }
+
+            let keys = if !target.has_key_grants {
+                None
+            } else {
+                Some(target.api_keys.iter().map(|k| k.secret_hash).collect())
+            };
+
+            let upstream_auth_header_name = if target.auth_header_name != "Authorization" {
+                Some(target.auth_header_name.clone())
+            } else {
+                None
+            };
+            let upstream_auth_header_prefix = if target.auth_header_prefix != "Bearer " {
+                Some(target.auth_header_prefix.clone())
+            } else {
+                None
+            };
+
+            let provider = ProviderSpec {
+                url: target.endpoint_url.clone(),
+                onwards_key: target.endpoint_api_key.clone(),
+                onwards_model: Some(target.model_name.clone()),
+                rate_limit: None,
+                concurrency_limit: None,
+                upstream_auth_header_name,
+                upstream_auth_header_prefix,
+                response_headers: None,
+                weight: 1,
+                sanitize_response: target.sanitize_responses,
+                request_timeout_secs: None,
+                trusted: Some(target.trusted),
+                propagate_trace_context: None,
+                reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
+            };
+
+            let fallback = if target.fallback_enabled {
+                let backoff = target.backoff_enabled.then_some(OnwardsBackoffConfig {
+                    initial_ms: target.backoff_initial_ms.max(1) as u64,
+                    max_ms: target.backoff_max_ms.max(target.backoff_initial_ms.max(1)) as u64,
+                    factor: target.backoff_factor.max(1.0),
+                    jitter: match target.backoff_jitter.as_str() {
+                        "none" => OnwardsJitterStrategy::None,
+                        _ => OnwardsJitterStrategy::Full,
+                    },
+                });
+                let max_total_backoff_ms = target.backoff_max_total_ms.and_then(|n| u64::try_from(n).ok());
+                Some(OnwardsFallbackConfig {
+                    enabled: true,
+                    on_rate_limit: target.fallback_on_rate_limit,
+                    on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    realtime_on_status: target.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
+                    with_replacement: target.fallback_with_replacement,
+                    max_attempts: target
+                        .fallback_max_attempts
+                        .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
+                    backoff,
+                    max_total_backoff_ms,
+                    first_token_timeout_ms: target.first_token_timeout_ms.map(|ms| ms as u64),
+                    aimd: target.aimd.clone(),
+                    affinity: None,
+                })
+            } else {
+                None
+            };
+
+            let pool_spec = PoolSpec {
+                keys,
+                rate_limit: None,
+                concurrency_limit: None,
+                fallback,
+                strategy: OnwardsLoadBalanceStrategy::default(),
+                providers: vec![provider],
+                response_headers: None,
+                sanitize_response: target.sanitize_responses,
+                trusted: false,
+                routing_rules: target.routing_rules,
+                overlays: overlays.by_target.get(&target.alias).cloned().unwrap_or_default(),
+                inflight_limit: None,
+                batch_inflight_limit: None,
+                class_route_of: None,
+                account_inflight_limits: HashMap::new(),
+            };
+
+            (target.alias, TargetSpecOrList::Pool(pool_spec))
+        })
+        .collect();
+
+    for composite in composites {
+        if composite.routing_mode == "class_routes"
+            && let Some(class_targets) = convert_class_routes(
+                &composite,
+                &mut key_definitions,
+                overlays,
+                inflight_overrides,
+                default_batch_inflight_capacity,
+            )
+        {
+            target_specs.extend(class_targets);
+            continue;
+        }
+        let mut composite = composite;
+        if !composite.has_key_grants
+            && let Some(keys) = composite.class_api_keys.remove(STANDARD_CLASS)
+        {
+            composite.api_keys = keys;
+            composite.has_key_grants = true;
+        }
+        if composite.components.is_empty() {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "composite_no_components",
+                Warning,
+                "Composite model '{}' has no enabled components - requests will return 503",
+                composite.alias
+            );
+        }
+
+        let (alias, spec) = convert_composite_to_target_spec(
+            &composite,
+            &mut key_definitions,
+            &overlays.by_target,
+            inflight_overrides,
+            default_batch_inflight_capacity,
+        );
+        target_specs.insert(alias, spec);
+    }
+
+    let auth = if key_definitions.is_empty() {
+        None
+    } else {
+        Some(
+            Auth::builder()
+                .global_keys(std::collections::HashSet::new())
+                .key_definitions(key_definitions)
+                .build(),
+        )
+    };
+
+    ConfigFile {
+        targets: target_specs,
+        auth,
+        strict_mode,
+        http_pool: None,
+        accounts,
+    }
+}
+
+#[cfg(test)]
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db(db: &PgPool, escalation_models: &[String], strict_mode: bool) -> Result<Targets, anyhow::Error> {
+    load_targets_from_db_with_batch_default(
+        db,
+        escalation_models,
+        strict_mode,
+        Some(crate::config::DEFAULT_BATCH_INFLIGHT_CAPACITY),
+    )
+    .await
+}
+
+#[tracing::instrument(skip(db, escalation_models))]
+pub async fn load_targets_from_db_with_batch_default(
+    db: &PgPool,
+    escalation_models: &[String],
+    strict_mode: bool,
+    default_batch_inflight_capacity: Option<u32>,
+) -> Result<Targets, anyhow::Error> {
+    let query_start = std::time::Instant::now();
+    debug!("Loading onwards targets from database (with composite models)");
+
+    let rows = sqlx::query!(
+        r#"
+        SELECT
+            dm.id as deployment_id,
+            dm.model_name,
+            dm.alias,
+            dm.hosted_on,
+            dm.sanitize_responses,
+            dm.trusted,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
+            dm.fallback_enabled,
+            dm.fallback_on_rate_limit,
+            dm.fallback_on_status,
+            dm.fallback_realtime_on_status,
+            dm.fallback_with_replacement,
+            dm.fallback_max_attempts,
+            dm.backoff_enabled,
+            dm.backoff_initial_ms,
+            dm.backoff_max_ms,
+            dm.backoff_factor,
+            dm.backoff_jitter,
+            dm.backoff_max_total_ms,
+            dm.first_token_timeout_ms,
+            dm.aimd,
+            ie.id as endpoint_id,
+            ie.url as "endpoint_url!",
+            ie.api_key as endpoint_api_key,
+            ie.auth_header_name,
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind,
+            ak.id as "api_key_id?",
+            ak.secret_hash as "api_key_secret_hash?",
+            ak.purpose as "api_key_purpose?",
+            ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
+            ak.user_id as "api_key_user_id?",
+            ak.user_username as "api_key_user_username?",
+            ak.user_display_name as "api_key_user_display_name?"
+        FROM deployed_models dm
+        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        LEFT JOIN LATERAL (
+            SELECT DISTINCT
+                ak.id,
+                ak.secret_hash,
+                ak.purpose,
+                ak.user_id,
+                u.zero_data_retention as user_zero_data_retention,
+                u.username as user_username,
+                u.display_name as user_display_name
+            FROM api_keys ak
+            JOIN users u ON u.id = ak.user_id
+            WHERE (
+                -- System user always has access
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- OR user is in a group assigned to this model
+                OR EXISTS (
+                    SELECT 1 FROM user_groups ug
+                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+                    WHERE dg.deployment_id = dm.id
+                      AND ug.user_id = ak.user_id
+                )
+                -- OR model is in public group
+                OR EXISTS (
+                    SELECT 1 FROM deployment_groups dg
+                    WHERE dg.deployment_id = dm.id
+                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+                -- OR this is a batch API key and model is an escalation target
+                OR (
+                    ak.purpose = 'batch'
+                    AND dm.alias = ANY($1::text[])
+                )
+            )
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                -- Positive balance read directly from the total
+                -- user_balance_checkpoints read model (kept current by the
+                -- writers folding synchronously with each charge). The
+                -- is_deleted guard mirrors the old balance CTE, which only
+                -- contained non-deleted users; key deletion is not implied by
+                -- user deletion, so this check is load-bearing.
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
+                    SELECT 1 FROM user_balance_checkpoints ub
+                    WHERE ub.user_id = ak.user_id AND ub.balance > 0
+                )))
+                OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
+                    NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    )
+                )
+            )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
+            AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
+                )
+            )
+            -- Inference data plane only: platform (management) keys must never
+            -- enter onwards' key set. Mirrors is_inference_purpose in
+            -- db::models::api_keys (SQL cannot call it). The system key is
+            -- purpose 'platform' (it calls admin endpoints, see migration 071)
+            -- but is used internally for onwards inference, so it is exempt.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
+            )
+        ) ak ON true
+        WHERE dm.deleted = FALSE
+          AND dm.is_composite = FALSE
+        ORDER BY dm.id, ak.id
+        "#,
+        escalation_models
+    )
+    .fetch_all(db)
+    .await?;
+
+    let query_duration = query_start.elapsed();
+    debug!(
+        "Regular (non-composite) deployed models query completed in {:?}, fetched {} rows",
+        query_duration,
+        rows.len()
+    );
+
+    let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
+    for row in rows {
+        let deployment_id = row.deployment_id;
+        let aimd = row.aimd.map(serde_json::from_value).transpose()?;
+        let target = targets_map.entry(deployment_id).or_insert_with(|| {
+            OnwardsTarget {
+                model_name: row.model_name.clone(),
+                alias: row.alias.clone(),
+                sanitize_responses: row.sanitize_responses,
+                trusted: row.trusted,
+                reasoning_translation: resolve_reasoning_translation(
+                    row.endpoint_reasoning_translation.clone(),
+                    row.model_reasoning_translation_overrides.clone(),
+                    &row.alias,
+                ),
+                routing_rules: Vec::new(),
+                fallback_enabled: row.fallback_enabled.unwrap_or(true),
+                fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status.clone(),
+                fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
+                fallback_max_attempts: row.fallback_max_attempts,
+                backoff_enabled: row.backoff_enabled,
+                backoff_initial_ms: row.backoff_initial_ms,
+                backoff_max_ms: row.backoff_max_ms,
+                backoff_factor: row.backoff_factor,
+                backoff_jitter: row.backoff_jitter.clone(),
+                backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd,
+                endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
+                endpoint_api_key: row.endpoint_api_key.clone(),
+                auth_header_name: row.auth_header_name.clone(),
+                auth_header_prefix: row.auth_header_prefix.clone(),
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
+                api_keys: Vec::new(),
+                has_key_grants: false,
+            }
+        });
+
+        target.has_key_grants |= row.api_key_id.is_some();
+
+        if let (
+            Some(api_key_id),
+            Some(api_key_secret_hash),
+            Some(api_key_purpose),
+            Some(zero_data_retention),
+            Some(user_id),
+            Some(username),
+        ) = (
+            row.api_key_id,
+            row.api_key_id.and_then(|id| key_hash(id, row.api_key_secret_hash)),
+            row.api_key_purpose,
+            row.api_key_user_zero_data_retention,
+            row.api_key_user_id,
+            row.api_key_user_username,
+        ) {
+            target.api_keys.push(OnwardsApiKey {
+                id: api_key_id,
+                secret_hash: api_key_secret_hash,
+                purpose: api_key_purpose,
+                zero_data_retention,
+                user_id,
+                username,
+                display_name: row.api_key_user_display_name,
+            });
+        }
+    }
+
+    debug!("Loaded {} deployed models", targets_map.len());
+
+    let composites = load_composite_models_from_db(db, escalation_models).await?;
+
+    let traffic_rule_rows = sqlx::query!(
+        r#"
+        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,
+               dm.alias as "redirect_target_alias?"
+        FROM model_traffic_rules mtr
+        LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id
+        WHERE mtr.deployed_model_id IN (
+            SELECT id FROM deployed_models WHERE deleted = FALSE
+        )
+        ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut routing_rules_map: HashMap<DeploymentId, Vec<RoutingRule>> = HashMap::new();
+    for rule_row in traffic_rule_rows {
+        let routing_rule = RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), rule_row.api_key_purpose)]),
+            action: match rule_row.action.as_str() {
+                "deny" => RoutingAction::Deny,
+                "redirect" => RoutingAction::Redirect {
+                    target: rule_row.redirect_target_alias.unwrap_or_default(),
+                },
+                _ => continue,
+            },
+        };
+        routing_rules_map.entry(rule_row.deployed_model_id).or_default().push(routing_rule);
+    }
+
+    for (deployment_id, target) in &mut targets_map {
+        if let Some(rules) = routing_rules_map.remove(deployment_id) {
+            target.routing_rules = rules;
+        }
+    }
+
+    let targets: Vec<_> = targets_map.into_values().collect();
+
+    let composites: Vec<_> = composites
+        .into_iter()
+        .map(|mut c| {
+            if let Some(rules) = routing_rules_map.remove(&c.id) {
+                c.routing_rules = rules;
+            }
+            c
+        })
+        .collect();
+
+    let overlays = load_overlays_from_db(db).await?;
+    let inflight_overrides = load_inflight_overrides_from_db(db).await?;
+    let accounts = load_accounts_from_db(db).await?;
+
+    let config = convert_to_config_file(
+        targets,
+        composites,
+        strict_mode,
+        &overlays,
+        &inflight_overrides,
+        accounts,
+        default_batch_inflight_capacity,
+    );
+
+    Targets::from_config(config)
+}
+
+async fn update_daemon_capacity_limits(
+    db: &PgPool,
+    limits: &Arc<dashmap::DashMap<String, usize>>,
+    default_capacity: usize,
+) -> Result<(), anyhow::Error> {
+    let models = sqlx::query!(
+        r#"
+        SELECT alias, batch_capacity
+        FROM deployed_models
+        WHERE deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut active_models = std::collections::HashSet::new();
+
+    for model in &models {
+        let capacity = match model.batch_capacity {
+            Some(c) if c > 0 => c as usize,
+            Some(c) => {
+                warn!(
+                    alias = %model.alias,
+                    batch_capacity = c,
+                    "Invalid non-positive batch_capacity; using default_capacity"
+                );
+                default_capacity
+            }
+            None => default_capacity,
+        };
+        active_models.insert(model.alias.clone());
+        limits.insert(model.alias.clone(), capacity);
+        debug!("Updated daemon capacity limit for model '{}': {}", model.alias, capacity);
+    }
+
+    limits.retain(|model_alias, _| active_models.contains(model_alias));
+
+    debug!("Updated {} model capacity limits for daemon", limits.len());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
