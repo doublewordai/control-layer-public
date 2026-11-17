@@ -8,6 +8,7 @@ pub mod databases;
 pub mod internal_credential;
 pub mod modalities;
 pub mod nvext_billing;
+pub mod openrouter_models;
 pub mod rejections;
 pub mod request_log_credentials;
 pub mod responses;

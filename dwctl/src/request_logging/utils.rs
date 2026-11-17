@@ -175,6 +175,19 @@ pub(crate) fn decompress_response_if_needed(
     }
 }
 
+pub(crate) fn header_map(request_data: &outlet::RequestData) -> axum::http::HeaderMap {
+    request_data
+        .headers
+        .iter()
+        .flat_map(|(name, values)| {
+            let name = axum::http::HeaderName::from_bytes(name.as_bytes()).ok();
+            values
+                .iter()
+                .filter_map(move |value| Some((name.clone()?, axum::http::HeaderValue::from_bytes(value).ok()?)))
+        })
+        .collect()
+}
+
 pub(crate) fn extract_header_as_uuid(request_data: &outlet::RequestData, header_name: &str) -> Option<uuid::Uuid> {
     request_data
         .headers

@@ -42,6 +42,7 @@ pub struct MessagesRequest {
     pub top_p: Option<f32>,
     pub tool_count: i32,
     pub message_count: Option<i32>,
+    pub tool_choice: Option<&'static str>,
 }
 
 impl MessagesRequest {
@@ -60,6 +61,9 @@ impl MessagesRequest {
             top_p: value.get("top_p").and_then(Value::as_f64).map(|t| t as f32),
             tool_count: array_len("tools").unwrap_or(0),
             message_count: array_len("messages"),
+            tool_choice: value
+                .get("tool_choice")
+                .and_then(crate::request_logging::tool_calls::tool_choice_mode),
         }
     }
 }

@@ -67,6 +67,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
             tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
         }
+        rejections::record_caller(&req, None);
         return next.run(req).await;
     }
 
@@ -158,6 +159,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
+    rejections::record_caller(&parts, Some(model));
     let refuse =
         |response: Response, code: &'static str, param: Option<&str>| rejections::refuse(&parts, response, code, param, Some(model));
     let invalid = |message: &str, code: &'static str, param: &'static str| invalid_request(&parts, Some(model), message, code, param);

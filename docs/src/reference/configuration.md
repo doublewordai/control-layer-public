@@ -692,6 +692,29 @@ over the cap is refused with `529` and code `batch_capacity_exceeded` (never
 `429`), naming the model and its cap, so the batch dispatcher backs off without
 spending a retry attempt and reschedules the request later.
 
+## OpenRouter Model Feed
+
+`GET /ai/v1/integrations/openrouter/models` lists models in OpenRouter's
+[V2 provider format](https://openrouter.ai/docs/guides/providers/integration),
+for OpenRouter's provider monitor to poll. It takes any inference API key, like
+`/ai/v1/models`, and lists the models that key's owner may use **and** that
+carry an OpenRouter listing (`settings.openrouter` in the
+[model catalog](./model-provisioning.md#openrouter-listing)). Prices are that
+account's realtime tariff, with cache-read and cache-write prices from its
+cache pricing. `/ai/v1/models` is unchanged.
+
+```yaml
+integrations:
+  openrouter:
+    # Declared on every document; empty (the default) leaves the field out.
+    datacenters:
+      - country_code: US     # ISO 3166-1 alpha-2, upper case
+        region: example-1    # optional
+```
+
+Request parameters in `onwards.rejected_params` are never declared, except
+where `onwards.model_allowed_params` allows them for the model.
+
 ## Account Scheduling: Tolerations and Provider Fallback
 
 Two account settings influence scheduling, and they are deliberately separate.

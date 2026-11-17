@@ -16,7 +16,7 @@ By the end of this tutorial, you'll have the Control Layer running locally and w
 Download the Docker Compose file and start the stack:
 
 ```bash
-wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/main/docker-compose.yml
+wget https://raw.githubusercontent.com/doublewordai/control-layer-public/refs/heads/main/docker-compose.yml
 docker compose up -d
 ```
 

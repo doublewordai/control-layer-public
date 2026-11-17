@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
 COPY dwctl/ dwctl/
 COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/

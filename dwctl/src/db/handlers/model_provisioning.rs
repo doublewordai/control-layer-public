@@ -519,6 +519,18 @@ impl<'c> ModelProvisioning<'c> {
         .await
         .with_context(|| format!("upsert model alias {alias:?}"))?;
 
+        let openrouter = settings.openrouter.as_ref().map(sqlx::types::Json);
+        sqlx::query(
+            "UPDATE deployed_models SET openrouter = $1, updated_at = $2 \
+             WHERE alias = $3 AND openrouter IS DISTINCT FROM $1",
+        )
+        .bind(openrouter)
+        .bind(effective_at)
+        .bind(alias)
+        .execute(&mut *self.db)
+        .await
+        .with_context(|| format!("set OpenRouter listing for model alias {alias:?}"))?;
+
         if let Some(limit) = settings.realtime_inflight_limit {
             sqlx::query(
                 "UPDATE deployed_models SET realtime_inflight_limit = $1, updated_at = $2 \

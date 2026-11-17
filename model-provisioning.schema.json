@@ -331,9 +331,309 @@
         },
         "reasoning_translation_overrides": {
           "default": null
+        },
+        "openrouter": {
+          "description": "How the model is offered on OpenRouter; omit to leave it out of\nOpenRouter's feed. Virtual models only. See [`crate::openrouter`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenRouterListing"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
+    },
+    "OpenRouterListing": {
+      "description": "How one model is offered on OpenRouter.",
+      "type": "object",
+      "properties": {
+        "hugging_face_id": {
+          "description": "Hugging Face id OpenRouter matches the model by when it first stages it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slug": {
+          "description": "OpenRouter model slug (`author/name`), used to attach a new entry that\nhas no Hugging Face match.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_ready": {
+          "description": "Whether OpenRouter may serve the model. `false` keeps a new endpoint\nstaged but hidden, and hides a live one. Defaults to `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "max_output_tokens": {
+          "description": "The largest completion the model serves, in tokens. Also caps the\ndeclared `max_tokens` parameter.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "deprecation_date": {
+          "description": "Retirement date, a few weeks ahead of shutting the model down.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date"
+        },
+        "media_inputs": {
+          "description": "Media inputs the model accepts and how they may be supplied. An empty\nlist turns that input off for the endpoint; an omitted kind is not declared.",
+          "type": "object",
+          "properties": {
+            "audio": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MediaSource"
+              }
+            },
+            "file": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MediaSource"
+              }
+            },
+            "image": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MediaSource"
+              }
+            },
+            "video": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MediaSource"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "supported_parameters": {
+          "description": "Changes to the default request parameters for the model's output:\na descriptor adds or replaces a parameter, `null` removes it. Parameters\nthe gateway refuses (`onwards.rejected_params`) are never declared.",
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ParameterDescriptor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "MediaSource": {
+      "type": "string",
+      "enum": [
+        "url",
+        "base64"
+      ]
+    },
+    "ParameterDescriptor": {
+      "description": "What a request parameter accepts, in OpenRouter's descriptor grammar.\nEach variant carries only the keys the schema allows for its `type`.",
+      "oneOf": [
+        {
+          "description": "Any number in `[min, max]`.",
+          "type": "object",
+          "properties": {
+            "min": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "max": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "default": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "format": "double"
+            },
+            "unit": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DescriptorUnit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "range"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Any integer in `[min, max]`.",
+          "type": "object",
+          "properties": {
+            "min": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "max": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "default": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "unit": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/DescriptorUnit"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "const": "integer"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Supported when present. Empty struct variants (not unit variants) so\nthat `deny_unknown_fields` refuses extra keys on them too.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "A discrete allowlist.",
+          "type": "object",
+          "properties": {
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EnumValue"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "enum"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "values"
+          ]
+        },
+        {
+          "description": "A list of values.",
+          "type": "object",
+          "properties": {
+            "max_items": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "type": {
+              "type": "string",
+              "const": "array"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Accepted, with a value domain that is not described.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "DescriptorUnit": {
+      "type": "string",
+      "enum": [
+        "second",
+        "pixel",
+        "byte",
+        "token",
+        "character"
+      ]
+    },
+    "EnumValue": {
+      "description": "An `enum` descriptor value: OpenRouter allows strings and numbers.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "number",
+          "format": "double"
+        },
+        {
+          "type": "string"
+        }
+      ]
     },
     "PhysicalDeployment": {
       "type": "object",
@@ -383,6 +683,10 @@
           "default": null
         },
         "settings": {
+          "description": "The OpenRouter listing belongs to the virtual model (`clay.settings`).",
+          "properties": {
+            "openrouter": false
+          },
           "$ref": "#/$defs/ModelSettings",
           "default": {
             "requests_per_second": null,

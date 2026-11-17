@@ -14,6 +14,7 @@ use sqlx::PgPool;
 
 use crate::db::handlers::ModelProvisioning;
 use crate::db::models::deployments::AffinityConfig;
+use crate::openrouter::listing::OpenRouterListing;
 
 const PER_MILLION: i64 = 1_000_000;
 
@@ -184,6 +185,8 @@ pub struct ModelSettings {
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     pub metadata: serde_json::Value,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<OpenRouterListing>,
 }
 
 impl Default for ModelSettings {
@@ -200,6 +203,7 @@ impl Default for ModelSettings {
             allowed_batch_completion_windows: None,
             metadata: serde_json::json!({}),
             reasoning_translation_overrides: None,
+            openrouter: None,
         }
     }
 }
@@ -219,6 +223,7 @@ pub struct PhysicalDeployment {
     #[serde(default)]
     pub capabilities: Option<Vec<String>>,
     #[serde(default)]
+    #[schemars(extend("properties" = {"openrouter": false}))]
     pub settings: ModelSettings,
     #[serde(default)]
     pub provider_pricing: Option<ProviderPricing>,
@@ -519,6 +524,12 @@ impl Catalog {
                 ensure_nonempty(&deployment.endpoint, &model.source, "deployment.endpoint")?;
                 validate_settings(&deployment.settings, &model.source, "deployment.settings")?;
                 ensure!(
+                    deployment.settings.openrouter.is_none(),
+                    "{}: deployment.settings.openrouter is set on {:?}; OpenRouter lists the virtual model, so the listing belongs in clay.settings",
+                    model.source,
+                    deployment.alias
+                );
+                ensure!(
                     deployment.settings.realtime_inflight_limit.is_none(),
                     "{}: deployment.settings.realtime_inflight_limit is set on {:?}; the limit belongs to the virtual model in clay.settings",
                     model.source,
@@ -795,6 +806,11 @@ fn validate_settings(settings: &ModelSettings, source: &str, field: &str) -> Res
         ensure!(value > 0.0, "{source}: {field}.throughput must be positive");
     }
     ensure!(settings.metadata.is_object(), "{source}: {field}.metadata must be an object");
+    if let Some(listing) = &settings.openrouter {
+        listing
+            .validate()
+            .map_err(|error| anyhow::anyhow!("{source}: {field}.openrouter: {error}"))?;
+    }
     Ok(())
 }
 
@@ -1160,6 +1176,105 @@ clay:
         write(directory.path(), "model.yaml", &omitted);
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
         assert_eq!(limits().await.0, 250);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn catalog_owns_the_openrouter_listing(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let stored = || async {
+            sqlx::query_as::<_, (String, Option<serde_json::Value>)>("SELECT alias, openrouter FROM deployed_models ORDER BY alias")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert!(
+            stored().await.iter().all(|(_, listing)| listing.is_none()),
+            "no listing until declared"
+        );
+
+        let listed = omitted.replace(
+            "  settings:\n    sanitize_responses: true\n  deployments:",
+            r#"  settings:
+    sanitize_responses: true
+    openrouter:
+      hugging_face_id: org/model
+      is_ready: true
+      max_output_tokens: 32768
+      media_inputs:
+        image: [url, base64]
+      supported_parameters:
+        top_k: null
+  deployments:"#,
+        );
+        assert_ne!(listed, omitted);
+        write(directory.path(), "model.yaml", &listed);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let rows = stored().await;
+        let listing = rows.iter().find(|(alias, _)| alias == "org/model").unwrap().1.clone();
+        assert_eq!(
+            listing,
+            Some(serde_json::json!({
+                "hugging_face_id": "org/model",
+                "is_ready": true,
+                "max_output_tokens": 32768,
+                "media_inputs": {"image": ["url", "base64"]},
+                "supported_parameters": {"top_k": null},
+            }))
+        );
+        assert!(
+            rows.iter()
+                .filter(|(alias, _)| alias != "org/model")
+                .all(|(_, listing)| listing.is_none()),
+            "only the virtual model is listed"
+        );
+
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert!(stored().await.iter().all(|(_, listing)| listing.is_none()));
+    }
+
+    #[test]
+    fn openrouter_listings_are_validated_and_belong_to_the_virtual_model() {
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        for (settings, error) in [
+            (
+                "    openrouter:\n      max_output_tokens: 0\n",
+                "clay.settings.openrouter: max_output_tokens must be positive",
+            ),
+            (
+                "    openrouter:\n      max_output_tokens: 9007199254740992\n",
+                "clay.settings.openrouter: max_output_tokens must be at most 9007199254740991",
+            ),
+            (
+                "    openrouter:\n      supported_parameters:\n        stop: {type: array, max_items: 9007199254740992}\n",
+                "supported_parameters.stop: max_items must be at most 9007199254740991",
+            ),
+            ("    openrouter:\n      price: 1\n", "unknown field `price`"),
+        ] {
+            let directory = tempdir().unwrap();
+            let yaml = omitted.replace(
+                "  settings:\n    sanitize_responses: true\n  deployments:",
+                &format!("  settings:\n    sanitize_responses: true\n{settings}  deployments:"),
+            );
+            write(directory.path(), "model.yaml", &yaml);
+            let message = format!("{:#}", Catalog::load(directory.path()).unwrap_err());
+            assert!(message.contains(error), "{message}");
+        }
+
+        let directory = tempdir().unwrap();
+        let yaml = omitted.replace(
+            "      settings:\n        sanitize_responses: true\n",
+            "      settings:\n        sanitize_responses: true\n        openrouter:\n          is_ready: true\n",
+        );
+        assert_ne!(yaml, omitted);
+        write(directory.path(), "model.yaml", &yaml);
+        let message = format!("{:#}", Catalog::load(directory.path()).unwrap_err());
+        assert!(message.contains("deployment.settings.openrouter is set"), "{message}");
     }
 
     #[test]

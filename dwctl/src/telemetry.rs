@@ -2,6 +2,7 @@
 use axum::{extract::Request, middleware::Next, response::Response};
 use chrono::{SecondsFormat, Utc};
 use onwards::{ErrorOrigin, RequestIdentity, ServedBy};
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
 pub use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -63,31 +64,10 @@ pub async fn carry_batch_completion_window(request: Request, next: Next) -> Resp
 pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span: &tracing::Span, status: u16) {
     let extensions = response.extensions();
     if let Some(identity) = extensions.get::<RequestIdentity>() {
+        record_identity_attributes(identity, span);
         let batch = identity.key_purpose.as_deref() == Some("batch");
-        span.set_attribute("doubleword.traffic", if batch { "batch" } else { "realtime" });
         if batch && let Some(BatchCompletionWindow(window)) = extensions.get() {
             span.set_attribute("doubleword.batch.completion_window", window.clone());
-        }
-        let (model, class) = identity
-            .model
-            .as_deref()
-            .map(|name| {
-                let (model, class) = split_served(name);
-                (Some(model.to_owned()), Some(class.unwrap_or(STANDARD_CLASS).to_owned()))
-            })
-            .unwrap_or_default();
-        let attrs = [
-            ("doubleword.account_id", identity.account_id.clone()),
-            ("doubleword.account_name", identity.account_name.clone()),
-            ("doubleword.api_key_id", identity.api_key_id.map(|id| id.to_string())),
-            ("doubleword.key_purpose", identity.key_purpose.clone()),
-            ("gen_ai.request.model", model),
-            ("doubleword.serving_class", class),
-        ];
-        for (key, value) in attrs {
-            if let Some(value) = value {
-                span.set_attribute(key, value);
-            }
         }
     }
     if status >= 400 {
@@ -101,6 +81,47 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
         span.set_attribute("doubleword.error.source", source);
         if let Some(code) = code.filter(|code| !code.is_empty()) {
             span.set_attribute("doubleword.rejection.code", code);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestSpan(pub tracing::Span);
+
+#[derive(Clone, Debug)]
+pub struct TraceParent(pub opentelemetry::trace::SpanContext);
+
+pub async fn carry_trace_parent(request: Request, next: Next) -> Response {
+    let parent = tracing::Span::current().context().span().span_context().clone();
+    let mut response = next.run(request).await;
+    if parent.is_valid() {
+        response.extensions_mut().insert(TraceParent(parent));
+    }
+    response
+}
+
+pub fn record_identity_attributes(identity: &RequestIdentity, span: &tracing::Span) {
+    let batch = identity.key_purpose.as_deref() == Some("batch");
+    span.set_attribute("doubleword.traffic", if batch { "batch" } else { "realtime" });
+    let (model, class) = identity
+        .model
+        .as_deref()
+        .map(|name| {
+            let (model, class) = split_served(name);
+            (Some(model.to_owned()), Some(class.unwrap_or(STANDARD_CLASS).to_owned()))
+        })
+        .unwrap_or_default();
+    let attrs = [
+        ("doubleword.account_id", identity.account_id.clone()),
+        ("doubleword.account_name", identity.account_name.clone()),
+        ("doubleword.api_key_id", identity.api_key_id.map(|id| id.to_string())),
+        ("doubleword.key_purpose", identity.key_purpose.clone()),
+        ("gen_ai.request.model", model),
+        ("doubleword.serving_class", class),
+    ];
+    for (key, value) in attrs {
+        if let Some(value) = value {
+            span.set_attribute(key, value);
         }
     }
 }

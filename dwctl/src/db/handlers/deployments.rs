@@ -28,6 +28,13 @@ pub struct BatchModelInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct OpenRouterListingRow {
+    pub id: DeploymentId,
+    pub alias: String,
+    pub listing: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
 pub struct DeploymentFilter {
     pub skip: i64,
     pub limit: i64,
@@ -1419,6 +1426,33 @@ impl<'c> Deployments<'c> {
             }
         }
         Ok(info)
+    }
+
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn list_openrouter_listings(&mut self, user_id: UserId) -> Result<Vec<OpenRouterListingRow>> {
+        let rows = sqlx::query_as!(
+            OpenRouterListingRow,
+            r#"
+            SELECT dm.id, dm.alias, dm.openrouter AS "listing!"
+            FROM deployed_models dm
+            WHERE dm.deleted = FALSE
+              AND dm.status = 'active'
+              AND dm.openrouter IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM deployment_groups dg
+                  WHERE dg.deployment_id = dm.id
+                    AND (
+                        dg.group_id = '00000000-0000-0000-0000-000000000000'
+                        OR dg.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $1)
+                    )
+              )
+            ORDER BY dm.alias
+            "#,
+            user_id,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(rows)
     }
 
     #[instrument(level = "debug", skip(self, aliases), fields(count = aliases.len()), err)]

@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "17.2.0"
+version = "17.3.0"
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -136,29 +136,8 @@ http-body = "1"
 http-body-util = "0.1"
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
-async-stripe = { version = "1.0.0-rc.0", default-features = false, features = [
-  "rustls-tls-webpki-roots",
-  "rustls-aws-lc-rs",
-] }
-async-stripe-checkout = { version = "1.0.0-rc.0", features = [
-  "checkout_session",
-] }
-async-stripe-webhook = { version = "1.0.0-rc.0", features = [
-  "async-stripe-checkout",
-  "deserialize",
-] }
-async-stripe-types = { version = "1.0.0-rc.0" }
-async-stripe-shared = { version = "1.0.0-rc.0" }
-async-stripe-core = { version = "1.0.0-rc.0", features = [
-  "payment_intent",
-  "customer",
-] }
-async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
+dwctl-stripe = { path = "../crates/dwctl-stripe" }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
-async-stripe-billing = { version = "1.0.0-rc.0", features = [
-  "billing_portal_session",
-  "invoice_item",
-] }
 sqlx-pool-router = "1.0"
 minijinja = "2.15.1"
 multer = "3.1.0"
@@ -175,7 +154,6 @@ google-cloud-auth = "1.10"
 dwctl-test-macros = { path = "test-macros" }
 dotenvy = "0.15"
 axum-test = { version = "18.4.1" }
-miniserde = "0.1"
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
@@ -191,6 +169,7 @@ tempfile = "3.0"
 wiremock = "0.6"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 serde_urlencoded = "0.7"
+jsonschema = { version = "0.61", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.7.0", features = ["profiling"] }

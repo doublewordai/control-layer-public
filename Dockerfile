@@ -4,6 +4,7 @@ WORKDIR /app
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
 COPY dwctl/ dwctl/
 COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
@@ -43,6 +44,7 @@ WORKDIR /app
 # Copy source and build
 COPY Cargo.toml Cargo.lock ./
 COPY .sqlx/ .sqlx/
+COPY crates/ crates/
 COPY dwctl/ dwctl/
 COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/

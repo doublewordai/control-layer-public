@@ -83,6 +83,8 @@ pub struct Config {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
     #[serde(default)]
+    pub integrations: IntegrationsConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
     pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
@@ -194,6 +196,18 @@ pub struct OpenApiConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryConfig {
     pub list_class_routes: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IntegrationsConfig {
+    pub openrouter: OpenRouterIntegrationConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OpenRouterIntegrationConfig {
+    pub datacenters: Vec<crate::openrouter::document::Datacenter>,
 }
 
 impl Default for OpenApiConfig {
@@ -2186,6 +2200,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             discovery: DiscoveryConfig::default(),
+            integrations: IntegrationsConfig::default(),
             cache: CacheConfig::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
@@ -2489,6 +2504,20 @@ impl Config {
         }) {
             return Err(Error::Internal {
                 operation: format!("Config validation: onwards.model_allowed_params.{model} names an unknown parameter: {name}"),
+            });
+        }
+        if let Some(datacenter) = self
+            .integrations
+            .openrouter
+            .datacenters
+            .iter()
+            .find(|datacenter| !datacenter.is_valid())
+        {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: integrations.openrouter.datacenters has country_code {:?}; use an upper-case ISO 3166-1 alpha-2 code",
+                    datacenter.country_code
+                ),
             });
         }
         if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
@@ -3151,6 +3180,31 @@ mod tests {
             .insert("example/model".to_string(), vec!["logprob".to_string()]);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("onwards.model_allowed_params.example/model names an unknown parameter: logprob"));
+    }
+
+    #[test]
+    fn openrouter_datacenters_need_country_codes() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.integrations = serde_yaml::from_str(
+            r#"
+openrouter:
+  datacenters:
+    - country_code: US
+      region: example-1
+    - country_code: FR
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.integrations.openrouter.datacenters.len(), 2);
+
+        config.integrations.openrouter.datacenters[1].country_code = "fra".to_string();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("integrations.openrouter.datacenters has country_code \"fra\""),
+            "{error}"
+        );
     }
 
     #[test]

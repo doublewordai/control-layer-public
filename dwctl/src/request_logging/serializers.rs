@@ -5,6 +5,8 @@ use crate::request_logging::models::{
     AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, MessagesRequest, ParsedAIRequest, ResponsesRequest,
 };
 use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
+use crate::request_logging::tool_calls::named_tool_choice_mode;
+use onwards::strict::schemas::chat_completions::ToolChoice;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
@@ -107,6 +109,8 @@ pub struct RequestParams {
     pub n: Option<i32>,
     pub tool_count: Option<i32>,
     pub message_count: Option<i32>,
+    #[serde(default)]
+    pub tool_choice: Option<String>,
 }
 
 impl RequestParams {
@@ -123,6 +127,7 @@ impl RequestParams {
                 n: None,
                 tool_count: Some(req.tool_count),
                 message_count: req.message_count,
+                tool_choice: req.tool_choice.map(String::from),
             };
         }
         match &parsed.request {
@@ -134,6 +139,14 @@ impl RequestParams {
                 n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
                 tool_count: Some(req.tools.as_ref().map(|t| t.len()).unwrap_or(0) as i32),
                 message_count: Some(req.messages.len() as i32),
+                tool_choice: req
+                    .tool_choice
+                    .as_ref()
+                    .map(|choice| match choice {
+                        ToolChoice::Mode(mode) => named_tool_choice_mode(mode),
+                        ToolChoice::Specific { .. } => "function",
+                    })
+                    .map(String::from),
             },
             AiRequest::Completions(req) => Self {
                 stream: Some(req.stream.unwrap_or(false)),
@@ -143,6 +156,7 @@ impl RequestParams {
                 n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
                 tool_count: None,
                 message_count: None,
+                tool_choice: None,
             },
             AiRequest::Embeddings(_) | AiRequest::Other(_) => Self::default(),
         }
@@ -2392,6 +2406,7 @@ mod tests {
                 n: None,
                 tool_count: Some(2),
                 message_count: Some(3),
+                tool_choice: None,
             }
         );
     }
@@ -2869,7 +2884,26 @@ mod tests {
                 n: Some(1),
                 tool_count: Some(1),
                 message_count: Some(3),
+                tool_choice: None,
             }
+        );
+    }
+
+    #[test]
+    fn request_params_read_the_tool_choice_mode() {
+        let body = |tool_choice: serde_json::Value| {
+            serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "u"}], "tool_choice": tool_choice}).to_string()
+        };
+        let mode = |tool_choice| params_for("/chat/completions", &body(tool_choice)).tool_choice;
+        assert_eq!(mode(serde_json::json!("required")).as_deref(), Some("required"));
+        assert_eq!(mode(serde_json::json!("auto")).as_deref(), Some("auto"));
+        assert_eq!(
+            mode(serde_json::json!({"type": "function", "function": {"name": "get_weather"}})).as_deref(),
+            Some("function")
+        );
+        assert_eq!(
+            params_for("/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"u"}]}"#).tool_choice,
+            None
         );
     }
 

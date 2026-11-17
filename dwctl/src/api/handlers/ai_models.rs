@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{QueryBuilder, Row};
+use sqlx::{Postgres, QueryBuilder, Row, pool::PoolConnection};
 use sqlx_pool_router::PoolProvider;
 
 use crate::crypto::hash_api_key;
@@ -23,6 +23,7 @@ use crate::{
     db::handlers::{Deployments, Repository},
     inference::rejections::{self, Origin, Recorder, bearer_token},
     reasoning::SupportedReasoningEfforts,
+    types::{DeploymentId, UserId},
 };
 
 const EVERYONE_GROUP_ID: uuid::Uuid = uuid::Uuid::nil();
@@ -85,7 +86,7 @@ struct ModelObject {
     cache_pricing: Option<CachePricingResponse>,
 }
 
-fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
+pub(crate) fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
     (
         status,
         Json(json!({
@@ -100,7 +101,7 @@ fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str)
         .into_response()
 }
 
-fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
+pub(crate) fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
     tracing::error!(%error, operation, "Failed to list AI models");
     openai_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -136,43 +137,32 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 }
 
 #[allow(clippy::result_large_err)]
-#[tracing::instrument(skip_all)]
-pub async fn list_ai_models<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    Query(query): Query<ModelsListQuery>,
-    recorder: Option<Extension<Recorder>>,
-    presented: Option<Extension<onwards::auth::PresentedKey>>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Result<Json<ModelsListResponse>, Response> {
-    let origin = Origin::new(recorder.as_ref().map(|Extension(recorder)| recorder), &headers, uri.path());
+pub(crate) fn presented_key_hash(
+    presented: Option<&onwards::auth::PresentedKey>,
+    headers: &HeaderMap,
+    origin: Origin<'_>,
+) -> Result<[u8; 32], Response> {
     let key_hash = match presented {
-        Some(Extension(onwards::auth::PresentedKey(hash))) => Some(*hash.as_bytes()),
-        None => bearer_token(&headers).map(hash_api_key),
+        Some(onwards::auth::PresentedKey(hash)) => Some(*hash.as_bytes()),
+        None => bearer_token(headers).map(hash_api_key),
     };
-    let Some(key_hash) = key_hash else {
+    key_hash.ok_or_else(|| {
         let response = openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing Authorization header",
             "authentication_error",
             "missing_authorization",
         );
-        return Err(rejections::refuse(origin, response, "missing_authorization", None, None));
-    };
+        rejections::refuse(origin, response, "missing_authorization", None, None)
+    })
+}
 
-    let refuse_query = |error: ModelsListQueryError| error.refuse(origin);
-    let group_ids = parse_group_filter(query.group.as_deref()).map_err(refuse_query)?;
-    let available_for_realtime =
-        parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref()).map_err(refuse_query)?;
-    let include_reasoning_capabilities =
-        parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
-            .map_err(refuse_query)?
-            .unwrap_or(false);
-    let include_pricing = query
-        .include
-        .as_deref()
-        .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
-
+#[allow(clippy::result_large_err)]
+pub(crate) async fn resolve_discovery_key<P: PoolProvider>(
+    state: &AppState<P>,
+    key_hash: &[u8; 32],
+    origin: Origin<'_>,
+) -> Result<uuid::Uuid, Response> {
     let key = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
         r#"
         SELECT ak.id, ak.user_id
@@ -200,6 +190,78 @@ pub async fn list_ai_models<P: PoolProvider>(
         return Err(rejections::refuse(origin, response, "invalid_api_key", None, None));
     };
     state.api_key_usage.record(api_key_id);
+    Ok(user_id)
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) async fn customer_priced_models<P: PoolProvider>(
+    state: &AppState<P>,
+    mut conn: PoolConnection<Postgres>,
+    model_ids: Vec<DeploymentId>,
+    account: UserId,
+) -> Result<Vec<DeployedModelResponse>, Response> {
+    let mut repo = Deployments::new(&mut conn);
+    let mut rules = repo
+        .get_traffic_rules_bulk(&model_ids)
+        .await
+        .map_err(|e| database_error("load_pricing_traffic_rules", e))?;
+    let models = repo
+        .get_bulk(model_ids)
+        .await
+        .map_err(|e| database_error("load_priced_models", e))?
+        .into_values()
+        .map(|model| {
+            let traffic_rules = rules.remove(&model.id).unwrap_or_default();
+            DeployedModelResponse::from(model).with_traffic_rules(traffic_rules)
+        })
+        .collect();
+    drop(conn);
+    DeployedModelEnricher {
+        db: &state.db.read(),
+        include_groups: false,
+        include_metrics: false,
+        include_status: false,
+        include_pricing: true,
+        include_endpoints: false,
+        include_components: false,
+        can_read_pricing: false,
+        can_read_rate_limits: false,
+        can_read_users: false,
+        pricing_account: Some(account),
+        can_read_composite_info: false,
+    }
+    .enrich_many(models)
+    .await
+    .map_err(|e| database_error("load_customer_pricing", e))
+}
+
+#[allow(clippy::result_large_err)]
+#[tracing::instrument(skip_all)]
+pub async fn list_ai_models<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Query(query): Query<ModelsListQuery>,
+    recorder: Option<Extension<Recorder>>,
+    presented: Option<Extension<onwards::auth::PresentedKey>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<ModelsListResponse>, Response> {
+    let origin = Origin::new(recorder.as_ref().map(|Extension(recorder)| recorder), &headers, uri.path());
+    let key_hash = presented_key_hash(presented.as_ref().map(|Extension(key)| key), &headers, origin)?;
+
+    let refuse_query = |error: ModelsListQueryError| error.refuse(origin);
+    let group_ids = parse_group_filter(query.group.as_deref()).map_err(refuse_query)?;
+    let available_for_realtime =
+        parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref()).map_err(refuse_query)?;
+    let include_reasoning_capabilities =
+        parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
+            .map_err(refuse_query)?
+            .unwrap_or(false);
+    let include_pricing = query
+        .include
+        .as_deref()
+        .is_some_and(|includes| includes.split(',').any(|include| include.trim() == "pricing"));
+
+    let user_id = resolve_discovery_key(&state, &key_hash, origin).await?;
 
     let mut conn = state
         .db
@@ -305,43 +367,11 @@ pub async fn list_ai_models<P: PoolProvider>(
 
     let mut pricing_models = if include_pricing && !rows.is_empty() {
         let model_ids = rows.iter().map(|row| row.get("id")).collect::<Vec<_>>();
-        let mut repo = Deployments::new(&mut conn);
-        let models = repo
-            .get_bulk(model_ids.clone())
-            .await
-            .map_err(|e| database_error("load_priced_models", e))?;
-        let mut rules = repo
-            .get_traffic_rules_bulk(&model_ids)
-            .await
-            .map_err(|e| database_error("load_pricing_traffic_rules", e))?;
-        let models = models
-            .into_values()
-            .map(|model| {
-                let traffic_rules = rules.remove(&model.id).unwrap_or_default();
-                DeployedModelResponse::from(model).with_traffic_rules(traffic_rules)
-            })
-            .collect();
-        drop(conn);
-        DeployedModelEnricher {
-            db: &state.db.read(),
-            include_groups: false,
-            include_metrics: false,
-            include_status: false,
-            include_pricing: true,
-            include_endpoints: false,
-            include_components: false,
-            can_read_pricing: false,
-            can_read_rate_limits: false,
-            can_read_users: false,
-            pricing_account: Some(user_id),
-            can_read_composite_info: false,
-        }
-        .enrich_many(models)
-        .await
-        .map_err(|e| database_error("load_customer_pricing", e))?
-        .into_iter()
-        .map(|model| (model.alias.clone(), model))
-        .collect::<HashMap<_, _>>()
+        customer_priced_models(&state, conn, model_ids, user_id)
+            .await?
+            .into_iter()
+            .map(|model| (model.alias.clone(), model))
+            .collect::<HashMap<_, _>>()
     } else {
         Default::default()
     };

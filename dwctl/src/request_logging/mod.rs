@@ -4,6 +4,7 @@ pub mod credential_scrubber;
 pub mod models;
 pub mod serializers;
 pub mod stream_completion;
+pub mod tool_calls;
 mod utils;
 
 pub use analytics_handler::AnalyticsHandler;

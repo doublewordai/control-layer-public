@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT dm.id, dm.alias, dm.openrouter AS \"listing!\"\n            FROM deployed_models dm\n            WHERE dm.deleted = FALSE\n              AND dm.status = 'active'\n              AND dm.openrouter IS NOT NULL\n              AND EXISTS (\n                  SELECT 1 FROM deployment_groups dg\n                  WHERE dg.deployment_id = dm.id\n                    AND (\n                        dg.group_id = '00000000-0000-0000-0000-000000000000'\n                        OR dg.group_id IN (SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $1)\n                    )\n              )\n            ORDER BY dm.alias\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "listing!",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "fd6576718660d351d4c566af65a0301c072b36713d5a7550fbafa7eaeb5011c3"
+}

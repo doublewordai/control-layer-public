@@ -1,5 +1,33 @@
 # Changelog
 
+## [17.3.0](https://github.com/doublewordai/control-layer/compare/v17.2.0...v17.3.0) (2026-11-17)
+
+
+### Features
+
+* **openrouter:** add an OpenRouter V2 model feed (DW-1287) ([#2204](https://github.com/doublewordai/control-layer/issues/2204)) ([c2e2a5c](https://github.com/doublewordai/control-layer/commit/c2e2a5c5b882957855e1efd21a0854d9e1cc7e06))
+* **telemetry:** attribute cancelled requests and check tool-call arguments ([#2205](https://github.com/doublewordai/control-layer/issues/2205)) ([3651936](https://github.com/doublewordai/control-layer/commit/3651936b7f11e9f5248f3bae3c32b4d8f9213e25))
+
+
+### Performance Improvements
+
+* **dev:** line tables only in local builds, no dependency debuginfo (DW-1033) ([#2190](https://github.com/doublewordai/control-layer/issues/2190)) ([6c27a0c](https://github.com/doublewordai/control-layer/commit/6c27a0c86bca56e01788421606f65df60b588ccf))
+
+
+### Code Refactoring
+
+* **payments:** move Stripe API calls into a dwctl-stripe crate (DW-1033) ([#2192](https://github.com/doublewordai/control-layer/issues/2192)) ([14af476](https://github.com/doublewordai/control-layer/commit/14af476b6682138a6650de76c36154c4abe629ae))
+
+
+### Documentation
+
+* fetch docker-compose.yml from control-layer-public, as control-layer is no longer public ([#2201](https://github.com/doublewordai/control-layer/issues/2201)) ([71ad182](https://github.com/doublewordai/control-layer/commit/71ad18268a5e42d24f9bb6073ff728461a3239a1))
+
+
+### Continuous Integration
+
+* let the pull request title check read pull requests ([#2202](https://github.com/doublewordai/control-layer/issues/2202)) ([3e7574a](https://github.com/doublewordai/control-layer/commit/3e7574afbea5008cbc02b9c2fccf3324229d62c0))
+
 ## [17.2.0](https://github.com/doublewordai/control-layer/compare/v17.1.4...v17.2.0) (2026-11-17)
 
 

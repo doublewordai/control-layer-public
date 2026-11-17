@@ -31,6 +31,7 @@ pub mod modalities;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
+pub mod openrouter;
 pub mod org_overlays;
 mod payment_providers;
 mod pending_secrets;
@@ -1474,7 +1475,8 @@ pub async fn build_router(
         }
 
         if let Some(writer) = analytics_writer {
-            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
+            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone())
+                .with_key_identity(state.internal_auth_state());
             if let Some(cache) = &reference_cache {
                 analytics_handler = analytics_handler.with_reference_cache(cache.clone(), state.internal_auth_state());
             }
@@ -1871,6 +1873,10 @@ pub async fn build_router(
 
     let onwards_router = Router::new()
         .route("/models", get(api::handlers::ai_models::list_ai_models))
+        .route(
+            "/integrations/openrouter/models",
+            get(api::handlers::openrouter_models::list_openrouter_models),
+        )
         .fallback_service(onwards_router);
 
     let onwards_router = {
@@ -2028,6 +2034,7 @@ pub async fn build_router(
         };
         onwards_router
             .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
+            .layer(middleware::from_fn(crate::telemetry::carry_trace_parent))
             .layer(middleware::from_fn(request_logging::stream_completion::track_stream_completion))
             .layer(outlet_layer)
     } else {
@@ -2300,6 +2307,7 @@ async fn assign_request_id(mut request: axum::extract::Request, next: middleware
 
 async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let span = tracing::Span::current();
+    request.extensions_mut().insert(crate::telemetry::RequestSpan(span.clone()));
     let sc = span.context().span().span_context().clone();
     if sc.is_valid() {
         span.record("trace_id", tracing::field::display(sc.trace_id()));

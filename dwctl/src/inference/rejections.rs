@@ -103,6 +103,23 @@ pub(crate) fn refuse_mismatch<'a>(
     Scope::of(origin).refuse_with_reason(response, "schema_mismatch", param, reason, model)
 }
 
+pub(crate) fn record_caller<'a>(origin: impl Into<Origin<'a>>, model: Option<&str>) {
+    let origin = origin.into();
+    let span = origin
+        .extensions
+        .and_then(|extensions| extensions.get::<crate::telemetry::RequestSpan>())
+        .map_or_else(tracing::Span::current, |root| root.0.clone());
+    let Some((targets, mut context)) = Scope::of(origin).caller else {
+        return;
+    };
+    if let Some(model) = model {
+        context.set_model_if_configured(&targets, model);
+    }
+    if let Some(identity) = context.identity() {
+        crate::telemetry::record_identity_attributes(&identity, &span);
+    }
+}
+
 pub(crate) struct Scope {
     caller: Option<(Targets, RejectionContext)>,
 }

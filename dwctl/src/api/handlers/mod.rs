@@ -37,6 +37,7 @@ pub mod images;
 pub mod inference_endpoints;
 pub mod modalities;
 pub mod openapi_docs;
+pub mod openrouter_models;
 pub mod organizations;
 pub mod payments;
 pub mod probes;

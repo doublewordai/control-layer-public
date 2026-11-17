@@ -338,6 +338,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     let mut rejection =
         RejectionContext::from_request(&state, req.headers(), auth::presented_key(&req));
+    rejection.record_identity();
     let result = async {
 
     metrics::gauge!("onwards_requests_inflight").increment(1.0);

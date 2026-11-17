@@ -2,7 +2,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{Router, body::Body, extract::Request, http::StatusCode};
-use onwards::{AppState, strict::build_strict_router, target::Targets, test_utils::MockHttpClient};
+use onwards::{
+    AppState, client::HttpClient, strict::build_strict_router, target::Targets,
+    test_utils::MockHttpClient,
+};
 use opentelemetry::{Value as AttributeValue, trace::TracerProvider};
 use opentelemetry_sdk::{
     error::OTelSdkResult,
@@ -30,6 +33,23 @@ impl SpanExporter for SpanRecorder {
 }
 
 fn router() -> Router {
+    router_with(MockHttpClient::new(StatusCode::OK, COMPLETION))
+}
+
+#[derive(Debug, Clone)]
+struct StalledUpstream;
+
+#[async_trait::async_trait]
+impl HttpClient for StalledUpstream {
+    async fn request(
+        &self,
+        _req: Request,
+    ) -> Result<axum::response::Response, Box<dyn std::error::Error + Send + Sync>> {
+        std::future::pending().await
+    }
+}
+
+fn router_with<T: HttpClient + Clone + Send + Sync + 'static>(client: T) -> Router {
     let mut targets = Targets::from_config(
         serde_json::from_value(json!({
             "auth": {
@@ -45,8 +65,7 @@ fn router() -> Router {
     )
     .unwrap();
     targets.strict_mode = true;
-    let mock = MockHttpClient::new(StatusCode::OK, COMPLETION);
-    build_strict_router(AppState::with_client(targets, mock))
+    build_strict_router(AppState::with_client(targets, client))
 }
 
 async fn send(path: &str, body: Value) -> (StatusCode, Vec<SpanData>) {
@@ -255,4 +274,48 @@ async fn upstream_request_span_names_the_server_host() {
         attribute(upstream, "server.address"),
         Some(AttributeValue::from("upstream.example.com"))
     );
+}
+
+#[tokio::test]
+async fn a_cancelled_request_still_names_its_caller() {
+    let spans = SpanRecorder::default();
+    let provider = SdkTracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_simple_exporter(spans.clone())
+        .build();
+    let dispatch = Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("cancel-test"))),
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {KEY}"))
+        .body(Body::from(
+            json!({"model": ALIAS, "messages": [{"role": "user", "content": "Hello"}]}).to_string(),
+        ))
+        .unwrap();
+    let outcome = async {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            router_with(StalledUpstream)
+                .oneshot(request)
+                .instrument(tracing::info_span!("gateway_request")),
+        )
+        .await
+    }
+    .with_subscriber(dispatch)
+    .await;
+    assert!(outcome.is_err(), "the stalled upstream must not answer");
+    provider.force_flush().unwrap();
+    let spans = spans.0.lock().unwrap().clone();
+
+    let request = span(&spans, "onwards.request");
+    assert_caller(request);
+    assert_eq!(
+        attribute(request, "gen_ai.request.model"),
+        Some(AttributeValue::from(ALIAS))
+    );
+    assert_eq!(attribute(request, "http.response.status_code"), None);
 }

@@ -4,15 +4,19 @@ use std::sync::Arc;
 
 use crate::auth::internal_credential::{InternalAuthState, carried_key_hash};
 use crate::config::Config;
+use crate::inference::rejections::api_key;
 use crate::metrics::errors::component::ANALYTICS;
 use crate::reference_cache::{Completion, ReferenceCache};
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
-use crate::request_logging::stream_completion::client_disconnected;
-use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
+use crate::request_logging::tool_calls;
+use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid, header_map};
+use crate::telemetry::TraceParent;
 use axum::http::StatusCode;
 use onwards::AuthenticatedApiKeyId;
+use onwards::auth::{API_KEY_ID_LABEL, KeyHash};
 use onwards::strict::schemas::chat_completions::MessageContent;
 use openai_reassembler::CompletionEvidence;
 use outlet::{RequestData, RequestHandler, ResponseData};
@@ -85,11 +89,95 @@ fn resolve_user_agent(request_data: &RequestData) -> Option<String> {
         .map(|ua| ua.chars().take(256).collect())
 }
 
+pub const STATUS_CLIENT_CLOSED_REQUEST: i32 = 499;
+
+struct HeaderFields {
+    fusillade_batch_id: Option<Uuid>,
+    fusillade_request_id: Option<Uuid>,
+    custom_id: Option<String>,
+    batch_completion_window: Option<String>,
+    batch_request_source: String,
+    batch_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    user_agent: Option<String>,
+    x_request_id: Option<Uuid>,
+}
+
+impl HeaderFields {
+    fn read(request_data: &RequestData) -> Self {
+        Self {
+            fusillade_batch_id: extract_header_as_uuid(request_data, "x-fusillade-batch-id"),
+            fusillade_request_id: extract_header_as_uuid(request_data, "x-fusillade-request-id"),
+            custom_id: extract_header_as_string(request_data, "x-fusillade-custom-id"),
+            batch_completion_window: extract_header_as_string(request_data, "x-fusillade-batch-completion-window"),
+            batch_request_source: extract_header_as_string(request_data, "x-fusillade-batch-request-source").unwrap_or_default(),
+            batch_created_at: extract_header_as_string(request_data, "x-fusillade-batch-created-at")
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok()),
+            user_agent: resolve_user_agent(request_data),
+            x_request_id: extract_header_as_uuid(request_data, "x-request-id"),
+        }
+    }
+}
+
+fn abandoned_record(
+    instance_id: Uuid,
+    request_data: &RequestData,
+    api_key_id: Option<Uuid>,
+    config: &Config,
+    abandoned_at: std::time::SystemTime,
+) -> RawAnalyticsRecord {
+    let headers = HeaderFields::read(request_data);
+    let duration_ms = abandoned_at.duration_since(request_data.timestamp).unwrap_or_default().as_millis();
+    RawAnalyticsRecord {
+        instance_id,
+        correlation_id: request_data.correlation_id as i64,
+        timestamp: chrono::DateTime::<chrono::Utc>::from(request_data.timestamp),
+        method: request_data.method.to_string(),
+        uri: request_data.uri.to_string(),
+        request_model: extract_header_as_string(request_data, "x-onwards-model"),
+        response_model: None,
+        status_code: STATUS_CLIENT_CLOSED_REQUEST,
+        duration_ms: i64::try_from(duration_ms).unwrap_or(i64::MAX),
+        duration_to_first_byte_ms: None,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        reasoning_tokens: 0,
+        total_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_5m_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
+        cache_creation_24h_input_tokens: 0,
+        response_type: "abandoned".to_string(),
+        finish_reason: Some(CLIENT_DISCONNECTED.to_string()),
+        user_agent: headers.user_agent,
+        engine_cached_tokens: None,
+        reference_cached_tokens: None,
+        cache_read_source: None,
+        request_params: Default::default(),
+        server_address: config.host.clone(),
+        server_port: config.port,
+        served_by: None,
+        served_model: None,
+        requested_serving_class: None,
+        resolved_serving_class: None,
+        api_key_id,
+        fusillade_batch_id: headers.fusillade_batch_id,
+        fusillade_request_id: headers.fusillade_request_id,
+        custom_id: headers.custom_id,
+        batch_completion_window: headers.batch_completion_window,
+        batch_created_at: headers.batch_created_at,
+        batch_request_source: headers.batch_request_source,
+        trace_id: request_data.trace_id.clone(),
+        gateway_span_id: request_data.span_id.clone(),
+        x_request_id: headers.x_request_id,
+    }
+}
+
 pub struct AnalyticsHandler {
     outbox_writer: AnalyticsOutboxWriter,
     instance_id: Uuid,
     config: Config,
     reference_cache: Option<(Arc<ReferenceCache>, InternalAuthState)>,
+    key_identity: Option<InternalAuthState>,
 }
 
 impl AnalyticsHandler {
@@ -99,6 +187,33 @@ impl AnalyticsHandler {
             instance_id,
             config,
             reference_cache: None,
+            key_identity: None,
+        }
+    }
+
+    pub fn with_key_identity(mut self, internal_auth: InternalAuthState) -> Self {
+        self.key_identity = Some(internal_auth);
+        self
+    }
+
+    fn abandoned_api_key_id(&self, request_data: &RequestData) -> Option<Uuid> {
+        let internal_auth = self.key_identity.as_ref()?;
+        let headers = header_map(request_data);
+        let hash = internal_auth.captured_key_hash(api_key(request_data.uri.path(), &headers), None)?;
+        let labels = internal_auth.targets.key_labels.get(&KeyHash::from_bytes(hash))?;
+        labels.get(API_KEY_ID_LABEL)?.parse().ok()
+    }
+
+    async fn publish(&self, record: RawAnalyticsRecord) {
+        let correlation_id = record.correlation_id;
+        if let Err(e) = self.outbox_writer.publish(record).await {
+            crate::background_error!(
+                ANALYTICS, "outbox_publish", Error,
+                correlation_id = correlation_id,
+                error = %e,
+                "Failed to publish analytics record to the durable outbox"
+            );
+            metrics::counter!("dwctl_analytics_outbox_publish_failures_total").increment(1);
         }
     }
 
@@ -163,14 +278,25 @@ impl RequestHandler for AnalyticsHandler {
                 );
             }
 
-            let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
-            let fusillade_request_id = extract_header_as_uuid(&request_data, "x-fusillade-request-id");
-            let custom_id = extract_header_as_string(&request_data, "x-fusillade-custom-id");
-            let batch_completion_window = extract_header_as_string(&request_data, "x-fusillade-batch-completion-window");
-            let batch_request_source = extract_header_as_string(&request_data, "x-fusillade-batch-request-source").unwrap_or_default();
+            let completed = (200..300).contains(&metrics.status_code) && !client_disconnected(&response_data);
+            if completed && let Some(report) = tool_calls::inspect(&parsed) {
+                let served_by = metrics
+                    .served_by
+                    .as_deref()
+                    .and_then(|url| url::Url::parse(url).ok())
+                    .and_then(|url| url.host_str().map(str::to_owned));
+                tool_calls::record(
+                    &report,
+                    &tool_calls::ToolCallContext {
+                        model: metrics.request_model.as_deref(),
+                        tool_choice: metrics.request_params.tool_choice.as_deref(),
+                        served_by: served_by.as_deref(),
+                        parent: response_data.extensions.get::<TraceParent>().map(|TraceParent(parent)| parent),
+                    },
+                );
+            }
 
-            let batch_created_at = extract_header_as_string(&request_data, "x-fusillade-batch-created-at")
-                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+            let headers = HeaderFields::read(&request_data);
 
             let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
@@ -217,7 +343,7 @@ impl RequestHandler for AnalyticsHandler {
                 cache_creation_24h_input_tokens: metrics.cache_creation_24h_input_tokens,
                 response_type: metrics.response_type,
                 finish_reason: metrics.finish_reason,
-                user_agent: resolve_user_agent(&request_data),
+                user_agent: headers.user_agent,
                 engine_cached_tokens: metrics.engine_cached_tokens,
                 reference_cached_tokens,
                 cache_read_source: metrics.cache_read_source.clone(),
@@ -229,26 +355,49 @@ impl RequestHandler for AnalyticsHandler {
                 requested_serving_class: metrics.requested_serving_class,
                 resolved_serving_class: metrics.resolved_serving_class,
                 api_key_id,
-                fusillade_batch_id,
-                fusillade_request_id,
-                custom_id,
-                batch_completion_window,
-                batch_created_at,
-                batch_request_source,
+                fusillade_batch_id: headers.fusillade_batch_id,
+                fusillade_request_id: headers.fusillade_request_id,
+                custom_id: headers.custom_id,
+                batch_completion_window: headers.batch_completion_window,
+                batch_created_at: headers.batch_created_at,
+                batch_request_source: headers.batch_request_source,
                 trace_id: request_data.trace_id.clone(),
                 gateway_span_id: request_data.span_id.clone(),
-                x_request_id: extract_header_as_uuid(&request_data, "x-request-id"),
+                x_request_id: headers.x_request_id,
             };
 
-            if let Err(e) = self.outbox_writer.publish(record).await {
-                crate::background_error!(
-                    ANALYTICS, "outbox_publish", Error,
-                    correlation_id = correlation_id,
-                    error = %e,
-                    "Failed to publish analytics record to the durable outbox"
-                );
-                metrics::counter!("dwctl_analytics_outbox_publish_failures_total").increment(1);
-            }
+            self.publish(record).await;
+        }
+        .instrument(span)
+        .await;
+    }
+
+    async fn handle_abandoned(&self, request_data: RequestData) {
+        let span = info_span!(
+            "dwctl.analytics_handler",
+            correlation_id = request_data.correlation_id,
+            status = STATUS_CLIENT_CLOSED_REQUEST,
+            x_request_id = tracing::field::Empty,
+        );
+        if let Some(x_request_id) = extract_header_as_string(&request_data, "x-request-id") {
+            span.record("x_request_id", tracing::field::display(x_request_id));
+        }
+        async {
+            let api_key_id = self.abandoned_api_key_id(&request_data);
+            let record = abandoned_record(
+                self.instance_id,
+                &request_data,
+                api_key_id,
+                &self.config,
+                std::time::SystemTime::now(),
+            );
+            tracing::debug!(
+                uri = %request_data.uri,
+                request_model = record.request_model.as_deref(),
+                duration_ms = record.duration_ms,
+                "Request abandoned by the client before any response"
+            );
+            self.publish(record).await;
         }
         .instrument(span)
         .await;
@@ -469,5 +618,148 @@ mod tests {
             Some("OpenAI/Python 1.2.3"),
             "the batch creator's client must reach the analytics record"
         );
+    }
+
+    fn key_identity(api_key_id: Uuid) -> InternalAuthState {
+        let targets = onwards::target::Targets::from_config(
+            serde_json::from_value(serde_json::json!({
+                "targets": {"model-a": {"url": "https://upstream.example.com/v1/"}},
+                "auth": {"global_keys": [], "key_definitions": {
+                    "k": {"key": "sk-test", "labels": {"account": "acct-1", "api_key_id": api_key_id.to_string()}}
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        InternalAuthState {
+            credentials: crate::auth::internal_credential::InternalCredentials::generate(),
+            targets,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_is_recorded_as_a_client_cancel() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+        let api_key_id = Uuid::new_v4();
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default())
+            .with_key_identity(key_identity(api_key_id));
+        let mut request = request_data_with_headers(&[
+            ("authorization", "Bearer sk-test"),
+            ("x-onwards-model", "model-a"),
+            ("user-agent", "example-router/1.0"),
+        ]);
+        request.timestamp = SystemTime::now() - Duration::from_secs(300);
+
+        handler.handle_abandoned(request).await;
+
+        let record = rx.try_recv().expect("an abandoned request must produce a record");
+        assert_eq!(record.status_code, STATUS_CLIENT_CLOSED_REQUEST);
+        assert_eq!(record.finish_reason.as_deref(), Some(CLIENT_DISCONNECTED));
+        assert_eq!(record.request_model.as_deref(), Some("model-a"));
+        assert_eq!(record.api_key_id, Some(api_key_id));
+        assert_eq!(record.user_agent.as_deref(), Some("example-router/1.0"));
+        assert!(
+            record.duration_ms >= 300_000,
+            "duration is the time the caller waited: {}",
+            record.duration_ms
+        );
+        assert_eq!(record.duration_to_first_byte_ms, None);
+        assert_eq!((record.prompt_tokens, record.completion_tokens, record.total_tokens), (0, 0, 0));
+        assert_eq!(record.response_type, "abandoned");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_request_with_an_unknown_key_is_still_recorded() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default())
+            .with_key_identity(key_identity(Uuid::new_v4()));
+        handler
+            .handle_abandoned(request_data_with_headers(&[("authorization", "Bearer sk-unknown")]))
+            .await;
+        let record = rx.try_recv().expect("record");
+        assert_eq!(record.status_code, STATUS_CLIENT_CLOSED_REQUEST);
+        assert_eq!(record.api_key_id, None);
+        assert_eq!(record.request_model, None);
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_messages_request_is_attributed_by_its_x_api_key() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+        let api_key_id = Uuid::new_v4();
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default())
+            .with_key_identity(key_identity(api_key_id));
+        let request = RequestData {
+            uri: Uri::from_static("/ai/v1/messages"),
+            ..request_data_with_headers(&[("x-api-key", "sk-test")])
+        };
+        handler.handle_abandoned(request).await;
+        assert_eq!(rx.try_recv().expect("record").api_key_id, Some(api_key_id));
+    }
+
+    #[test]
+    fn tool_calls_are_checked_only_in_completed_responses() {
+        let counted = |ended: bool| {
+            let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = prometheus.handle();
+            metrics::with_local_recorder(&prometheus, || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let (tx, _rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+                    let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default());
+                    let request = RequestData {
+                        body: Some(bytes::Bytes::from(r#"{"model":"model-a","messages":[{"role":"user","content":"u"}]}"#)),
+                        ..create_test_request_data()
+                    };
+                    let mut response = create_test_response_data();
+                    response.body = Some(bytes::Bytes::from(
+                        r#"{"id":"c","object":"chat.completion","created":1,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"q\": "}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                    ));
+                    let completion = crate::request_logging::stream_completion::StreamCompletion::default();
+                    if ended {
+                        completion.mark_ended();
+                    }
+                    response.extensions.insert(completion);
+                    handler.handle_response(request, response).await;
+                })
+            });
+            handle
+                .render()
+                .contains(r#"dwctl_tool_call_arguments_total{model="model-a",outcome="invalid_json""#)
+        };
+        assert!(counted(true), "a completed response is checked");
+        assert!(!counted(false), "a dropped response is not");
+    }
+
+    #[tokio::test]
+    async fn outlet_reports_a_cancel_before_any_response_as_abandoned() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default());
+        let config = outlet::RequestLoggerConfig {
+            capture_request_body: true,
+            capture_response_body: true,
+            ..Default::default()
+        };
+        let app = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    std::future::pending::<()>().await;
+                    "unreachable"
+                }),
+            )
+            .layer(outlet::RequestLoggerLayer::new(config, handler));
+        let request = axum::http::Request::post("/ai/v1/chat/completions")
+            .header("x-onwards-model", "model-a")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let outcome = tokio::time::timeout(Duration::from_millis(100), tower::ServiceExt::oneshot(app, request)).await;
+        assert!(outcome.is_err(), "the inner service must not answer");
+
+        let record = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("outlet must report the abandoned request")
+            .expect("record");
+        assert_eq!(record.status_code, STATUS_CLIENT_CLOSED_REQUEST);
+        assert_eq!(record.request_model.as_deref(), Some("model-a"));
+        assert!(record.uri.ends_with("/chat/completions"));
     }
 }

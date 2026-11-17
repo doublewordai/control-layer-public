@@ -611,6 +611,20 @@ discovery:
   # Set via environment: DWCTL_DISCOVERY__LIST_CLASS_ROUTES=true
   list_class_routes: false
 
+# Feeds for third-party marketplaces
+integrations:
+  # OpenRouter's model feed (GET /ai/v1/integrations/openrouter/models), polled
+  # by OpenRouter with its account's API key. A model is listed only when its
+  # provisioning document sets settings.openrouter; prices come from the
+  # account's realtime tariff and cache pricing.
+  openrouter:
+    # Where the listed models serve from, declared on every document as
+    # OpenRouter's `datacenters`. Empty leaves the field out. Example:
+    #   datacenters:
+    #     - country_code: US          # ISO 3166-1 alpha-2, upper case
+    #       region: example-region-1  # optional
+    datacenters: []
+
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:

@@ -218,6 +218,36 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     let inner = onwards_request(&spans, request);
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("422"));
 
+    mock.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&mock)
+        .await;
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        server.post(path_chat).add_header("Authorization", &auth).json(&chat),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the stalled upstream must not answer");
+    let spans = take(&provider, &exported);
+    let request = spans
+        .iter()
+        .find(|s| attr(s, "url.path").as_deref() == Some(path_chat) && attr(s, "api.type").as_deref() == Some("ai_proxy"))
+        .unwrap_or_else(|| {
+            let names: Vec<_> = spans.iter().map(|s| s.name.to_string()).collect();
+            panic!("cancelled request's root span was not exported: {names:?}")
+        });
+    assert_eq!(attr(request, "http.response.status_code"), None);
+    assert_eq!(attr(request, "doubleword.account_id"), Some(owner.to_string()));
+    assert_eq!(attr(request, "doubleword.account_name").as_deref(), Some("Example Trading Ltd"));
+    assert_eq!(attr(request, "doubleword.api_key_id"), Some(key_id.to_string()));
+    assert_eq!(attr(request, "gen_ai.request.model").as_deref(), Some("gpt-4o"));
+    let inner = onwards_request(&spans, request);
+    assert_eq!(attr(inner, "onwards.account_name").as_deref(), Some("Example Trading Ltd"));
+    assert_eq!(attr(inner, "onwards.api_key_id"), Some(key_id.to_string()));
+    mock.reset().await;
+
     sqlx::query("DELETE FROM deployment_groups").execute(&pool).await.unwrap();
     bg.sync_onwards_config(&pool).await.unwrap();
     let denied = server.post(path_chat).add_header("Authorization", &auth).json(&chat).await;

@@ -340,6 +340,56 @@ Models omitted from YAML are not deleted or otherwise rewritten. Their
 Physical models that disappear from an endpoint filter are marked inactive;
 endpoint synchronization does not delete or rewrite YAML-owned rows.
 
+## OpenRouter listing
+
+`settings.openrouter` on the virtual model offers it on OpenRouter through the
+[OpenRouter model feed](./configuration.md#openrouter-model-feed). A model with
+no listing is left out of the feed, so removing the block takes the model off
+the feed at the next restart. OpenRouter hides a live endpoint whose id
+disappears; set `is_ready: false` instead to take a model offline.
+
+```yaml
+clay:
+  alias: example-org/Example-Model
+  capabilities: [reasoning]
+  settings:
+    metadata:
+      context_window: 262144    # the declared context length
+      quantization: fp8         # declared when it is one of OpenRouter's values
+    openrouter:
+      hugging_face_id: example-org/Example-Model
+      slug: example-org/example-model
+      is_ready: true            # default false: staged on OpenRouter but hidden
+      max_output_tokens: 65536
+      deprecation_date: 2027-02-01
+      media_inputs:             # omitted kinds are not declared
+        image: [url, base64]
+        video: []               # an empty list turns that input off
+      supported_parameters:     # changes to the default chat parameters
+        top_k: null             # null removes one
+        reasoning_effort:
+          type: enum
+          values: [low, high]
+```
+
+The document's `id` is the alias. Everything else comes from data the control
+layer already holds:
+
+| Document field | Source |
+|---|---|
+| `name`, `created` | `display_name` (else the alias), creation time |
+| `input_modalities[text].supported_inputs.max_context_length` | `settings.metadata.context_window` |
+| `quantization` | `settings.metadata.quantization`; values OpenRouter does not list are left out |
+| text input `pricing` | the account's realtime tariff (`prompt`), cache read and the 5-minute, 1-hour and 24-hour cache writes (`cached_prompt`, `cache_write` with `ttl_seconds`) |
+| output `pricing` | the realtime output price (`completion`) |
+| `supported_parameters` | sampling parameters, `max_tokens` (capped at `max_output_tokens`), `logprobs`, tools, tool choice and response formats, plus `reasoning` and `include_reasoning` for models with the `reasoning` capability; then the listing's changes; then minus `onwards.rejected_params` |
+| `datacenters` | `integrations.openrouter.datacenters` |
+
+The catalog owns the listing like the other model fields: it is replaced on
+every restart and cannot be set on a physical deployment. Unknown keys are
+rejected when the catalog loads, because OpenRouter rejects a whole document
+for one unknown key. Chat and embedding models are listed; rerankers are not.
+
 ## Tariff history
 
 Tariffs retain their temporal history. Within an account/class scope, their natural
