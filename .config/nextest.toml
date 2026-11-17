@@ -1,10 +1,21 @@
 [profile.default]
 slow-timeout = { period = "10s" }
+default-filter = 'not binary(memory_budget)'
 
 [profile.default.junit]
 path = "junit.xml"
 
 [[profile.default.overrides]]
+filter = 'binary(memory_budget)'
+threads-required = "num-cpus"
+
+[profile.ci]
+default-filter = 'all()'
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[[profile.ci.overrides]]
 filter = 'binary(memory_budget)'
 threads-required = "num-cpus"
 

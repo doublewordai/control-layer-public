@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+original_args=("$@")
 
 watch=false
 coverage=false
 no_run=false
+doctests=true
 args=()
 doc_args=()
 default_workspace=true
@@ -17,6 +19,7 @@ while (($#)); do
     case "$1" in
         --watch) watch=true; shift ;;
         --coverage) coverage=true; shift ;;
+        --no-doctests) doctests=false; shift ;;
         --no-run) no_run=true; args+=("$1"); shift ;;
         -p|--package|--exclude|-F|--features|--target)
             if (($# < 2)); then echo "$1 requires a value" >&2; exit 2; fi
@@ -33,6 +36,10 @@ while (($#)); do
     esac
 done
 
+if ! $watch && [[ -z "${DW_BUILD_LOCK_HELD:-}" ]]; then
+    exec ./scripts/with-build-lock.sh ./scripts/test-rust.sh ${original_args[@]+"${original_args[@]}"}
+fi
+
 if ! cargo nextest --version >/dev/null 2>&1; then
     echo "cargo-nextest is required: cargo install cargo-nextest --locked" >&2
     exit 1
@@ -45,9 +52,16 @@ if $watch; then
     fi
     command=(./scripts/test-rust.sh)
     if $coverage; then command+=(--coverage); fi
+    if ! $doctests; then command+=(--no-doctests); fi
     command+=(${args[@]+"${args[@]}"})
     printf -v watch_command '%q ' "${command[@]}"
     exec cargo watch -s "$watch_command"
+fi
+
+offline_defaulted=false
+if [[ -z "${SQLX_OFFLINE+set}" ]]; then
+    export SQLX_OFFLINE=true
+    offline_defaulted=true
 fi
 
 defaults=()
@@ -62,7 +76,12 @@ else
     cargo nextest run ${defaults[@]+"${defaults[@]}"} ${args[@]+"${args[@]}"} || status=$?
 fi
 
-if ! $no_run; then
+if $offline_defaulted && ((status == 101)); then
+    echo "test rust: the build ran with SQLX_OFFLINE=true. If it reports 'no cached data for this query'," >&2
+    echo "  run ./scripts/sqlx-prepare.sh against a migrated database, or set SQLX_OFFLINE=false." >&2
+fi
+
+if ! $no_run && $doctests; then
     cargo test --doc ${defaults[@]+"${defaults[@]}"} ${doc_args[@]+"${doc_args[@]}"} || status=$?
 fi
 exit "$status"

@@ -5,19 +5,23 @@ use crate::request::RequestData;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use opentelemetry::trace::TraceContextExt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[async_trait]
 pub trait HttpClient: Send + Sync + Clone {
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
+
+    fn ensure_ready(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 
 #[derive(Clone)]
 pub struct ReqwestHttpClient {
-    client: reqwest::Client,
+    client: Arc<LazyLock<std::result::Result<reqwest::Client, String>>>,
     first_chunk_timeout: Duration,
     chunk_timeout: Duration,
     body_timeout: Duration,
@@ -33,13 +37,23 @@ pub(crate) const DEFAULT_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_UPLOAD_STALL_POLL: Duration = Duration::from_millis(100);
 
 impl ReqwestHttpClient {
+    fn client(&self) -> Result<&reqwest::Client> {
+        (**self.client)
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("HTTP client could not be built: {e}").into())
+    }
+
     pub fn new(
         first_chunk_timeout: Duration,
         chunk_timeout: Duration,
         body_timeout: Duration,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Arc::new(LazyLock::new(|| {
+                reqwest::Client::builder()
+                    .build()
+                    .map_err(|e| e.to_string())
+            })),
             first_chunk_timeout,
             chunk_timeout,
             body_timeout,
@@ -93,6 +107,10 @@ fn map_reqwest_error(error: reqwest::Error) -> crate::error::FusilladeError {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
+    fn ensure_ready(&self) -> Result<()> {
+        self.client().map(|_| ())
+    }
+
     #[tracing::instrument(name = "fusillade.execute", skip(self, request, api_key), fields(
         otel.name = %format!("{} {}", request.method, request.path),
         x_request_id = tracing::field::Empty,
@@ -116,7 +134,7 @@ impl HttpClient for ReqwestHttpClient {
             "Executing HTTP request"
         );
 
-        let mut req = self.client.request(
+        let mut req = self.client()?.request(
             request.method.parse().map_err(|e| {
                 tracing::error!(method = %request.method, error = %e, "Invalid HTTP method");
                 anyhow::anyhow!("Invalid HTTP method '{}': {}", request.method, e)

@@ -56,6 +56,11 @@ check:
 
     echo "✅ All required tools found!"
 
+    # Optional: serialises heavy cargo jobs across worktrees (scripts/with-build-lock.sh)
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "⚠️  Optional: flock not found (macOS: brew install flock); the build lock is skipped without it"
+    fi
+
     echo "✅ Development setup complete!"
 
 
@@ -312,7 +317,7 @@ down *args="":
     docker compose down {{args}}
 
 
-# Run tests: 'just test' or 'just test [docker|rust|ts|memory]'
+# Run tests: 'just test' or 'just test [docker|rust|quick|ts|memory]'
 #
 # Test targets available:
 #
@@ -331,6 +336,12 @@ down *args="":
 #
 # rust: Unit and integration tests for Rust services
 # - Requires PostgreSQL database (run 'just db-setup' first)
+# - --no-doctests skips the doctest pass
+#
+# quick: Only the Rust tests for the files changed since origin/main
+# - The default inner loop; maps changed files to a nextest filterset
+# - Flags: --print (show the filterset only), --base <ref>; other
+#   arguments go to nextest. Doctests are skipped.
 #
 # ts: Frontend unit tests and type checking
 # - Runs TypeScript compiler checks and ESLint
@@ -338,12 +349,15 @@ down *args="":
 #
 # memory: Heap budgets for requests in flight (dwctl/tests/memory_budget)
 # - Requires PostgreSQL database (run 'just db-setup' first)
-# - Prints the heap each request holds; also part of 'just test rust'
+# - Prints the heap each request holds. This is the local way to run them:
+#   'just test rust' and 'just test quick' skip them (nextest default-filter);
+#   CI runs them with the 'ci' nextest profile.
 #
 # Examples:
 #   just test                    # Test against running services
 #   just test docker             # Full docker integration test
 #   just test rust               # Backend unit tests
+#   just test quick              # Tests for the files you changed
 #   just test ts                 # Frontend tests
 #   just test memory             # Request memory budgets
 [positional-arguments]
@@ -354,6 +368,9 @@ test target="" *args="":
     shift
     if [[ "$target" == rust ]]; then
         exec ./scripts/test-rust.sh "$@"
+    fi
+    if [[ "$target" == quick ]]; then
+        exec ./scripts/test-quick.sh "$@"
     fi
     exec just _test-other "$target" "$@"
 
@@ -604,10 +621,12 @@ _test-other target="" *args="":
             ;;
         memory)
             echo "Running memory budget tests..."
-            cargo test --package dwctl --test memory_budget {{args}} -- --nocapture
+            # Through the runner: same build as 'just test rust' (no -p rebuild) and the build lock.
+            ./scripts/test-rust.sh --no-doctests --ignore-default-filter \
+                -E 'binary(memory_budget)' --no-capture {{args}}
             ;;
         *)
-            echo "Usage: just test [docker|rust|ts|memory]"
+            echo "Usage: just test [docker|rust|quick|ts|memory]"
             exit 1
             ;;
     esac
@@ -649,6 +668,9 @@ lint target *args="":
             pnpm exec eslint . --max-warnings 0 {{args}}
             ;;
         rust)
+            # Clippy compiles against the committed .sqlx metadata; the prepare
+            # check below still verifies it against the database.
+            export SQLX_OFFLINE="${SQLX_OFFLINE-true}"
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -660,7 +682,7 @@ lint target *args="":
                 --package openai-reassembler \
                 --package dwctl-test-macros
             echo "Running cargo clippy..."
-            cargo clippy \
+            ./scripts/with-build-lock.sh cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
@@ -680,8 +702,9 @@ lint target *args="":
             python3 -B scripts/tests/schema_migrations/test_projection_guard.py
             python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
-            cargo sqlx prepare --check --workspace
+            ./scripts/with-build-lock.sh ./scripts/sqlx-prepare.sh --check
             python3 -B scripts/tests/test_rust_runner.py
+            python3 -B scripts/tests/test_quick_runner.py
             echo "Checking local Rust workspace topology..."
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py

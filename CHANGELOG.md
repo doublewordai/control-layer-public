@@ -1,5 +1,28 @@
 # Changelog
 
+## [17.2.0](https://github.com/doublewordai/control-layer/compare/v17.1.4...v17.2.0) (2026-11-17)
+
+
+### Features
+
+* **dev:** just test quick, and memory-budget tests out of the default profile (DW-1033) ([#2188](https://github.com/doublewordai/control-layer/issues/2188)) ([a7064b3](https://github.com/doublewordai/control-layer/commit/a7064b3d60d396e5e4f98d301c4d652e07fa5a11))
+
+
+### Bug Fixes
+
+* **inference:** return 400 for image URLs that can't be fetched, failing fast on IPv6-only hosts ([#2196](https://github.com/doublewordai/control-layer/issues/2196)) ([3c6b22f](https://github.com/doublewordai/control-layer/commit/3c6b22f4dc15a3666197ac09fbc2e9185d5030f2))
+
+
+### Performance Improvements
+
+* **fusillade:** build the daemon's HTTP client on first request (DW-1033) ([#2189](https://github.com/doublewordai/control-layer/issues/2189)) ([c14a733](https://github.com/doublewordai/control-layer/commit/c14a73384ffd221ff2fcb169ce6c6915eecf0371))
+
+
+### Miscellaneous
+
+* **dev:** build lock and targeted-test guidance for the local loop (DW-1032) ([#2187](https://github.com/doublewordai/control-layer/issues/2187)) ([399598d](https://github.com/doublewordai/control-layer/commit/399598d9aef8f79285985aaead7ff2199bf1c8bb))
+* **sqlx:** offline query metadata for test targets; tests and lint compile offline (DW-1033) ([#2191](https://github.com/doublewordai/control-layer/issues/2191)) ([3750b82](https://github.com/doublewordai/control-layer/commit/3750b8241807da53ecfba32c7ae805e11dc443b1))
+
 ## [17.1.4](https://github.com/doublewordai/control-layer/compare/v17.1.3...v17.1.4) (2026-11-16)
 
 

@@ -55,6 +55,13 @@ mod types;
 mod upload_compression;
 pub mod webhooks;
 
+macro_rules! startup_stage {
+    ($name:literal) => {
+        #[cfg(test)]
+        crate::test::utils::startup_stage($name);
+    };
+}
+
 #[cfg(test)]
 mod test;
 
@@ -1065,6 +1072,7 @@ async fn setup_database(
             .expect("Failed to create TestDbPools");
         let replica_pool = test_pools.read().into_inner();
         migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
+        startup_stage!("db.main");
         (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         let (embedded_db, database_url) = match &config.database {
@@ -1213,7 +1221,9 @@ async fn setup_database(
         None
     };
 
+    startup_stage!("db.fusillade");
     migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
+    startup_stage!("db.underway");
 
     let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
@@ -1253,6 +1263,7 @@ async fn setup_database(
     }
 
     seed_database(&config.model_sources, &main.pooled.write()).await?;
+    startup_stage!("db.seed");
 
     if config.model_provisioning.enabled {
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
@@ -3567,6 +3578,7 @@ impl Application {
                 .with_retention_maintenance(retention_maintenance_config)
                 .with_leak_config(config.background_services.batch_daemon.leak.clone()),
         );
+        startup_stage!("app.fusillade-daemon");
         let keystore = match config.keystore.as_ref() {
             Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
@@ -3609,6 +3621,7 @@ impl Application {
         })
         .await?;
 
+        startup_stage!("app.background-services");
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone());
         let daemon_insert_result = sqlx::query(
@@ -3781,6 +3794,7 @@ impl Application {
         )
         .await?;
 
+        startup_stage!("app.router");
         Ok(Self {
             router,
             app_state,

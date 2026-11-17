@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use rand::RngExt;
-use std::net::{IpAddr, SocketAddr};
+use std::env;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -99,13 +100,7 @@ impl ImageFetcher {
                 .build()
                 .map_err(|e| FetchError::Transient(format!("client build: {e}")))?;
 
-            let resp = match client.get(url.clone()).send().await {
-                Ok(r) => r,
-                Err(e) if e.is_timeout() || e.is_connect() => {
-                    return Err(FetchError::Transient(format!("connect/timeout: {e}")));
-                }
-                Err(e) => return Err(FetchError::FetchFailed(format!("send: {e}"))),
-            };
+            let resp = client.get(url.clone()).send().await.map_err(classify_send_error)?;
 
             let status = resp.status();
             if status.is_redirection() {
@@ -159,6 +154,14 @@ impl ImageFetcher {
     }
 }
 
+fn classify_send_error(e: reqwest::Error) -> FetchError {
+    if e.is_timeout() || e.is_connect() {
+        FetchError::Transient(format!("connect/timeout: {}", e.without_url()))
+    } else {
+        FetchError::FetchFailed(format!("send: {}", e.without_url()))
+    }
+}
+
 fn classify_status(status: reqwest::StatusCode) -> Result<(), FetchError> {
     use reqwest::StatusCode;
     if status.is_success() {
@@ -181,15 +184,50 @@ async fn resolve_first_allowed(host: &str, port: u16) -> Result<SocketAddr, Fetc
     let lookup = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| FetchError::Transient(format!("dns resolve {host}: {e}")))?;
-    for addr in lookup {
-        let ip: IpAddr = addr.ip();
-        if !ip_filter::is_denied(ip) {
-            return Ok(addr);
-        }
+    pick_address(host, lookup, route_check(proxy_configured()))
+}
+
+const PROXY_ENV_VARS: [&str; 6] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+
+fn proxy_configured() -> bool {
+    PROXY_ENV_VARS
+        .iter()
+        .any(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+fn route_check(proxied: bool) -> fn(&SocketAddr) -> bool {
+    if proxied { |_| true } else { has_route }
+}
+
+fn pick_address(
+    host: &str,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    routable: impl Fn(&SocketAddr) -> bool,
+) -> Result<SocketAddr, FetchError> {
+    let allowed: Vec<SocketAddr> = resolved.into_iter().filter(|addr| !ip_filter::is_denied(addr.ip())).collect();
+    if allowed.is_empty() {
+        return Err(FetchError::BadInput(format!(
+            "all resolved addresses for {host} are in the deny-list"
+        )));
     }
-    Err(FetchError::BadInput(format!(
-        "all resolved addresses for {host} are in the deny-list"
-    )))
+    if let Some(addr) = allowed.iter().copied().find(routable) {
+        return Ok(addr);
+    }
+    if allowed.iter().all(SocketAddr::is_ipv6) {
+        return Err(FetchError::BadInput(format!(
+            "{host} only has IPv6 addresses and this server cannot connect over IPv6; send the image as a base64 data URL instead"
+        )));
+    }
+    Err(FetchError::Transient(format!("no route to {host}")))
+}
+
+fn has_route(addr: &SocketAddr) -> bool {
+    let unspecified: IpAddr = if addr.is_ipv4() {
+        Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        Ipv6Addr::UNSPECIFIED.into()
+    };
+    UdpSocket::bind((unspecified, 0)).and_then(|socket| socket.connect(addr)).is_ok()
 }
 
 async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Bytes, FetchError> {
@@ -197,7 +235,7 @@ async fn read_bounded(resp: reqwest::Response, max: usize) -> Result<Bytes, Fetc
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| FetchError::Transient(format!("body read: {e}")))?;
+        let chunk = chunk.map_err(|e| FetchError::Transient(format!("body read: {}", e.without_url())))?;
         if buf.len() + chunk.len() > max {
             return Err(FetchError::BadInput(format!("body exceeds cap {max}")));
         }
@@ -277,5 +315,60 @@ mod tests {
             let err = classify_status(s).unwrap_err();
             assert!(matches!(err, FetchError::Transient(_)), "{s} → {err:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn classify_send_error_strips_signed_url_from_connect_failure() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{port}/a/b.png?X-Amz-Signature=supersecret");
+        let reqwest_err = reqwest::Client::new().get(&url).send().await.unwrap_err();
+        assert!(reqwest_err.to_string().contains("supersecret"));
+
+        let fetch_err = classify_send_error(reqwest_err);
+        assert!(matches!(fetch_err, FetchError::Transient(_)), "got {fetch_err:?}");
+        let rendered = fetch_err.to_string();
+        assert!(!rendered.contains("supersecret"), "leaked query string: {rendered}");
+        assert!(!rendered.contains("/a/b.png"), "leaked url path: {rendered}");
+    }
+
+    #[test]
+    fn pick_address_rejects_ipv6_only_host_without_an_ipv6_route() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let err = pick_address("images.example.com", [ipv6], |addr| addr.is_ipv4()).unwrap_err();
+        assert!(
+            matches!(&err, FetchError::BadInput(m) if m.contains("only has IPv6 addresses")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pick_address_skips_addresses_without_a_route() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let ipv4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        assert_eq!(
+            pick_address("images.example.com", [ipv6, ipv4], |addr| addr.is_ipv4()).unwrap(),
+            ipv4
+        );
+    }
+
+    #[test]
+    fn pick_address_retries_when_no_ipv4_route_exists() {
+        let ipv4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let err = pick_address("images.example.com", [ipv4], |_| false).unwrap_err();
+        assert!(matches!(err, FetchError::Transient(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn pick_address_leaves_routing_to_a_configured_proxy() {
+        let ipv6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        assert_eq!(pick_address("images.example.com", [ipv6], route_check(true)).unwrap(), ipv6);
+    }
+
+    #[test]
+    fn has_route_to_loopback() {
+        assert!(has_route(&"127.0.0.1:443".parse().unwrap()));
     }
 }

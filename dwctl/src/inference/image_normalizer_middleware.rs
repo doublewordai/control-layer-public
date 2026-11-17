@@ -318,7 +318,7 @@ pub(crate) fn refuse_normalize_error<'a>(origin: impl Into<rejections::Origin<'a
 fn normalize_error_status(err: &NormalizeError) -> (StatusCode, &'static str) {
     match err {
         NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
-        NormalizeError::Unfetchable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "image_url_unfetchable"),
+        NormalizeError::Unfetchable(_) => (StatusCode::BAD_REQUEST, "image_url_unfetchable"),
         NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
         NormalizeError::FetchFailed(_) => (StatusCode::BAD_GATEWAY, "image_fetch_failed"),
         NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
@@ -1201,10 +1201,7 @@ mod tests {
     fn error_response_maps_each_variant_to_the_right_status() {
         let cases = [
             (NormalizeError::BadInput("x".into()), StatusCode::BAD_REQUEST),
-            (
-                NormalizeError::Unfetchable("origin 403 Forbidden".into()),
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ),
+            (NormalizeError::Unfetchable("origin 403 Forbidden".into()), StatusCode::BAD_REQUEST),
             (NormalizeError::Transient("x".into()), StatusCode::SERVICE_UNAVAILABLE),
             (NormalizeError::FetchFailed("x".into()), StatusCode::BAD_GATEWAY),
             (NormalizeError::StoreFailed("x".into()), StatusCode::SERVICE_UNAVAILABLE),

@@ -2690,6 +2690,7 @@ where
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
         self.validate_startup(mode)?;
+        self.http_client.ensure_ready()?;
 
         let supports_batch_claims = self.storage.supports_batch_claims();
         let supports_background_claims = self.storage.supports_background_claims();

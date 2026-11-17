@@ -553,7 +553,7 @@ impl FileUploadError {
             FileUploadError::ImageAccessUnavailable { line } => Error::ServiceUnavailable {
                 message: format!("Line {}: image access store temporarily unavailable, please retry", line),
             },
-            FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
+            FileUploadError::ImageUnfetchable { line, message } => Error::BadRequest {
                 message: format!(
                     "Line {}: referenced image could not be retrieved ({}); ensure the URL is publicly accessible and does not require authentication",
                     line, message
@@ -1042,11 +1042,11 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
     ),
     responses(
         (status = 201, description = "File uploaded and validated successfully.", body = FileResponse),
-        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
+        (status = 400, description = "Invalid file format, malformed JSON, missing required fields, a referenced image URL that was rejected or whose origin refused access (e.g. 403/404), etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
         (status = 415, description = "The request is not `multipart/form-data`, or the file is compressed in a format other than gzip or zstd."),
-        (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
+        (status = 422, description = "A line is well-formed but its reasoning settings cannot be processed (e.g. a reasoning effort that needs `max_completion_tokens` when the line does not set it)."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
         (status = 503, description = "A referenced image could not be fetched due to a transient upstream/store error, or the service is briefly overloaded. Retry after a short delay.")
@@ -3904,18 +3904,18 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_unfetchable_maps_to_unprocessable_entity_not_server_error() {
+    fn test_batch_unfetchable_maps_to_bad_request_not_server_error() {
         let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::Unfetchable("origin 403 Forbidden".to_string()), 5);
         assert!(
             matches!(mapped, super::FileUploadError::ImageUnfetchable { .. }),
             "Unfetchable must map to ImageUnfetchable, got {mapped:?}"
         );
         match mapped.into_http_error() {
-            crate::errors::Error::UnprocessableEntity { message } => {
+            crate::errors::Error::BadRequest { message } => {
                 assert!(message.contains("Line 5"));
                 assert!(message.contains("403 Forbidden"));
             }
-            _ => panic!("Expected UnprocessableEntity error"),
+            _ => panic!("Expected BadRequest error"),
         }
     }
 
