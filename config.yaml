@@ -546,6 +546,16 @@ batches:
 #     # Maximum seconds to wait for an upload slot before returning HTTP 429
 #     # Set to 0 to reject immediately when no slot is available
 #     max_upload_wait_secs: 60
+#   checkout:
+#     # Cap on hosted checkouts that never end in a payment, to stop the
+#     # payment page being used to test cards. Completed payments and card
+#     # setups never count, so paying customers can top up without limit.
+#     # Unpaid checkouts one user may have inside the window, across their
+#     # own account and any organization they pay for.
+#     # Set to 0 for unlimited.
+#     max_unpaid_per_user: 5
+#     # Length of the rolling window in hours (minimum 1)
+#     window_hours: 24
 #   requests:
 #     # Maximum body size per individual request (bytes). Applies to requests
 #     # in batch JSONL files and to realtime request bodies on /ai/v1/*.

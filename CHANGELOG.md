@@ -1,5 +1,18 @@
 # Changelog
 
+## [17.4.0](https://github.com/doublewordai/control-layer/compare/v17.3.0...v17.4.0) (2026-11-18)
+
+
+### Features
+
+* **analytics:** check structured-output content and missing tool calls ([#2210](https://github.com/doublewordai/control-layer/issues/2210)) ([8d1a900](https://github.com/doublewordai/control-layer/commit/8d1a900bc0be57fd034eaa3f61a1337800fe4ecc))
+* **payments:** cap unpaid checkouts per user and keep one provider customer per payer ([#2207](https://github.com/doublewordai/control-layer/issues/2207)) ([3efb834](https://github.com/doublewordai/control-layer/commit/3efb83406d95ff4f80a13679c0455b5e97c95800))
+
+
+### Continuous Integration
+
+* build and push the dwctl image at merge, tagged with its commit (SD-25) ([#2197](https://github.com/doublewordai/control-layer/issues/2197)) ([38746cb](https://github.com/doublewordai/control-layer/commit/38746cb218dc7eca6042136c5bd18825b17a035a))
+
 ## [17.3.0](https://github.com/doublewordai/control-layer/compare/v17.2.0...v17.3.0) (2026-11-17)
 
 

@@ -8,7 +8,7 @@ use crate::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{CheckoutPayer, OpenedCheckout, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
 };
 
 #[cfg(test)]
@@ -34,7 +34,7 @@ impl PaymentProvider for DummyProvider {
         creditee_id: Option<&str>,
         _cancel_url: &str,
         success_url: &str,
-    ) -> Result<String> {
+    ) -> Result<OpenedCheckout> {
         let payer_id_string = payer.id.to_string();
         let recipient_id = creditee_id.unwrap_or(&payer_id_string);
 
@@ -49,7 +49,10 @@ impl PaymentProvider for DummyProvider {
             payer.id
         );
 
-        Ok(redirect_url)
+        Ok(OpenedCheckout {
+            url: redirect_url,
+            session_id,
+        })
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
@@ -118,6 +121,8 @@ impl PaymentProvider for DummyProvider {
                 tracing::error!(session_id, target_id = %target_id, error = %e, "Verification credits grant failed");
             }
 
+            super::claim_checkout_attempt(&mut conn, session_id).await;
+
             tracing::info!("Successfully fulfilled dummy setup session {} for user {}", session_id, target_id);
             return Ok(());
         }
@@ -150,6 +155,8 @@ impl PaymentProvider for DummyProvider {
                 "Dummy payment (test)".to_string()
             }
         };
+
+        super::claim_checkout_attempt(&mut conn, session_id).await;
 
         let request = CreditTransactionCreateDBRequest {
             user_id: payment_session.creditee_id,
@@ -192,18 +199,29 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
-    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<OpenedCheckout> {
         let session_id = format!("{}{}_{}", DUMMY_SETUP_SESSION_PREFIX, payer.id, uuid::Uuid::new_v4());
-        Ok(success_url.replace("{CHECKOUT_SESSION_ID}", &session_id))
+        Ok(OpenedCheckout {
+            url: success_url.replace("{CHECKOUT_SESSION_ID}", &session_id),
+            session_id,
+        })
     }
 
-    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_auto_topup_checkout_session(
+        &self,
+        payer: &CheckoutPayer,
+        _cancel_url: &str,
+        success_url: &str,
+    ) -> Result<OpenedCheckout> {
         let session_id = format!("dummy_session_{}_{}", payer.id, uuid::Uuid::new_v4());
         let redirect_url = success_url.replace("{CHECKOUT_SESSION_ID}", &session_id);
-        Ok(redirect_url)
+        Ok(OpenedCheckout {
+            url: redirect_url,
+            session_id,
+        })
     }
 
-    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<super::AutoTopupSetupResult> {
+    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<super::AutoTopupSetupResult> {
         if !session_id.starts_with("dummy_session_") {
             return Err(PaymentError::InvalidData("Invalid dummy session ID format".to_string()));
         }
@@ -211,6 +229,11 @@ impl PaymentProvider for DummyProvider {
             .strip_prefix("dummy_session_")
             .and_then(|s| s.split('_').next())
             .map(String::from);
+
+        match db_pool.acquire().await {
+            Ok(mut conn) => super::claim_checkout_attempt(&mut conn, session_id).await,
+            Err(e) => tracing::error!(session_id, error = %e, "Failed to mark checkout attempt completed"),
+        }
 
         Ok(super::AutoTopupSetupResult {
             customer_id: Some(format!("dummy_cus_{}", uuid::Uuid::new_v4())),
@@ -336,7 +359,8 @@ mod tests {
         let checkout_url = provider
             .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
             .await
-            .unwrap();
+            .unwrap()
+            .url;
 
         assert!(checkout_url.contains("payment=success"));
         assert!(checkout_url.contains(&format!("session_id=dummy_session_{}", user.id)));
@@ -394,7 +418,8 @@ mod tests {
         let checkout_url = provider
             .create_checkout_session(&payer_from(&user), None, cancel_url, success_url)
             .await
-            .unwrap();
+            .unwrap()
+            .url;
 
         let url = url::Url::parse(&checkout_url).unwrap();
         let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();

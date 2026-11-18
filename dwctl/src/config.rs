@@ -809,6 +809,23 @@ pub struct LimitsConfig {
     pub requests: RequestLimitsConfig,
     pub realtime_inflight: RealtimeInflightLimitsConfig,
     pub batch_inflight: BatchInflightLimitsConfig,
+    pub checkout: CheckoutLimitsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckoutLimitsConfig {
+    pub max_unpaid_per_user: u32,
+    pub window_hours: u32,
+}
+
+impl Default for CheckoutLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_unpaid_per_user: 5,
+            window_hours: 24,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

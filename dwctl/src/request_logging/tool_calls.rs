@@ -1,106 +1,33 @@
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use opentelemetry::trace::{SpanContext, TraceContextExt};
-use opentelemetry::{Array, StringValue, Value};
-use serde::de::IgnoredAny;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-
+use crate::request_logging::json_output::{self, JsonCheck, OutputContext, check_json_object, finish_reason_label};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArgumentsOutcome {
-    Valid,
-    Empty,
-    InvalidJson,
-    NotObject,
-}
-
-impl ArgumentsOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Valid => "valid",
-            Self::Empty => "empty",
-            Self::InvalidJson => "invalid_json",
-            Self::NotObject => "not_object",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ParseErrorPosition {
-    pub line: usize,
-    pub column: usize,
-    pub category: &'static str,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCallCheck {
-    pub outcome: ArgumentsOutcome,
-    pub length: usize,
-    pub error: Option<ParseErrorPosition>,
-}
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallReport {
-    pub calls: Vec<ToolCallCheck>,
+    pub calls: Vec<JsonCheck>,
     pub stream: bool,
     pub finish_reasons: Vec<&'static str>,
 }
 
-impl ToolCallReport {
-    pub fn failures(&self) -> usize {
-        self.calls.iter().filter(|call| call.outcome != ArgumentsOutcome::Valid).count()
-    }
-}
-
-pub fn check_arguments(arguments: &str) -> ToolCallCheck {
-    let length = arguments.len();
-    if arguments.trim().is_empty() {
-        return ToolCallCheck {
-            outcome: ArgumentsOutcome::Empty,
-            length,
-            error: None,
-        };
-    }
-    match serde_json::from_str::<IgnoredAny>(arguments) {
-        Ok(_) if arguments.trim_start().starts_with('{') => ToolCallCheck {
-            outcome: ArgumentsOutcome::Valid,
-            length,
-            error: None,
-        },
-        Ok(_) => ToolCallCheck {
-            outcome: ArgumentsOutcome::NotObject,
-            length,
-            error: None,
-        },
-        Err(error) => ToolCallCheck {
-            outcome: ArgumentsOutcome::InvalidJson,
-            length,
-            error: Some(ParseErrorPosition {
-                line: error.line(),
-                column: error.column(),
-                category: match error.classify() {
-                    serde_json::error::Category::Syntax => "syntax",
-                    serde_json::error::Category::Eof => "eof",
-                    serde_json::error::Category::Data => "data",
-                    serde_json::error::Category::Io => "io",
-                },
-            }),
-        },
-    }
-}
-
-pub fn inspect(response: &AiResponse) -> Option<ToolCallReport> {
+pub fn inspect(response: &AiResponse, tool_choice: Option<&str>) -> Option<ToolCallReport> {
+    let forced = matches!(tool_choice, Some("required" | "function"));
     let report = match response {
         AiResponse::ChatCompletions(completion) => {
             let mut calls = Vec::new();
             let mut finish_reasons = Vec::new();
             for choice in &completion.choices {
-                let Some(tool_calls) = choice.message.tool_calls.as_ref().filter(|calls| !calls.is_empty()) else {
+                let tool_calls = choice.message.tool_calls.as_deref().unwrap_or_default();
+                let owed = forced || choice.finish_reason.as_deref() == Some("tool_calls");
+                if tool_calls.is_empty() && !owed {
                     continue;
-                };
-                calls.extend(tool_calls.iter().map(|call| check_arguments(&call.function.arguments)));
+                }
+                calls.extend(tool_calls.iter().map(|call| check_json_object(&call.function.arguments)));
+                if tool_calls.is_empty() {
+                    calls.push(JsonCheck::missing());
+                }
                 finish_reasons.extend(choice.finish_reason.as_deref().map(finish_reason_label));
             }
             ToolCallReport {
@@ -112,11 +39,13 @@ pub fn inspect(response: &AiResponse) -> Option<ToolCallReport> {
         AiResponse::ChatCompletionsStream(chunks) => {
             let mut arguments: BTreeMap<(u32, u32), String> = BTreeMap::new();
             let mut finish_reasons: BTreeMap<u32, &'static str> = BTreeMap::new();
+            let mut seen: BTreeSet<u32> = BTreeSet::new();
             for chunk in chunks {
                 let ChatCompletionChunk::Chunk(chunk) = chunk else {
                     continue;
                 };
                 for choice in &chunk.choices {
+                    seen.insert(choice.index);
                     for call in choice.delta.tool_calls.iter().flatten() {
                         let fragment = call.function.as_ref().and_then(|function| function.arguments.as_deref());
                         arguments
@@ -129,32 +58,33 @@ pub fn inspect(response: &AiResponse) -> Option<ToolCallReport> {
                     }
                 }
             }
-            let choices_with_calls: Vec<u32> = arguments.keys().map(|(choice, _)| *choice).collect();
+            let owed = |choice: &u32| forced || finish_reasons.get(choice) == Some(&"tool_calls");
+            let choices: BTreeSet<u32> = arguments
+                .keys()
+                .map(|(choice, _)| *choice)
+                .chain(seen.iter().copied().filter(owed))
+                .collect();
+            let mut calls = Vec::new();
+            for &choice in &choices {
+                let before = calls.len();
+                calls.extend(
+                    arguments
+                        .range((choice, 0)..=(choice, u32::MAX))
+                        .map(|(_, arguments)| check_json_object(arguments)),
+                );
+                if calls.len() == before {
+                    calls.push(JsonCheck::missing());
+                }
+            }
             ToolCallReport {
-                calls: arguments.values().map(|arguments| check_arguments(arguments)).collect(),
+                calls,
                 stream: true,
-                finish_reasons: finish_reasons
-                    .into_iter()
-                    .filter(|(choice, _)| choices_with_calls.contains(choice))
-                    .map(|(_, reason)| reason)
-                    .collect(),
+                finish_reasons: choices.iter().filter_map(|choice| finish_reasons.get(choice).copied()).collect(),
             }
         }
         _ => return None,
     };
     (!report.calls.is_empty()).then_some(report)
-}
-
-pub fn finish_reason_label(reason: &str) -> &'static str {
-    match reason {
-        "stop" => "stop",
-        "length" => "length",
-        "tool_calls" => "tool_calls",
-        "content_filter" => "content_filter",
-        "function_call" => "function_call",
-        "error" => "error",
-        _ => "other",
-    }
 }
 
 pub fn tool_choice_mode(tool_choice: &serde_json::Value) -> Option<&'static str> {
@@ -181,72 +111,31 @@ pub fn named_tool_choice_mode(mode: &str) -> &'static str {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ToolCallContext<'a> {
-    pub model: Option<&'a str>,
-    pub tool_choice: Option<&'a str>,
-    pub served_by: Option<&'a str>,
-    pub parent: Option<&'a SpanContext>,
-}
-
-pub fn record(report: &ToolCallReport, context: &ToolCallContext<'_>) {
-    let model = context.model.unwrap_or_default().to_string();
-    let tool_choice = context.tool_choice.unwrap_or("unset");
-    let stream = if report.stream { "true" } else { "false" };
+pub fn record(report: &ToolCallReport, context: &OutputContext<'_>, tool_choice: Option<&str>) {
+    let model = context.model();
+    let tool_choice = tool_choice.unwrap_or("unset");
+    let stream = json_output::stream_label(report.stream);
+    let labels = [
+        ("model", model.clone()),
+        ("tool_choice", tool_choice.to_string()),
+        ("stream", stream.to_string()),
+    ];
     for call in &report.calls {
-        metrics::counter!(
-            "dwctl_tool_call_arguments_total",
-            "model" => model.clone(),
-            "outcome" => call.outcome.as_str(),
-            "tool_choice" => tool_choice.to_string(),
-            "stream" => stream,
-        )
-        .increment(1);
+        json_output::count("dwctl_tool_call_arguments_total", &labels, call.outcome);
     }
 
-    let span = tracing::info_span!("dwctl.tool_call_arguments", otel.name = "dwctl.tool_call_arguments");
-    if let Some(parent) = context.parent {
-        let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent.clone()));
-    }
-    let failed = report.failures();
-    let first_error = report.calls.iter().find_map(|call| call.error);
-    span.set_attribute("gen_ai.request.model", model.clone());
-    span.set_attribute(
-        "gen_ai.response.finish_reasons",
-        Value::Array(Array::String(
-            report.finish_reasons.iter().map(|&reason| StringValue::from(reason)).collect(),
-        )),
+    let span = context.span(
+        "dwctl.tool_call_arguments",
+        "doubleword.tool_calls",
+        "argument_lengths",
+        &report.calls,
+        report.stream,
+        &report.finish_reasons,
     );
-    span.set_attribute("doubleword.tool_calls.count", report.calls.len() as i64);
-    span.set_attribute("doubleword.tool_calls.failed", failed as i64);
-    span.set_attribute(
-        "doubleword.tool_calls.outcomes",
-        Value::Array(Array::String(
-            report.calls.iter().map(|call| StringValue::from(call.outcome.as_str())).collect(),
-        )),
-    );
-    span.set_attribute(
-        "doubleword.tool_calls.argument_lengths",
-        Value::Array(Array::I64(
-            report
-                .calls
-                .iter()
-                .map(|call| i64::try_from(call.length).unwrap_or(i64::MAX))
-                .collect(),
-        )),
-    );
-    if let Some(error) = first_error {
-        span.set_attribute("doubleword.tool_calls.first_error.line", error.line as i64);
-        span.set_attribute("doubleword.tool_calls.first_error.column", error.column as i64);
-        span.set_attribute("doubleword.tool_calls.first_error.category", error.category);
-    }
     span.set_attribute("doubleword.tool_choice", tool_choice.to_string());
-    span.set_attribute("doubleword.stream", report.stream);
-    if let Some(served_by) = context.served_by {
-        span.set_attribute("doubleword.served_by", served_by.to_string());
-    }
+    let failed = json_output::failures(&report.calls);
     if failed > 0 {
-        span.set_attribute("otel.status_code", "ERROR");
+        let first_error = json_output::first_error(&report.calls);
         let _entered = span.enter();
         tracing::warn!(
             model = %model,
@@ -266,18 +155,25 @@ pub fn record(report: &ToolCallReport, context: &ToolCallContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_logging::json_output::JsonOutcome;
+    use crate::request_logging::json_output::testing::{attribute, counter, parent, recorded};
+    use opentelemetry::trace::TraceFlags;
     use serde_json::json;
 
-    fn chat(tool_calls: serde_json::Value) -> AiResponse {
+    fn chat_with(tool_calls: serde_json::Value, finish_reason: &str) -> AiResponse {
         serde_json::from_value(json!({
             "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "model-a",
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": null, "tool_calls": tool_calls},
-                "finish_reason": "tool_calls"
+                "finish_reason": finish_reason
             }]
         }))
         .unwrap()
+    }
+
+    fn chat(tool_calls: serde_json::Value) -> AiResponse {
+        chat_with(tool_calls, "tool_calls")
     }
 
     fn call(arguments: &str) -> serde_json::Value {
@@ -309,41 +205,16 @@ mod tests {
         json!({"tool_calls": [{"index": index, "function": {"arguments": arguments}}]})
     }
 
-    #[test]
-    fn arguments_are_classified() {
-        assert_eq!(check_arguments(r#"{"city": "Paris"}"#).outcome, ArgumentsOutcome::Valid);
-        assert_eq!(check_arguments(" {}\n").outcome, ArgumentsOutcome::Valid);
-        assert_eq!(check_arguments("").outcome, ArgumentsOutcome::Empty);
-        assert_eq!(check_arguments(r#""Paris""#).outcome, ArgumentsOutcome::NotObject);
-        assert_eq!(check_arguments("[1]").outcome, ArgumentsOutcome::NotObject);
-        assert_eq!(check_arguments("null").outcome, ArgumentsOutcome::NotObject);
-
-        let truncated = check_arguments(r#"{"city": "Par"#);
-        assert_eq!(truncated.outcome, ArgumentsOutcome::InvalidJson);
-        assert_eq!(truncated.length, 13);
-        assert_eq!(truncated.error.map(|error| error.category), Some("eof"));
-
-        let trailing = check_arguments(r#"{"a": 1}{"a": 2}"#);
-        assert_eq!(trailing.outcome, ArgumentsOutcome::InvalidJson);
-        assert_eq!(
-            trailing.error,
-            Some(ParseErrorPosition {
-                line: 1,
-                column: 9,
-                category: "syntax"
-            })
-        );
+    fn outcomes(report: &ToolCallReport) -> Vec<JsonOutcome> {
+        report.calls.iter().map(|call| call.outcome).collect()
     }
 
     #[test]
     fn non_streaming_tool_calls_are_checked_in_order() {
-        let report = inspect(&chat(json!([call(r#"{"q": 1}"#), call(r#"{"q": "#)]))).unwrap();
+        let report = inspect(&chat(json!([call(r#"{"q": 1}"#), call(r#"{"q": "#)])), None).unwrap();
         assert!(!report.stream);
-        assert_eq!(
-            report.calls.iter().map(|call| call.outcome).collect::<Vec<_>>(),
-            [ArgumentsOutcome::Valid, ArgumentsOutcome::InvalidJson]
-        );
-        assert_eq!(report.failures(), 1);
+        assert_eq!(outcomes(&report), [JsonOutcome::Valid, JsonOutcome::InvalidJson]);
+        assert_eq!(json_output::failures(&report.calls), 1);
         assert_eq!(report.finish_reasons, ["tool_calls"]);
     }
 
@@ -358,14 +229,44 @@ mod tests {
             ],
             "tool_calls",
         );
-        let report = inspect(&response).unwrap();
+        let report = inspect(&response, None).unwrap();
         assert!(report.stream);
-        assert_eq!(
-            report.calls.iter().map(|call| call.outcome).collect::<Vec<_>>(),
-            [ArgumentsOutcome::Valid, ArgumentsOutcome::InvalidJson]
-        );
+        assert_eq!(outcomes(&report), [JsonOutcome::Valid, JsonOutcome::InvalidJson]);
         assert_eq!(report.calls[0].length, r#"{"city": "Paris"}"#.len());
         assert_eq!(report.finish_reasons, ["tool_calls"]);
+    }
+
+    #[test]
+    fn finishing_with_tool_calls_but_none_is_a_missing_call() {
+        let report = inspect(&chat(serde_json::Value::Null), None).unwrap();
+        assert_eq!(outcomes(&report), [JsonOutcome::Missing]);
+        assert_eq!(report.finish_reasons, ["tool_calls"]);
+
+        let report = inspect(&stream(&[json!({"content": "<tool_call>lookup"})], "tool_calls"), None).unwrap();
+        assert!(report.stream);
+        assert_eq!(outcomes(&report), [JsonOutcome::Missing]);
+        assert_eq!(report.calls[0].length, 0);
+    }
+
+    #[test]
+    fn a_forced_tool_choice_answered_without_a_call_is_missing() {
+        let answer: AiResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "model-a",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
+        }))
+        .unwrap();
+        for forced in ["required", "function"] {
+            let report = inspect(&answer, Some(forced)).unwrap();
+            assert_eq!(outcomes(&report), [JsonOutcome::Missing], "{forced}");
+            assert_eq!(report.finish_reasons, ["stop"]);
+            let streamed = inspect(&stream(&[json!({"content": "Hi"})], "stop"), Some(forced)).unwrap();
+            assert_eq!(outcomes(&streamed), [JsonOutcome::Missing], "{forced}");
+        }
+        assert_eq!(inspect(&answer, Some("auto")), None);
+        assert_eq!(
+            outcomes(&inspect(&chat_with(json!([call("{}")]), "stop"), Some("required")).unwrap()),
+            [JsonOutcome::Valid]
+        );
     }
 
     #[test]
@@ -375,10 +276,10 @@ mod tests {
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}]
         }))
         .unwrap();
-        assert_eq!(inspect(&answer), None);
-        assert_eq!(inspect(&chat(json!([]))), None);
-        assert_eq!(inspect(&stream(&[json!({"content": "Hi"})], "stop")), None);
-        assert_eq!(inspect(&AiResponse::Other(serde_json::Value::Null)), None);
+        assert_eq!(inspect(&answer, None), None);
+        assert_eq!(inspect(&chat_with(json!([]), "stop"), None), None);
+        assert_eq!(inspect(&stream(&[json!({"content": "Hi"})], "stop"), None), None);
+        assert_eq!(inspect(&AiResponse::Other(serde_json::Value::Null), None), None);
     }
 
     #[test]
@@ -398,62 +299,26 @@ mod tests {
 
     #[test]
     fn finish_reasons_are_bounded() {
-        let mut response = chat(json!([call("{}")]));
-        if let AiResponse::ChatCompletions(completion) = &mut response {
-            completion.choices[0].finish_reason = Some("private-value-7f3a".to_string());
-        }
-        assert_eq!(inspect(&response).unwrap().finish_reasons, ["other"]);
-        assert_eq!(finish_reason_label("length"), "length");
+        let response = chat_with(json!([call("{}")]), "private-value-7f3a");
+        assert_eq!(inspect(&response, None).unwrap().finish_reasons, ["other"]);
     }
 
-    fn record_under(report: &ToolCallReport, parent: &SpanContext) -> (Vec<opentelemetry_sdk::trace::SpanData>, String) {
-        use opentelemetry::trace::TracerProvider as _;
-        use opentelemetry_sdk::error::OTelSdkResult;
-        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Clone, Debug, Default)]
-        struct Exported(Arc<Mutex<Vec<SpanData>>>);
-        impl SpanExporter for Exported {
-            async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-                self.0.lock().unwrap().extend(batch);
-                Ok(())
-            }
-        }
-
-        let exporter = Exported::default();
-        let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("tool-calls-test")));
-        let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let handle = prometheus.handle();
-        metrics::with_local_recorder(&prometheus, || {
-            tracing::subscriber::with_default(subscriber, || {
-                record(
-                    report,
-                    &ToolCallContext {
-                        model: Some("model-a"),
-                        tool_choice: Some("required"),
-                        served_by: Some("upstream.example.com"),
-                        parent: Some(parent),
-                    },
-                )
-            })
-        });
-        provider.force_flush().unwrap();
-        let spans = exporter.0.lock().unwrap().clone();
-        (spans, handle.render())
-    }
-
-    fn parent(flags: opentelemetry::trace::TraceFlags) -> SpanContext {
-        SpanContext::new(
-            opentelemetry::trace::TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
-            opentelemetry::trace::SpanId::from_hex("00f067aa0ba902b7").unwrap(),
-            flags,
-            false,
-            Default::default(),
-        )
+    fn record_under(report: &ToolCallReport, flags: TraceFlags) -> (Vec<opentelemetry_sdk::trace::SpanData>, String) {
+        let parent = parent(flags);
+        recorded(|| {
+            record(
+                report,
+                &OutputContext {
+                    model: Some("model-a"),
+                    served_by: Some("upstream.example.com"),
+                    max_tokens: Some(200),
+                    output_tokens: Some(200),
+                    reasoning_tokens: Some(150),
+                    parent: Some(&parent),
+                },
+                Some("required"),
+            )
+        })
     }
 
     #[test]
@@ -463,32 +328,34 @@ mod tests {
             call(&format!(r#"{{"note": "{SECRET}"}}"#)),
             call(&format!(r#"{{"note": "{SECRET}"#)),
         ]));
-        let report = inspect(&response).unwrap();
-        let (spans, rendered) = record_under(&report, &parent(opentelemetry::trace::TraceFlags::SAMPLED));
+        let report = inspect(&response, None).unwrap();
+        let (spans, rendered) = record_under(&report, TraceFlags::SAMPLED);
 
-        for outcome in ["valid", "invalid_json"] {
-            assert!(
-                rendered.lines().any(|line| line.starts_with("dwctl_tool_call_arguments_total")
-                    && line.contains(&format!(r#"outcome="{outcome}""#))
-                    && line.contains(r#"model="model-a""#)
-                    && line.contains(r#"tool_choice="required""#)
-                    && line.contains(r#"stream="false""#)
-                    && line.ends_with(" 1")),
-                "{rendered}"
-            );
-        }
+        let labels = [r#"model="model-a""#, r#"tool_choice="required""#, r#"stream="false""#];
+        let count = |outcome: &str| {
+            let outcome = format!(r#"outcome="{outcome}""#);
+            counter(
+                &rendered,
+                "dwctl_tool_call_arguments_total",
+                &[&labels[..], &[outcome.as_str()]].concat(),
+            )
+        };
+        assert_eq!(count("valid"), Some(1), "{rendered}");
+        assert_eq!(count("invalid_json"), Some(1), "{rendered}");
+        assert_eq!(count("missing"), Some(0), "{rendered}");
 
-        let span = spans
-            .iter()
-            .find(|span| span.name == "dwctl.tool_call_arguments")
-            .expect("span exported");
-        let attr = |key: &str| span.attributes.iter().find(|a| a.key.as_str() == key).map(|a| a.value.to_string());
+        const NAME: &str = "dwctl.tool_call_arguments";
+        let attr = |key: &str| attribute(&spans, NAME, key);
+        let span = spans.iter().find(|span| span.name == NAME).unwrap();
         assert_eq!(span.span_context.trace_id().to_string(), "4bf92f3577b34da6a3ce929d0e0e4736");
         assert_eq!(attr("doubleword.tool_calls.count").as_deref(), Some("2"));
         assert_eq!(attr("doubleword.tool_calls.failed").as_deref(), Some("1"));
         assert_eq!(attr("doubleword.tool_calls.first_error.category").as_deref(), Some("eof"));
+        assert!(attr("doubleword.tool_calls.argument_lengths").is_some());
         assert_eq!(attr("doubleword.tool_choice").as_deref(), Some("required"));
         assert_eq!(attr("doubleword.served_by").as_deref(), Some("upstream.example.com"));
+        assert_eq!(attr("gen_ai.request.max_tokens").as_deref(), Some("200"));
+        assert_eq!(attr("gen_ai.usage.output_tokens.reasoning").as_deref(), Some("150"));
         assert!(attr("doubleword.tool_calls.outcomes").unwrap().contains("invalid_json"));
 
         let recorded = format!("{spans:?}{rendered}");
@@ -498,8 +365,8 @@ mod tests {
 
     #[test]
     fn record_keeps_the_requests_sampling_decision() {
-        let report = inspect(&chat(json!([call("{}")]))).unwrap();
-        let (spans, rendered) = record_under(&report, &parent(opentelemetry::trace::TraceFlags::default()));
+        let report = inspect(&chat(json!([call("{}")])), None).unwrap();
+        let (spans, rendered) = record_under(&report, TraceFlags::default());
         assert!(spans.is_empty(), "{spans:?}");
         assert!(rendered.contains("dwctl_tool_call_arguments_total"));
     }

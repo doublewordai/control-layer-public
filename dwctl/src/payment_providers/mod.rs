@@ -107,6 +107,21 @@ pub struct WebhookEvent {
     pub session_id: Option<String>,
 }
 
+pub(crate) async fn claim_checkout_attempt(conn: &mut sqlx::PgConnection, session_id: &str) {
+    if let Err(e) = crate::db::handlers::checkout_attempts::CheckoutAttempts::new(conn)
+        .mark_completed(session_id)
+        .await
+    {
+        tracing::error!(session_id, error = %e, "Failed to mark checkout attempt completed");
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedCheckout {
+    pub url: String,
+    pub session_id: String,
+}
+
 pub struct CheckoutPayer {
     pub id: UserId,
     pub email: String,
@@ -121,11 +136,11 @@ pub trait PaymentProvider: Send + Sync {
         creditee_id: Option<&str>,
         cancel_url: &str,
         success_url: &str,
-    ) -> Result<String>;
+    ) -> Result<OpenedCheckout>;
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession>;
 
-    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String>;
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<OpenedCheckout>;
 
     async fn process_payment_session(&self, db_pool: &PgPool, session_id: &str, credits_config: &CreditsConfig) -> Result<()>;
 
@@ -135,7 +150,12 @@ pub trait PaymentProvider: Send + Sync {
 
     async fn create_billing_portal_session(&self, customer_id: &str, return_url: &str) -> Result<String>;
 
-    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String>;
+    async fn create_auto_topup_checkout_session(
+        &self,
+        payer: &CheckoutPayer,
+        cancel_url: &str,
+        success_url: &str,
+    ) -> Result<OpenedCheckout>;
 
     async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult>;
 

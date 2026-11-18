@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND (payment_provider_id IS NULL OR payment_provider_id = '')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "217a0e13fe50a6a478bfe3e8b56def431843a8d1c1482693db718f77b6aae1b5"
+}

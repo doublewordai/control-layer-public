@@ -5,7 +5,8 @@ use crate::request_logging::models::{
     AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, MessagesRequest, ParsedAIRequest, ResponsesRequest,
 };
 use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
-use crate::request_logging::tool_calls::named_tool_choice_mode;
+use crate::request_logging::structured_output::response_format_label;
+use crate::request_logging::tool_calls::{named_tool_choice_mode, tool_choice_mode};
 use onwards::strict::schemas::chat_completions::ToolChoice;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -111,6 +112,8 @@ pub struct RequestParams {
     pub message_count: Option<i32>,
     #[serde(default)]
     pub tool_choice: Option<String>,
+    #[serde(default)]
+    pub response_format: Option<String>,
 }
 
 impl RequestParams {
@@ -128,6 +131,7 @@ impl RequestParams {
                 tool_count: Some(req.tool_count),
                 message_count: req.message_count,
                 tool_choice: req.tool_choice.map(String::from),
+                response_format: None,
             };
         }
         match &parsed.request {
@@ -147,6 +151,10 @@ impl RequestParams {
                         ToolChoice::Specific { .. } => "function",
                     })
                     .map(String::from),
+                response_format: req
+                    .response_format
+                    .as_ref()
+                    .map(|format| response_format_label(&format.format_type).to_string()),
             },
             AiRequest::Completions(req) => Self {
                 stream: Some(req.stream.unwrap_or(false)),
@@ -157,6 +165,15 @@ impl RequestParams {
                 tool_count: None,
                 message_count: None,
                 tool_choice: None,
+                response_format: None,
+            },
+            AiRequest::Other(value) if value.get("messages").is_some() => Self {
+                tool_choice: value.get("tool_choice").and_then(tool_choice_mode).map(String::from),
+                response_format: value
+                    .pointer("/response_format/type")
+                    .and_then(Value::as_str)
+                    .map(|format_type| response_format_label(format_type).to_string()),
+                ..Self::default()
             },
             AiRequest::Embeddings(_) | AiRequest::Other(_) => Self::default(),
         }
@@ -2407,6 +2424,7 @@ mod tests {
                 tool_count: Some(2),
                 message_count: Some(3),
                 tool_choice: None,
+                response_format: None,
             }
         );
     }
@@ -2885,6 +2903,7 @@ mod tests {
                 tool_count: Some(1),
                 message_count: Some(3),
                 tool_choice: None,
+                response_format: None,
             }
         );
     }
@@ -2905,6 +2924,51 @@ mod tests {
             params_for("/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"u"}]}"#).tool_choice,
             None
         );
+    }
+
+    #[test]
+    fn request_params_read_the_response_format_type() {
+        let format = |response_format: serde_json::Value| {
+            let body =
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "u"}], "response_format": response_format});
+            params_for("/chat/completions", &body.to_string()).response_format
+        };
+        let schema = serde_json::json!({"type": "json_schema", "json_schema": {"name": "private-name", "schema": {"type": "object"}}});
+        assert_eq!(format(schema).as_deref(), Some("json_schema"));
+        assert_eq!(format(serde_json::json!({"type": "json_object"})).as_deref(), Some("json_object"));
+        assert_eq!(format(serde_json::json!({"type": "regex"})).as_deref(), Some("other"));
+        assert_eq!(
+            params_for("/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"u"}]}"#).response_format,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unmodelled_chat_request_keeps_its_output_labels() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "f"}}]}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "object"}}},
+            "tool_choice": {"type": "function", "function": {"name": "private-name"}}
+        });
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body.to_string())),
+            trace_id: None,
+            span_id: None,
+        };
+        assert!(
+            matches!(parse_ai_request(&request_data).unwrap().request, AiRequest::Other(_)),
+            "precondition"
+        );
+        let params = params_for("/chat/completions", &body.to_string());
+        assert_eq!(params.response_format.as_deref(), Some("json_schema"));
+        assert_eq!(params.tool_choice.as_deref(), Some("function"));
+        assert_eq!(params.stream, None, "analytics fields are left as before");
     }
 
     #[test]

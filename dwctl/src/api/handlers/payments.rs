@@ -8,12 +8,18 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx_pool_router::PoolProvider;
+use uuid::Uuid;
 
 use crate::{
     AppState,
     api::models::users::CurrentUser,
     auth::permissions,
-    db::{handlers::repository::Repository, handlers::users::Users, models::users::UserUpdateDBRequest},
+    db::{
+        handlers::checkout_attempts::{CheckoutAttempts, CheckoutKind, Reservation},
+        handlers::repository::Repository,
+        handlers::users::Users,
+        models::users::UserUpdateDBRequest,
+    },
     metrics::errors::component::PAYMENTS,
     payment_providers,
 };
@@ -24,6 +30,123 @@ struct BillingTarget {
     email: String,
     invoicing_enabled: bool,
     display_name: Option<String>,
+}
+
+enum CheckoutGate {
+    Proceed(Uuid),
+    Refused(Response),
+}
+
+async fn begin_checkout<P: PoolProvider>(
+    state: &AppState<P>,
+    actor: &CurrentUser,
+    provider: &dyn payment_providers::PaymentProvider,
+    payer: &mut payment_providers::CheckoutPayer,
+    display_name: Option<&str>,
+    kind: CheckoutKind,
+) -> Result<CheckoutGate, StatusCode> {
+    let config = state.current_config();
+    let limits = &config.limits.checkout;
+    let window_hours = i32::try_from(limits.window_hours.max(1)).unwrap_or(i32::MAX);
+    let max_unpaid = (limits.max_unpaid_per_user > 0).then(|| i64::from(limits.max_unpaid_per_user));
+
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let reservation = CheckoutAttempts::new(&mut conn)
+        .reserve(actor.id, payer.id, kind, max_unpaid, window_hours)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reserve checkout attempt: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let attempt_id = match reservation {
+        Reservation::Reserved(id) => id,
+        Reservation::OverCap { unpaid } => {
+            metrics::counter!("dwctl_checkout_limit_reached_total").increment(1);
+            tracing::warn!(actor_id = %actor.id, payer_id = %payer.id, unpaid, "Refused checkout: too many unpaid checkouts");
+            return Ok(CheckoutGate::Refused(
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "message": "Too many incomplete payment attempts. Please try again later or contact support."
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+
+    if payer.payment_provider_id.as_deref().is_none_or(str::is_empty) {
+        let customer_id = ensure_provider_customer(&mut conn, provider, payer, display_name).await;
+        drop(conn);
+        match customer_id {
+            Ok(customer_id) => payer.payment_provider_id = Some(customer_id),
+            Err(status) => {
+                abandon_checkout(state, attempt_id).await;
+                return Err(status);
+            }
+        }
+    }
+
+    Ok(CheckoutGate::Proceed(attempt_id))
+}
+
+async fn ensure_provider_customer(
+    conn: &mut sqlx::PgConnection,
+    provider: &dyn payment_providers::PaymentProvider,
+    payer: &payment_providers::CheckoutPayer,
+    display_name: Option<&str>,
+) -> Result<String, StatusCode> {
+    let new_id = provider.create_customer(&payer.email, display_name).await.map_err(|e| {
+        tracing::error!("Failed to create payment provider customer: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut users = Users::new(conn);
+    let saved = users.set_payment_provider_id_if_empty(payer.id, &new_id).await.map_err(|e| {
+        tracing::error!("Failed to save customer ID: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if saved {
+        return Ok(new_id);
+    }
+    Ok(users
+        .get_by_id(payer.id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to reload customer ID: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .and_then(|u| u.payment_provider_id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(new_id))
+}
+
+async fn record_checkout<P: PoolProvider>(state: &AppState<P>, attempt_id: Uuid, session_id: &str) {
+    let result = async {
+        let mut conn = state.db.write().acquire().await?;
+        CheckoutAttempts::new(&mut conn).bind_session(attempt_id, session_id).await?;
+        Ok::<_, crate::db::errors::DbError>(())
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::error!(%attempt_id, "Failed to record checkout session; paying it will not clear the attempt: {:?}", e);
+    }
+}
+
+async fn abandon_checkout<P: PoolProvider>(state: &AppState<P>, attempt_id: Uuid) {
+    let result = async {
+        let mut conn = state.db.write().acquire().await?;
+        CheckoutAttempts::new(&mut conn).release(attempt_id).await?;
+        Ok::<_, crate::db::errors::DbError>(())
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::error!(%attempt_id, "Failed to release checkout attempt: {:?}", e);
+    }
 }
 
 async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnection) -> Result<BillingTarget, StatusCode> {
@@ -86,6 +209,7 @@ pub struct PaymentQuery {
     ),
     responses(
         (status = 200, description = "Payment session created successfully. Returns JSON with checkout URL.", body = inline(Object)),
+        (status = 429, description = "Too many unpaid checkouts for this user"),
         (status = 501, description = "No payment provider configured"),
     ),
     security(
@@ -157,7 +281,7 @@ pub async fn create_payment<P: PoolProvider>(
             .into_response());
     }
 
-    let payer = payment_providers::CheckoutPayer {
+    let mut payer = payment_providers::CheckoutPayer {
         id: target.id,
         email: target.email,
         payment_provider_id: target.payment_provider_id,
@@ -165,16 +289,36 @@ pub async fn create_payment<P: PoolProvider>(
 
     let provider = payment_providers::create_provider(payment_config);
 
-    let checkout_url = provider
+    let attempt_id = match begin_checkout(
+        &state,
+        &user,
+        provider.as_ref(),
+        &mut payer,
+        target.display_name.as_deref(),
+        CheckoutKind::Payment,
+    )
+    .await?
+    {
+        CheckoutGate::Proceed(attempt_id) => attempt_id,
+        CheckoutGate::Refused(response) => return Ok(response),
+    };
+
+    let checkout = match provider
         .create_checkout_session(&payer, query.creditee_id.as_deref(), &cancel_url, &success_url)
         .await
-        .map_err(|e| {
+    {
+        Ok(checkout) => checkout,
+        Err(e) => {
             tracing::error!("Failed to create checkout session: {:?}", e);
-            StatusCode::from(e)
-        })?;
+            abandon_checkout(&state, attempt_id).await;
+            return Err(StatusCode::from(e));
+        }
+    };
+
+    record_checkout(&state, attempt_id, &checkout.session_id).await;
 
     Ok(Json(json!({
-        "url": checkout_url
+        "url": checkout.url
     }))
     .into_response())
 }
@@ -188,6 +332,7 @@ pub async fn create_payment<P: PoolProvider>(
     responses(
         (status = 200, description = "Setup session created successfully. Returns JSON with checkout URL.", body = inline(Object)),
         (status = 403, description = "Caller cannot manage billing for the active organization"),
+        (status = 429, description = "Too many unpaid checkouts for this user"),
         (status = 503, description = "No payment provider configured"),
     ),
     security(
@@ -221,7 +366,7 @@ pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<
     let target = resolve_billing_target(&user, &mut conn).await?;
     drop(conn);
 
-    let payer = payment_providers::CheckoutPayer {
+    let mut payer = payment_providers::CheckoutPayer {
         id: target.id,
         email: target.email,
         payment_provider_id: target.payment_provider_id,
@@ -229,16 +374,33 @@ pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<
 
     let provider = payment_providers::create_provider(payment_config);
 
-    let checkout_url = provider
-        .create_setup_checkout_session(&payer, &cancel_url, &success_url)
-        .await
-        .map_err(|e| {
+    let attempt_id = match begin_checkout(
+        &state,
+        &user,
+        provider.as_ref(),
+        &mut payer,
+        target.display_name.as_deref(),
+        CheckoutKind::Setup,
+    )
+    .await?
+    {
+        CheckoutGate::Proceed(attempt_id) => attempt_id,
+        CheckoutGate::Refused(response) => return Ok(response),
+    };
+
+    let checkout = match provider.create_setup_checkout_session(&payer, &cancel_url, &success_url).await {
+        Ok(checkout) => checkout,
+        Err(e) => {
             tracing::error!("Failed to create setup checkout session: {:?}", e);
-            StatusCode::from(e)
-        })?;
+            abandon_checkout(&state, attempt_id).await;
+            return Err(StatusCode::from(e));
+        }
+    };
+
+    record_checkout(&state, attempt_id, &checkout.session_id).await;
 
     Ok(Json(json!({
-        "url": checkout_url
+        "url": checkout.url
     }))
     .into_response())
 }
@@ -479,6 +641,7 @@ pub async fn create_billing_portal_session<P: PoolProvider>(
     responses(
         (status = 200, description = "Checkout session created. Returns JSON with checkout URL.", body = inline(Object)),
         (status = 400, description = "User does not have a payment provider customer ID"),
+        (status = 429, description = "Too many unpaid checkouts for this user"),
         (status = 503, description = "No payment provider configured"),
     ),
     security(
@@ -508,7 +671,7 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
     let success_url = format!("{}/cost-management?autoTopupId={{CHECKOUT_SESSION_ID}}&autoTopup=true", origin);
     let cancel_url = format!("{}/cost-management?autoTopup=true&autoTopupId=fail", origin);
 
-    let payer = payment_providers::CheckoutPayer {
+    let mut payer = payment_providers::CheckoutPayer {
         id: user.id,
         email: user.email.clone(),
         payment_provider_id: user.payment_provider_id.clone(),
@@ -516,16 +679,24 @@ pub async fn create_auto_topup_checkout<P: PoolProvider>(
 
     let provider = payment_providers::create_provider(payment_config);
 
-    let checkout_url = provider
-        .create_auto_topup_checkout_session(&payer, &cancel_url, &success_url)
-        .await
-        .map_err(|e| {
+    let attempt_id = match begin_checkout(&state, &user, provider.as_ref(), &mut payer, None, CheckoutKind::AutoTopup).await? {
+        CheckoutGate::Proceed(attempt_id) => attempt_id,
+        CheckoutGate::Refused(response) => return Ok(response),
+    };
+
+    let checkout = match provider.create_auto_topup_checkout_session(&payer, &cancel_url, &success_url).await {
+        Ok(checkout) => checkout,
+        Err(e) => {
             tracing::error!("Failed to create auto top-up checkout session: {:?}", e);
-            StatusCode::from(e)
-        })?;
+            abandon_checkout(&state, attempt_id).await;
+            return Err(StatusCode::from(e));
+        }
+    };
+
+    record_checkout(&state, attempt_id, &checkout.session_id).await;
 
     Ok(Json(json!({
-        "url": checkout_url
+        "url": checkout.url
     }))
     .into_response())
 }
@@ -1815,5 +1986,353 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, Some(0), "zero credits configured means no grant row");
+    }
+
+
+    use crate::api::models::users::{Role, UserResponse};
+
+    async fn checkout_cap_server(pool: &PgPool, tweak: impl FnOnce(&mut crate::config::CheckoutLimitsConfig)) -> TestServer {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+        tweak(&mut config.limits.checkout);
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let app = Router::new()
+            .route("/payments", post(create_payment))
+            .route("/payments/setup", post(create_payment_setup))
+            .route("/payments/{id}", patch(process_payment))
+            .route("/auto-topup/checkout", post(create_auto_topup_checkout))
+            .with_state(state);
+        TestServer::new(app).unwrap()
+    }
+
+    async fn open_checkout(server: &TestServer, user: &UserResponse, path: &str) -> axum_test::TestResponse {
+        let mut request = server.post(path);
+        for (key, value) in crate::test::utils::add_auth_headers(user) {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await
+    }
+
+    fn session_id_of(response: &axum_test::TestResponse) -> String {
+        let body: serde_json::Value = response.json();
+        let url = url::Url::parse(body["url"].as_str().unwrap()).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        pairs.get("session_id").unwrap().to_string()
+    }
+
+    async fn confirm_payment(server: &TestServer, user: &UserResponse, session_id: &str) {
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in crate::test::utils::add_auth_headers(user) {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status_success();
+    }
+
+    async fn stored_customer_id(pool: &PgPool, user: &UserResponse) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT payment_provider_id FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_refuses_after_default_unpaid_limit(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |_| {}).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        for attempt in 1..=5 {
+            let response = open_checkout(&server, &user, "/payments").await;
+            assert_eq!(response.status_code(), StatusCode::OK, "unpaid checkout {attempt} of 5 is allowed");
+        }
+        let refused = open_checkout(&server, &user, "/payments").await;
+        refused.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        let body: serde_json::Value = refused.json();
+        assert!(body["message"].as_str().unwrap().contains("incomplete payment attempts"));
+
+        let other = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        open_checkout(&server, &other, "/payments").await.assert_status(StatusCode::OK);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_never_counts_paid_checkouts(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 2).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        for top_up in 1..=8 {
+            let response = open_checkout(&server, &user, "/payments").await;
+            assert_eq!(response.status_code(), StatusCode::OK, "paid top-up {top_up} must not be limited");
+            confirm_payment(&server, &user, &session_id_of(&response)).await;
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_replayed_confirmation_clears_one_attempt(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 2).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        let first = open_checkout(&server, &user, "/payments/setup").await;
+        first.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments/setup").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments/setup")
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+        let session_id = session_id_of(&first);
+        confirm_payment(&server, &user, &session_id).await;
+        confirm_payment(&server, &user, &session_id).await;
+
+        open_checkout(&server, &user, "/payments/setup").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments/setup")
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_is_shared_by_every_checkout_endpoint(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 3).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments/setup").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/auto-topup/checkout")
+            .await
+            .assert_status(StatusCode::OK);
+
+        for path in ["/payments", "/payments/setup", "/auto-topup/checkout"] {
+            open_checkout(&server, &user, path)
+                .await
+                .assert_status(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_only_counts_the_rolling_window(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 2).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments")
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+        sqlx::query("UPDATE checkout_attempts SET created_at = NOW() - INTERVAL '25 hours' WHERE payer_id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_zero_means_unlimited(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 0).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        for _ in 0..12 {
+            open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_follows_the_user_across_organizations(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 3).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org_a = crate::test::utils::create_test_org(&pool, user.id).await;
+        let org_b = crate::test::utils::create_test_org(&pool, user.id).await;
+
+        let open_as = |org: Option<crate::types::UserId>| {
+            let mut request = server.post("/payments");
+            for (key, value) in crate::test::utils::add_auth_headers(&user) {
+                request = request.add_header(key.as_str(), value.as_str());
+            }
+            if let Some(org_id) = org {
+                request = request.add_header("x-organization-id", org_id.to_string());
+            }
+            request
+        };
+
+        open_as(None).await.assert_status(StatusCode::OK);
+        open_as(Some(org_a.id)).await.assert_status(StatusCode::OK);
+        open_as(Some(org_b.id)).await.assert_status(StatusCode::OK);
+
+        for org in [None, Some(org_a.id), Some(org_b.id)] {
+            open_as(org).await.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        let colleague = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        crate::test::utils::add_org_member(&pool, org_a.id, colleague.id, "admin").await;
+        let mut request = server.post("/payments");
+        for (key, value) in crate::test::utils::add_auth_headers(&colleague) {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request
+            .add_header("x-organization-id", org_a.id.to_string())
+            .await
+            .assert_status(StatusCode::OK);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_payment_clears_only_its_own_attempt(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 2).await;
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, owner.id).await;
+        let colleague = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        crate::test::utils::add_org_member(&pool, org.id, colleague.id, "admin").await;
+
+        let open_for_org = |user: &UserResponse| {
+            let mut request = server.post("/payments");
+            for (key, value) in crate::test::utils::add_auth_headers(user) {
+                request = request.add_header(key.as_str(), value.as_str());
+            }
+            request.add_header("x-organization-id", org.id.to_string())
+        };
+        let confirm_for_org = |user: &UserResponse, session_id: String| {
+            let mut request = server.patch(&format!("/payments/{}", session_id));
+            for (key, value) in crate::test::utils::add_auth_headers(user) {
+                request = request.add_header(key.as_str(), value.as_str());
+            }
+            request.add_header("x-organization-id", org.id.to_string())
+        };
+
+        open_for_org(&colleague).await.assert_status(StatusCode::OK);
+        open_for_org(&colleague).await.assert_status(StatusCode::OK);
+        open_for_org(&colleague).await.assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+        for _ in 0..2 {
+            let response = open_for_org(&owner).await;
+            response.assert_status(StatusCode::OK);
+            confirm_for_org(&owner, session_id_of(&response)).await.assert_status_success();
+        }
+
+        open_for_org(&colleague).await.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        open_for_org(&owner).await.assert_status(StatusCode::OK);
+        open_for_org(&owner).await.assert_status(StatusCode::OK);
+        open_for_org(&owner).await.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_creates_one_customer_and_reuses_it(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |_| {}).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        assert_eq!(
+            stored_customer_id(&pool, &user).await,
+            None,
+            "no customer before the first checkout"
+        );
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        let customer = stored_customer_id(&pool, &user).await.expect("first checkout saves a customer id");
+
+        for path in ["/payments", "/payments/setup", "/auto-topup/checkout"] {
+            open_checkout(&server, &user, path).await.assert_status(StatusCode::OK);
+            assert_eq!(
+                stored_customer_id(&pool, &user).await.as_deref(),
+                Some(customer.as_str()),
+                "{path} must reuse the existing customer"
+            );
+        }
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_replaces_an_empty_customer_id_once(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |_| {}).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query("UPDATE users SET payment_provider_id = '' WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        let customer = stored_customer_id(&pool, &user)
+            .await
+            .filter(|id| !id.is_empty())
+            .expect("a customer id is saved");
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        assert_eq!(stored_customer_id(&pool, &user).await.as_deref(), Some(customer.as_str()));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_zero_window_still_enforces(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| {
+            limits.max_unpaid_per_user = 1;
+            limits.window_hours = 0;
+        })
+        .await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        open_checkout(&server, &user, "/payments").await.assert_status(StatusCode::OK);
+        open_checkout(&server, &user, "/payments")
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_checkout_cap_holds_for_parallel_requests(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 5).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        let responses = futures::future::join_all((0..10).map(|_| open_checkout(&server, &user, "/payments"))).await;
+
+        let opened = responses.iter().filter(|r| r.status_code() == StatusCode::OK).count();
+        let refused = responses
+            .iter()
+            .filter(|r| r.status_code() == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert_eq!((opened, refused), (5, 5), "exactly the cap gets through a burst of 10");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_released_reservation_does_not_count(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut attempts = CheckoutAttempts::new(&mut conn);
+
+        let Reservation::Reserved(first) = attempts
+            .reserve(user.id, user.id, CheckoutKind::Payment, Some(1), 24)
+            .await
+            .unwrap()
+        else {
+            panic!("the first checkout is under the cap");
+        };
+        assert_eq!(
+            attempts
+                .reserve(user.id, user.id, CheckoutKind::Payment, Some(1), 24)
+                .await
+                .unwrap(),
+            Reservation::OverCap { unpaid: 1 }
+        );
+
+        attempts.release(first).await.unwrap();
+        assert!(matches!(
+            attempts
+                .reserve(user.id, user.id, CheckoutKind::Payment, Some(1), 24)
+                .await
+                .unwrap(),
+            Reservation::Reserved(_)
+        ));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn test_refused_checkout_creates_no_customer(pool: PgPool) {
+        let server = checkout_cap_server(&pool, |limits| limits.max_unpaid_per_user = 1).await;
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query("INSERT INTO checkout_attempts (actor_id, payer_id, kind, session_id) VALUES ($1, $1, 'payment', 'cs_test_unpaid')")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        open_checkout(&server, &user, "/payments")
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(stored_customer_id(&pool, &user).await, None);
     }
 }

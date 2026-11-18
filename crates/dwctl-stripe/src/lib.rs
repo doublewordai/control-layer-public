@@ -282,11 +282,17 @@ pub fn verify_webhook(body: &str, signature: &str, webhook_secret: &str) -> Resu
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedCheckout {
+    pub id: String,
+    pub url: String,
+}
+
 #[async_trait]
 pub trait StripeApi: Send + Sync {
-    async fn create_payment_checkout_session(&self, checkout: PaymentCheckout<'_>) -> Result<String>;
+    async fn create_payment_checkout_session(&self, checkout: PaymentCheckout<'_>) -> Result<CreatedCheckout>;
 
-    async fn create_setup_checkout_session(&self, checkout: SetupCheckout<'_>) -> Result<String>;
+    async fn create_setup_checkout_session(&self, checkout: SetupCheckout<'_>) -> Result<CreatedCheckout>;
 
     async fn get_payment_session(&self, session_id: &str) -> Result<CheckoutSession>;
 
@@ -379,7 +385,7 @@ impl StripeClient {
 
 #[async_trait]
 impl StripeApi for StripeClient {
-    async fn create_payment_checkout_session(&self, checkout: PaymentCheckout<'_>) -> Result<String> {
+    async fn create_payment_checkout_session(&self, checkout: PaymentCheckout<'_>) -> Result<CreatedCheckout> {
         let payer = checkout.payer;
         let mut checkout_params = CreateCheckoutSession::new()
             .cancel_url(checkout.cancel_url)
@@ -444,13 +450,17 @@ impl StripeApi for StripeClient {
             payer.reference_id
         );
 
-        checkout_session.url.ok_or_else(|| {
+        let url = checkout_session.url.ok_or_else(|| {
             tracing::error!("Checkout session missing URL");
             Error::Api("Checkout session missing URL".to_string())
+        })?;
+        Ok(CreatedCheckout {
+            id: checkout_session.id.to_string(),
+            url,
         })
     }
 
-    async fn create_setup_checkout_session(&self, checkout: SetupCheckout<'_>) -> Result<String> {
+    async fn create_setup_checkout_session(&self, checkout: SetupCheckout<'_>) -> Result<CreatedCheckout> {
         let payer = checkout.payer;
         let copy = checkout.purpose.copy();
         let mut checkout_params = CreateCheckoutSession::new()
@@ -519,9 +529,13 @@ impl StripeApi for StripeClient {
             payer.reference_id
         );
 
-        checkout_session.url.ok_or_else(|| {
+        let url = checkout_session.url.ok_or_else(|| {
             tracing::error!("Setup checkout session missing URL");
             Error::Api("Checkout session missing URL".to_string())
+        })?;
+        Ok(CreatedCheckout {
+            id: checkout_session.id.to_string(),
+            url,
         })
     }
 

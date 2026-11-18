@@ -1139,7 +1139,7 @@ impl<'c> Users<'c> {
     #[instrument(level = "debug", skip(self), err)]
     pub async fn set_payment_provider_id_if_empty(&mut self, user_id: UserId, payment_provider_id: &str) -> Result<bool> {
         let rows_affected = sqlx::query!(
-            "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND payment_provider_id IS NULL",
+            "UPDATE users SET payment_provider_id = $1 WHERE id = $2 AND (payment_provider_id IS NULL OR payment_provider_id = '')",
             payment_provider_id,
             user_id
         )

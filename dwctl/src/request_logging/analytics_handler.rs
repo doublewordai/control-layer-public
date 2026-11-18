@@ -8,11 +8,12 @@ use crate::inference::rejections::api_key;
 use crate::metrics::errors::component::ANALYTICS;
 use crate::reference_cache::{Completion, ReferenceCache};
 use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
+use crate::request_logging::json_output::OutputContext;
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::stream_completion::{CLIENT_DISCONNECTED, client_disconnected};
-use crate::request_logging::tool_calls;
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid, header_map};
+use crate::request_logging::{structured_output, tool_calls};
 use crate::telemetry::TraceParent;
 use axum::http::StatusCode;
 use onwards::AuthenticatedApiKeyId;
@@ -259,7 +260,8 @@ impl RequestHandler for AnalyticsHandler {
 
             let parsed = parsed.unwrap_or(AiResponse::Other(serde_json::Value::Null));
 
-            if response_data.status.is_success() && is_reasoning_without_answer(&parsed) {
+            let reasoning_without_answer = response_data.status.is_success() && is_reasoning_without_answer(&parsed);
+            if reasoning_without_answer {
                 response_data.status = StatusCode::BAD_GATEWAY;
             }
 
@@ -278,22 +280,32 @@ impl RequestHandler for AnalyticsHandler {
                 );
             }
 
-            let completed = (200..300).contains(&metrics.status_code) && !client_disconnected(&response_data);
-            if completed && let Some(report) = tool_calls::inspect(&parsed) {
+            let completed = ((200..300).contains(&metrics.status_code) || reasoning_without_answer) && !client_disconnected(&response_data);
+            if completed {
                 let served_by = metrics
                     .served_by
                     .as_deref()
                     .and_then(|url| url::Url::parse(url).ok())
                     .and_then(|url| url.host_str().map(str::to_owned));
-                tool_calls::record(
-                    &report,
-                    &tool_calls::ToolCallContext {
-                        model: metrics.request_model.as_deref(),
-                        tool_choice: metrics.request_params.tool_choice.as_deref(),
-                        served_by: served_by.as_deref(),
-                        parent: response_data.extensions.get::<TraceParent>().map(|TraceParent(parent)| parent),
-                    },
-                );
+                let reported = |tokens: i64| (metrics.total_tokens > 0).then_some(tokens);
+                let context = OutputContext {
+                    model: metrics.request_model.as_deref(),
+                    served_by: served_by.as_deref(),
+                    max_tokens: metrics.request_params.max_tokens,
+                    output_tokens: reported(metrics.completion_tokens),
+                    reasoning_tokens: reported(metrics.reasoning_tokens),
+                    parent: response_data.extensions.get::<TraceParent>().map(|TraceParent(parent)| parent),
+                };
+                let tool_choice = metrics.request_params.tool_choice.as_deref();
+                if let Some(report) = tool_calls::inspect(&parsed, tool_choice) {
+                    tool_calls::record(&report, &context, tool_choice);
+                }
+                let format = metrics.request_params.response_format.as_deref();
+                if let Some(format) = format.filter(|format| structured_output::expects_json(format))
+                    && let Some(report) = structured_output::inspect(&parsed)
+                {
+                    structured_output::record(&report, &context, format);
+                }
             }
 
             let headers = HeaderFields::read(&request_data);
@@ -696,23 +708,23 @@ mod tests {
         assert_eq!(rx.try_recv().expect("record").api_key_id, Some(api_key_id));
     }
 
-    #[test]
-    fn tool_calls_are_checked_only_in_completed_responses() {
-        let counted = |ended: bool| {
-            let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-            let handle = prometheus.handle();
-            metrics::with_local_recorder(&prometheus, || {
-                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+    fn metrics_after(request_body: &'static str, response_body: &'static str, ended: bool) -> String {
+        let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = prometheus.handle();
+        metrics::with_local_recorder(&prometheus, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
                     let (tx, _rx) = mpsc::channel::<RawAnalyticsRecord>(100);
                     let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default());
                     let request = RequestData {
-                        body: Some(bytes::Bytes::from(r#"{"model":"model-a","messages":[{"role":"user","content":"u"}]}"#)),
+                        body: Some(bytes::Bytes::from(request_body)),
                         ..create_test_request_data()
                     };
                     let mut response = create_test_response_data();
-                    response.body = Some(bytes::Bytes::from(
-                        r#"{"id":"c","object":"chat.completion","created":1,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"q\": "}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
-                    ));
+                    response.body = Some(bytes::Bytes::from(response_body));
                     let completion = crate::request_logging::stream_completion::StreamCompletion::default();
                     if ended {
                         completion.mark_ended();
@@ -720,13 +732,59 @@ mod tests {
                     response.extensions.insert(completion);
                     handler.handle_response(request, response).await;
                 })
-            });
-            handle
-                .render()
-                .contains(r#"dwctl_tool_call_arguments_total{model="model-a",outcome="invalid_json""#)
+        });
+        handle.render()
+    }
+
+    #[test]
+    fn tool_calls_are_checked_only_in_completed_responses() {
+        let counted = |ended: bool| {
+            metrics_after(
+                r#"{"model":"model-a","messages":[{"role":"user","content":"u"}]}"#,
+                r#"{"id":"c","object":"chat.completion","created":1,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"q\": "}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                ended,
+            )
         };
-        assert!(counted(true), "a completed response is checked");
-        assert!(!counted(false), "a dropped response is not");
+        let invalid = |rendered: &str| {
+            crate::request_logging::json_output::testing::counter(
+                rendered,
+                "dwctl_tool_call_arguments_total",
+                &[r#"model="model-a""#, r#"outcome="invalid_json""#],
+            )
+        };
+        assert_eq!(invalid(&counted(true)), Some(1), "a completed response is checked");
+        assert_eq!(invalid(&counted(false)), None, "a dropped response is not");
+    }
+
+    #[test]
+    fn structured_output_is_checked_for_a_reasoning_only_answer() {
+        const REASONING_ONLY: &str = r#"{"id":"c","object":"chat.completion","created":1,"model":"model-a","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":"r"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":200,"total_tokens":201}}"#;
+        let rendered = metrics_after(
+            r#"{"model":"model-a","messages":[{"role":"user","content":"u"}],"response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object"}}}}"#,
+            REASONING_ONLY,
+            true,
+        );
+        assert_eq!(
+            crate::request_logging::json_output::testing::counter(
+                &rendered,
+                "dwctl_structured_output_total",
+                &[
+                    r#"model="model-a""#,
+                    r#"response_format="json_schema""#,
+                    r#"finish_reason="stop""#,
+                    r#"outcome="missing""#
+                ],
+            ),
+            Some(1),
+            "{rendered}"
+        );
+
+        let plain = metrics_after(
+            r#"{"model":"model-a","messages":[{"role":"user","content":"u"}]}"#,
+            REASONING_ONLY,
+            true,
+        );
+        assert!(!plain.contains("dwctl_structured_output_total"), "{plain}");
     }
 
     #[tokio::test]

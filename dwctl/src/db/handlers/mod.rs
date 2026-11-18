@@ -5,6 +5,7 @@ pub mod batch_sla;
 pub mod batch_templates;
 pub mod cache_tariffs;
 pub mod capacity_reservations;
+pub mod checkout_attempts;
 pub mod connections;
 pub mod credits;
 pub mod deployments;

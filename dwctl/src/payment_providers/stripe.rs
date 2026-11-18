@@ -13,7 +13,8 @@ use crate::{
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
     payment_providers::{
-        AutoTopupDeclineKind, AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent,
+        AutoTopupDeclineKind, AutoTopupSetupResult, CheckoutPayer, OpenedCheckout, PaymentError, PaymentProvider, PaymentSession, Result,
+        WebhookEvent,
     },
     types::UserId,
 };
@@ -115,6 +116,8 @@ impl StripeProvider {
                 tracing::debug!("Saved newly created stripe ID {} for user ID {}", provider_id, target_id);
             }
         }
+
+        super::claim_checkout_attempt(conn, session_id).await;
 
         let purpose = setup_intent.purpose;
         let Some(fingerprint) = setup_intent.fingerprint.as_deref() else {
@@ -218,9 +221,9 @@ impl PaymentProvider for StripeProvider {
         creditee_id: Option<&str>,
         cancel_url: &str,
         success_url: &str,
-    ) -> Result<String> {
+    ) -> Result<OpenedCheckout> {
         let payer_id = payer.id.to_string();
-        Ok(self
+        let created = self
             .client
             .create_payment_checkout_session(PaymentCheckout {
                 payer: stripe_payer(payer, &payer_id),
@@ -230,7 +233,11 @@ impl PaymentProvider for StripeProvider {
                 price_id: &self.config.price_id,
                 invoice_creation: self.config.enable_invoice_creation,
             })
-            .await?)
+            .await?;
+        Ok(OpenedCheckout {
+            url: created.url,
+            session_id: created.id,
+        })
     }
 
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession> {
@@ -313,6 +320,8 @@ impl PaymentProvider for StripeProvider {
             api_key_id: None,
         };
 
+        super::claim_checkout_attempt(&mut conn, session_id).await;
+
         let mut credits = Credits::new(&mut conn);
         credits.create_transaction(&request).await?;
 
@@ -382,9 +391,9 @@ impl PaymentProvider for StripeProvider {
         self.process_payment_session(db_pool, session_id, credits_config).await
     }
 
-    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<OpenedCheckout> {
         let payer_id = payer.id.to_string();
-        Ok(self
+        let created = self
             .client
             .create_setup_checkout_session(SetupCheckout {
                 payer: stripe_payer(payer, &payer_id),
@@ -397,12 +406,21 @@ impl PaymentProvider for StripeProvider {
                     .as_deref()
                     .or(self.config.auto_topup_terms_of_service_text.as_deref()),
             })
-            .await?)
+            .await?;
+        Ok(OpenedCheckout {
+            url: created.url,
+            session_id: created.id,
+        })
     }
 
-    async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
+    async fn create_auto_topup_checkout_session(
+        &self,
+        payer: &CheckoutPayer,
+        cancel_url: &str,
+        success_url: &str,
+    ) -> Result<OpenedCheckout> {
         let payer_id = payer.id.to_string();
-        Ok(self
+        let created = self
             .client
             .create_setup_checkout_session(SetupCheckout {
                 payer: stripe_payer(payer, &payer_id),
@@ -411,10 +429,14 @@ impl PaymentProvider for StripeProvider {
                 purpose: SetupPurpose::AutoTopup,
                 terms_of_service_text: self.config.auto_topup_terms_of_service_text.as_deref(),
             })
-            .await?)
+            .await?;
+        Ok(OpenedCheckout {
+            url: created.url,
+            session_id: created.id,
+        })
     }
 
-    async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult> {
+    async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult> {
         let session = self.client.get_setup_session(session_id).await?;
 
         if !session.complete {
@@ -431,6 +453,11 @@ impl PaymentProvider for StripeProvider {
 
         if let (Some(cust_id), Some(pm_id)) = (session.customer_id.as_deref(), setup_intent.payment_method_id.as_deref()) {
             self.client.set_default_payment_method(cust_id, pm_id).await;
+        }
+
+        match db_pool.acquire().await {
+            Ok(mut conn) => super::claim_checkout_attempt(&mut conn, session_id).await,
+            Err(e) => tracing::error!(session_id, error = %e, "Failed to mark checkout attempt completed"),
         }
 
         Ok(AutoTopupSetupResult {

@@ -1592,7 +1592,7 @@ mod tests {
             _: Option<&str>,
             _: &str,
             _: &str,
-        ) -> crate::payment_providers::Result<String> {
+        ) -> crate::payment_providers::Result<crate::payment_providers::OpenedCheckout> {
             unimplemented!("not called by process_auto_topups")
         }
         async fn get_payment_session(&self, _: &str) -> crate::payment_providers::Result<crate::payment_providers::PaymentSession> {
@@ -1624,7 +1624,7 @@ mod tests {
             _: &crate::payment_providers::CheckoutPayer,
             _: &str,
             _: &str,
-        ) -> crate::payment_providers::Result<String> {
+        ) -> crate::payment_providers::Result<crate::payment_providers::OpenedCheckout> {
             unimplemented!("not called by process_auto_topups")
         }
         async fn create_auto_topup_checkout_session(
@@ -1632,7 +1632,7 @@ mod tests {
             _: &crate::payment_providers::CheckoutPayer,
             _: &str,
             _: &str,
-        ) -> crate::payment_providers::Result<String> {
+        ) -> crate::payment_providers::Result<crate::payment_providers::OpenedCheckout> {
             unimplemented!("not called by process_auto_topups")
         }
         async fn process_auto_topup_session(

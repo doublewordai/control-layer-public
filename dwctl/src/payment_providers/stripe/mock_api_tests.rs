@@ -1243,7 +1243,11 @@ async fn create_checkout_session_for_a_new_customer() {
         )
         .await
         .unwrap();
-    assert_eq!(url, CHECKOUT_URL);
+    assert_eq!(url.url, CHECKOUT_URL);
+    assert_eq!(
+        url.session_id, "cs_test_ExampleCreated",
+        "the session id is what a completed session is matched on"
+    );
 
     let request = only_request(&server, "POST", "/v1/checkout/sessions").await;
     assert_eq!(request.form_value("mode"), Some("payment"));
@@ -1329,7 +1333,8 @@ async fn setup_checkout_sessions_differ_in_purpose_and_offered_methods() {
         .create_setup_checkout_session(&payer(target, None), urls.0, urls.1)
         .await
         .unwrap();
-    assert_eq!(verification, CHECKOUT_URL);
+    assert_eq!(verification.url, CHECKOUT_URL);
+    assert_eq!(verification.session_id, "cs_test_ExampleCreated");
 
     let request = only_request(&server, "POST", "/v1/checkout/sessions").await;
     assert_eq!(request.form_value("mode"), Some("setup"));
@@ -1648,6 +1653,46 @@ async fn webhook_endpoint_credits_a_signed_checkout_completion_once(pool: PgPool
 
     assert_eq!(balance(&pool, user).await, Decimal::new(2500, 2));
     assert_eq!(transaction_count(&pool, SESSION_ID).await, 1);
+}
+
+#[dwctl_test_macros::test]
+async fn webhook_completion_clears_only_that_sessions_checkout_attempt(pool: PgPool) {
+    let stripe = MockServer::start().await;
+    let server = webhook_server(&pool, &stripe).await;
+    let user = create_test_user(&pool, Role::StandardUser).await.id;
+
+    for (session_id, age) in [("cs_test_abandoned", "2 hours"), (SESSION_ID, "1 minute")] {
+        sqlx::query(
+            "INSERT INTO checkout_attempts (actor_id, payer_id, kind, session_id, created_at) VALUES ($1, $1, 'payment', $2, NOW() - $3::interval)",
+        )
+        .bind(user)
+        .bind(session_id)
+        .bind(age)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let session = payment_session(SESSION_ID, user, None);
+    mock_session(&stripe, &session).await;
+    let payload = event_payload("checkout.session.completed", &session);
+    server
+        .post("/webhooks/payments")
+        .add_header("stripe-signature", sign_at(&payload, WEBHOOK_SECRET, now()))
+        .text(payload)
+        .await
+        .assert_status_ok();
+
+    let unpaid: Vec<String> = sqlx::query_scalar("SELECT session_id FROM checkout_attempts WHERE actor_id = $1 AND completed_at IS NULL")
+        .bind(user)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        unpaid,
+        vec!["cs_test_abandoned".to_string()],
+        "only the paid session's attempt is cleared"
+    );
 }
 
 #[dwctl_test_macros::test]
