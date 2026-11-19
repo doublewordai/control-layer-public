@@ -93,6 +93,7 @@ pub trait StreamReframer: Send {
 pub struct TranslationRegistry {
     translators: Vec<Arc<dyn ProtocolTranslator>>,
     max_body_size: usize,
+    sse_buffer_limit: usize,
 }
 
 impl TranslationRegistry {
@@ -100,6 +101,7 @@ impl TranslationRegistry {
         Self {
             translators,
             max_body_size: usize::MAX,
+            sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
         }
     }
 
@@ -110,6 +112,15 @@ impl TranslationRegistry {
 
     pub fn max_body_size(&self) -> usize {
         self.max_body_size
+    }
+
+    pub fn with_sse_buffer_limit(mut self, sse_buffer_limit: usize) -> Self {
+        self.sse_buffer_limit = sse_buffer_limit;
+        self
+    }
+
+    pub fn sse_buffer_limit(&self) -> usize {
+        self.sse_buffer_limit
     }
 
     pub fn detect(&self, path: &str, headers: &HeaderMap) -> Option<Arc<dyn ProtocolTranslator>> {

@@ -87,7 +87,11 @@ export function AutoTopupSection({
         }
       } catch (err) {
         console.error("Failed to enable auto top-up:", err);
-        toast.error("Failed to enable auto top-up");
+        toast.error(
+          err instanceof Error && err.message
+            ? err.message
+            : "Failed to enable auto top-up",
+        );
       }
     } else {
       try {

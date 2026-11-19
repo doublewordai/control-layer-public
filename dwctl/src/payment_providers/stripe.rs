@@ -94,7 +94,9 @@ impl StripeProvider {
             return Err(PaymentError::InvalidData("Payment method setup failed".to_string()));
         }
 
-        if let (Some(cust_id), Some(pm_id)) = (customer_id, setup_intent.payment_method_id.as_deref()) {
+        if let (Some(cust_id), Some(pm_id)) = (customer_id, setup_intent.payment_method_id.as_deref())
+            && !setup_intent.cvc_check_failed
+        {
             self.client.set_default_payment_method(cust_id, pm_id).await;
         }
 
@@ -118,6 +120,21 @@ impl StripeProvider {
         }
 
         super::claim_checkout_attempt(conn, session_id).await;
+
+        if setup_intent.cvc_check_failed {
+            tracing::warn!(
+                session_id,
+                target_id = %target_id,
+                purpose = setup_intent.purpose.as_str(),
+                "Setup session card failed its CVC check; not verifying"
+            );
+            return match setup_intent.purpose {
+                SetupPurpose::Verification => Err(PaymentError::InvalidData(
+                    "Card failed its CVC check; verification requires a card that passes it".to_string(),
+                )),
+                SetupPurpose::AutoTopup => Ok(()),
+            };
+        }
 
         let purpose = setup_intent.purpose;
         let Some(fingerprint) = setup_intent.fingerprint.as_deref() else {
@@ -449,6 +466,11 @@ impl PaymentProvider for StripeProvider {
 
         if setup_intent.status != "succeeded" {
             return Err(PaymentError::InvalidData("Payment method setup failed".to_string()));
+        }
+
+        if setup_intent.cvc_check_failed {
+            tracing::warn!(session_id, "Auto top-up setup card failed its CVC check; not enrolling");
+            return Err(PaymentError::CardNotVerified);
         }
 
         if let (Some(cust_id), Some(pm_id)) = (session.customer_id.as_deref(), setup_intent.payment_method_id.as_deref()) {

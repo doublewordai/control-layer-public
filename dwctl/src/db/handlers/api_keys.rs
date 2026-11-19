@@ -2388,6 +2388,7 @@ mod tests {
             openapi: Default::default(),
             discovery: Default::default(),
             integrations: Default::default(),
+            account_prices: Default::default(),
             cache: Default::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),

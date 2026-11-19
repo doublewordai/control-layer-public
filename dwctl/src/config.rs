@@ -85,6 +85,8 @@ pub struct Config {
     #[serde(default)]
     pub integrations: IntegrationsConfig,
     #[serde(default)]
+    pub account_prices: AccountPricesConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
     pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
@@ -204,10 +206,60 @@ pub struct IntegrationsConfig {
     pub openrouter: OpenRouterIntegrationConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OpenRouterIntegrationConfig {
     pub datacenters: Vec<crate::openrouter::document::Datacenter>,
+    pub account: Option<String>,
+    pub provider_slug: Option<String>,
+    #[serde(skip_serializing)]
+    pub provider_api_key: Option<String>,
+    pub api_base_url: Url,
+    #[serde(with = "humantime_serde")]
+    pub refresh_coalesce: Duration,
+    #[serde(with = "humantime_serde")]
+    pub refresh_timeout: Duration,
+}
+
+impl Default for OpenRouterIntegrationConfig {
+    fn default() -> Self {
+        Self {
+            datacenters: Vec::new(),
+            account: None,
+            provider_slug: None,
+            provider_api_key: None,
+            api_base_url: Url::parse("https://openrouter.ai").expect("a valid URL"),
+            refresh_coalesce: Duration::from_secs(2),
+            refresh_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenRouterIntegrationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenRouterIntegrationConfig")
+            .field("datacenters", &self.datacenters)
+            .field("account", &self.account)
+            .field("provider_slug", &self.provider_slug)
+            .field("provider_api_key", &self.provider_api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_base_url", &self.api_base_url.as_str())
+            .field("refresh_coalesce", &self.refresh_coalesce)
+            .field("refresh_timeout", &self.refresh_timeout)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountPricesConfig {
+    pub floors: HashMap<String, PriceFloor>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceFloor {
+    pub input_per_million_tokens: String,
+    pub output_per_million_tokens: String,
 }
 
 impl Default for OpenApiConfig {
@@ -2218,6 +2270,7 @@ impl Default for Config {
             openapi: OpenApiConfig::default(),
             discovery: DiscoveryConfig::default(),
             integrations: IntegrationsConfig::default(),
+            account_prices: AccountPricesConfig::default(),
             cache: CacheConfig::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
@@ -2537,6 +2590,42 @@ impl Config {
                 ),
             });
         }
+        for (alias, floor) in &self.account_prices.floors {
+            for (field, value) in [
+                ("input_per_million_tokens", &floor.input_per_million_tokens),
+                ("output_per_million_tokens", &floor.output_per_million_tokens),
+            ] {
+                if let Err(error) = crate::model_provisioning::parse_per_million(value) {
+                    return Err(Error::Internal {
+                        operation: format!("Config validation: account_prices.floors.{alias:?}.{field}: {error:#}"),
+                    });
+                }
+            }
+        }
+        let openrouter = &self.integrations.openrouter;
+        let blank = |value: &Option<String>| value.as_deref().is_none_or(|value| value.trim().is_empty());
+        if !blank(&openrouter.provider_api_key) && (blank(&openrouter.account) || blank(&openrouter.provider_slug)) {
+            return Err(Error::Internal {
+                operation:
+                    "Config validation: integrations.openrouter.provider_api_key needs integrations.openrouter.account and provider_slug"
+                        .to_string(),
+            });
+        }
+        for (field, value) in [("account", &openrouter.account), ("provider_slug", &openrouter.provider_slug)] {
+            if value.as_deref().is_some_and(|value| value != value.trim()) {
+                return Err(Error::Internal {
+                    operation: format!("Config validation: integrations.openrouter.{field} has surrounding whitespace"),
+                });
+            }
+        }
+        if !matches!(openrouter.api_base_url.scheme(), "http" | "https") {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: integrations.openrouter.api_base_url must be http or https, not {:?}",
+                    openrouter.api_base_url.scheme()
+                ),
+            });
+        }
         if let Some(PaymentConfig::Stripe(stripe)) = &self.payment
             && let Err(error) = stripe.api_base()
         {
@@ -2684,9 +2773,18 @@ impl Config {
                 operation: format!("Config validation: {e}"),
             });
         }
-        if let Err(e) = self.reference_cache.validate(self.enable_analytics) {
+        if let Err(e) = self.reference_cache.validate(self.enable_analytics, self.cache.enabled) {
             return Err(Error::Internal {
                 operation: format!("Config validation: {e}"),
+            });
+        }
+        let main_pool_max = self.database.main_pool_settings().max_connections;
+        if self.reference_cache.enabled && self.reference_cache.max_connections.saturating_add(2) >= main_pool_max {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: reference_cache.max_connections ({}) plus its sweeper and terms reload must stay below the main database pool's max_connections ({main_pool_max})",
+                    self.reference_cache.max_connections
+                ),
             });
         }
         if let Some(ch) = &self.clickhouse
@@ -3705,6 +3803,28 @@ auth:
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reference_cache_connections_must_leave_main_pool_headroom() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.enable_analytics = true;
+        config.cache.enabled = true;
+        config.reference_cache.enabled = true;
+        config.reference_cache.max_connections = 4;
+        let pool = match &mut config.database {
+            DatabaseConfig::Embedded { pool, .. } | DatabaseConfig::External { pool, .. } => pool,
+        };
+        pool.max_connections = 7;
+        assert!(
+            config.validate().is_ok(),
+            "4, the sweeper and the terms reload leave one for everything else"
+        );
+        config.reference_cache.max_connections = 5;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("reference_cache.max_connections"), "{err}");
     }
 
     #[test]

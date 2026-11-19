@@ -28,15 +28,15 @@ pub(crate) struct CacheTariffRow {
 }
 
 pub(crate) fn clamp_implicit_read_multiplier(mults: Option<CacheMultipliers>, read_source: Option<&str>) -> Option<CacheMultipliers> {
-    match (mults, read_source) {
-        (Some(m), Some(s)) if s == crate::prompt_cache::CacheReadSource::Engine.as_str() && m.read > Decimal::ONE => {
-            Some(CacheMultipliers { read: Decimal::ONE, ..m })
-        }
+    use crate::prompt_cache::CacheReadSource::{Engine, Reference};
+    let implicit = read_source.is_some_and(|s| s == Engine.as_str() || s == Reference.as_str());
+    match mults {
+        Some(m) if implicit && m.read > Decimal::ONE => Some(CacheMultipliers { read: Decimal::ONE, ..m }),
         _ => mults,
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheMultipliers {
     pub read: Decimal,
     pub write_5m: Decimal,
@@ -401,6 +401,43 @@ where
         }
     }
     Ok(map)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BilledPrice {
+    pub input: Decimal,
+    pub output: Decimal,
+    pub cache: Option<CacheMultipliers>,
+}
+
+pub(crate) async fn billed_realtime_prices(
+    conn: &mut sqlx::PgConnection,
+    aliases: &[String],
+    account: uuid::Uuid,
+    serving_class: &str,
+    at: DateTime<Utc>,
+) -> Result<std::collections::HashMap<String, BilledPrice>, sqlx::Error> {
+    let models = lookup_model_tariffs(&mut *conn, aliases, &[account]).await?;
+    let cache_tariffs = lookup_cache_tariffs(&mut *conn, aliases, &[account]).await?;
+    Ok(models
+        .into_iter()
+        .filter_map(|(alias, model)| {
+            let (Some(input), Some(output)) = find_best_tariff(
+                &model.tariffs,
+                Some(&ApiKeyPurpose::Realtime),
+                None,
+                at,
+                Some(account),
+                Some(serving_class),
+            ) else {
+                return None;
+            };
+            let cache = cache_tariffs
+                .get(&alias)
+                .and_then(|rows| resolve_cache_multipliers(rows, at, Some(account), Some(serving_class)));
+            Some((alias, BilledPrice { input, output, cache }))
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

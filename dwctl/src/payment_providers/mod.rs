@@ -55,6 +55,9 @@ pub enum PaymentError {
 
     #[error("Payment method has already verified another account")]
     InstrumentAlreadyUsed,
+
+    #[error("Payment method could not be verified")]
+    CardNotVerified,
 }
 
 impl From<PaymentError> for StatusCode {
@@ -66,6 +69,7 @@ impl From<PaymentError> for StatusCode {
             PaymentError::UnknownReference(_) => StatusCode::NOT_FOUND,
             PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InstrumentAlreadyUsed => StatusCode::CONFLICT,
+            PaymentError::CardNotVerified => StatusCode::FORBIDDEN,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

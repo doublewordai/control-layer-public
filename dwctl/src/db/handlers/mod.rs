@@ -1,4 +1,5 @@
 
+pub mod account_prices;
 pub mod analytics;
 pub mod api_keys;
 pub mod batch_sla;
@@ -22,6 +23,7 @@ pub mod tariffs;
 pub mod users;
 pub mod webhooks;
 
+pub(crate) use account_prices::AccountPrices;
 pub use batch_templates::BatchTemplates;
 pub use cache_tariffs::{ActiveTariff, CacheTariffOverrides, CacheTariffs};
 pub use capacity_reservations::BatchCapacityReservations;

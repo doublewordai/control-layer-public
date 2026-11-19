@@ -1,7 +1,8 @@
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
@@ -14,15 +15,16 @@ use http_body_util::BodyExt;
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::index::{CacheResult, TierPolicy};
 use super::inject::{
-    UpstreamCachedTokens, UsageEdit, inject_into_response_nonstreaming, scan_edit_sse, scrub_response_nonstreaming, strip_cache_control,
+    Bill, StreamUsage, UpstreamCachedTokens, inject_into_response_nonstreaming, scrub_response_nonstreaming, strip_cache_control,
 };
 use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
-use super::stats::{CacheBilling, CacheReadSource};
+use super::stats::{BilledCache, CacheBilling, CacheReadSource};
 use crate::inference::rejections;
 use crate::inference::serving_name::ServingName;
+use crate::reference_cache::{FirstTokenDetector, PendingReference, ReferenceCache};
 
 const COMMIT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -32,6 +34,7 @@ pub struct CacheLayerState {
     pub deadline: Duration,
     pub body_limit: usize,
     pub sse_buffer_limit: usize,
+    pub reference: Option<Arc<ReferenceCache>>,
 }
 
 impl CacheLayerState {
@@ -41,11 +44,17 @@ impl CacheLayerState {
             deadline,
             body_limit,
             sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            reference: None,
         }
     }
 
     pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
         self.sse_buffer_limit = limit;
+        self
+    }
+
+    pub fn with_reference_cache(mut self, reference: Arc<ReferenceCache>) -> Self {
+        self.reference = Some(reference);
         self
     }
 }
@@ -108,6 +117,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     if !is_cacheable(&request) {
         return next.run(request).await;
     }
+    let arrival = chrono::Utc::now();
 
     let (mut parts, body) = request.into_parts();
     let body_bytes = match axum::body::to_bytes(body, state.body_limit).await {
@@ -196,9 +206,18 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     let api_key = crate::auth::internal_credential::presented_key_hash(&parts.extensions, bearer);
 
     let model_label = virtual_model.clone().unwrap_or_default();
+    let alias = virtual_model
+        .as_deref()
+        .map(|requested| ServingName::of(&parts.extensions, requested).model);
 
-    let classify_handle = virtual_model.map(|requested| {
-        let model = ServingName::of(&parts.extensions, &requested).model;
+    let reference = match (&state.reference, api_key, virtual_model.as_deref(), alias.as_deref()) {
+        (Some(cache), Some(key), Some(requested), Some(model)) if chat_route => {
+            cache.begin(key, requested, model, body_bytes.clone(), arrival)
+        }
+        _ => None,
+    };
+
+    let classify_handle = virtual_model.zip(alias).map(|(requested, model)| {
         let classifier = state.classifier.clone();
         let body = body_bytes.to_vec();
         tokio::spawn(async move {
@@ -214,6 +233,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 .await
         })
     });
+    let mut classify = AbortOnDrop(classify_handle);
 
     let (stripped, had_markers) = strip_cache_control(&body_bytes, state.classifier.telemetry_policy());
     cache_metrics::record_marker_request(had_markers);
@@ -236,15 +256,15 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     let cache_billing = CacheBilling::default();
     response.extensions_mut().insert(cache_billing.clone());
 
-    let Some(mut handle) = classify_handle else {
+    if classify.as_mut().is_none() {
         cache_metrics::record_request_outcome("inactive");
         return response;
-    };
+    }
 
     if is_streaming(&response) {
         return defer_classify_into_stream(
             response,
-            handle,
+            classify,
             state.deadline,
             model_label,
             state.classifier.clone(),
@@ -252,15 +272,48 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             cache_billing,
             had_markers,
             state.sse_buffer_limit,
+            reference,
         );
     }
 
-    let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
+    let (response, buffered) = buffer_json_body(response).await;
+    if !buffered {
+        drop(classify);
+        if let Some(r) = reference {
+            r.finish(None, false);
+        }
+        return response;
+    }
+    let mut reference = match reference {
+        Some(r) if !response.status().is_success() => {
+            r.finish(None, false);
+            None
+        }
+        r => r,
+    };
+    let join_reference = async {
+        if let Some(r) = reference.as_mut() {
+            r.join().await;
+        }
+    };
+    let (outcome, ()) = tokio::join!(join_guarded(&mut classify, state.deadline, &model_label), join_reference);
     if !outcome.active {
-        return scrub_response_nonstreaming(response, &upstream_cached).await;
+        let response = scrub_response_nonstreaming(response, &upstream_cached).await;
+        let success = response.status().is_success();
+        record_scrubbed(reference.as_ref(), &upstream_cached, &cache_billing);
+        settle_reference(reference, &cache_billing, &upstream_cached, !had_markers, false, success);
+        return response;
     }
     let allow_implicit = !had_markers;
-    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached, allow_implicit).await;
+    let (response, billing_ok) = inject_into_response_nonstreaming(
+        response,
+        &outcome.stats,
+        &upstream_cached,
+        allow_implicit,
+        reference.as_ref().and_then(PendingReference::joined),
+    )
+    .await;
+    settle_reference(reference, &cache_billing, &upstream_cached, allow_implicit, true, billing_ok);
     if !outcome.pending.is_empty() {
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
@@ -272,6 +325,67 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     response
 }
 
+async fn buffer_json_body(response: Response) -> (Response, bool) {
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json"))
+        })
+        .unwrap_or(true);
+    if !is_json || !response.status().is_success() {
+        return (response, true);
+    }
+    let (parts, body) = response.into_parts();
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => (Response::from_parts(parts, Body::from(bytes)), true),
+        Err(e) => {
+            warn!(error = %e, "Failed to buffer upstream response body in cache middleware");
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read upstream response body: {e}"),
+                    "type": "internal_error",
+                    "code": "response_body_read_failed",
+                }
+            });
+            ((StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response(), false)
+        }
+    }
+}
+
+fn record_scrubbed(reference: Option<&PendingReference>, upstream: &UpstreamCachedTokens, cache_billing: &CacheBilling) {
+    let estimate = reference
+        .and_then(PendingReference::joined)
+        .zip(upstream.prompt_tokens())
+        .and_then(|(joined, prompt)| joined.estimate(prompt));
+    if let Some(estimate) = estimate {
+        cache_billing.set(BilledCache {
+            reference: Some(estimate),
+            ..Default::default()
+        });
+    }
+}
+
+fn settle_reference(
+    reference: Option<PendingReference>,
+    cache_billing: &CacheBilling,
+    upstream: &UpstreamCachedTokens,
+    unmarked: bool,
+    injected: bool,
+    success: bool,
+) {
+    let Some(mut reference) = reference else {
+        return;
+    };
+    let billed = cache_billing.get().unwrap_or_default();
+    reference.record(&billed, upstream.get(), upstream.prompt_tokens(), unmarked, injected);
+    reference.finish(upstream.prompt_tokens(), success);
+}
+
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
@@ -279,6 +393,15 @@ fn is_streaming(response: &Response) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').next())
         .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+async fn join_guarded(guard: &mut AbortOnDrop<CacheResult<ClassifyOutcome>>, deadline: Duration, model_label: &str) -> ClassifyOutcome {
+    let Some(handle) = guard.as_mut() else {
+        return ClassifyOutcome::inactive();
+    };
+    let outcome = join_classify(handle, deadline, model_label).await;
+    guard.take();
+    outcome
 }
 
 async fn join_classify(
@@ -357,10 +480,67 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+struct StreamBilling {
+    classify: AbortOnDrop<CacheResult<ClassifyOutcome>>,
+    outcome: Option<ClassifyOutcome>,
+    reference: Option<PendingReference>,
+    usage: StreamUsage,
+    deadline: Duration,
+    model_label: String,
+    had_markers: bool,
+    upstream_cached: UpstreamCachedTokens,
+    cache_billing: CacheBilling,
+}
+
+impl StreamBilling {
+    async fn settle(&mut self) -> Option<Bytes> {
+        if !self.usage.pending() {
+            return None;
+        }
+        let Self {
+            classify,
+            outcome,
+            reference,
+            deadline,
+            model_label,
+            ..
+        } = self;
+        let join_classify = async {
+            match outcome.take() {
+                Some(o) => o,
+                None => join_guarded(classify, *deadline, model_label).await,
+            }
+        };
+        let join_reference = async {
+            if let Some(r) = reference.as_mut() {
+                r.join().await;
+            }
+        };
+        let (joined_outcome, ()) = tokio::join!(join_classify, join_reference);
+        self.outcome = Some(joined_outcome);
+
+        self.upstream_cached.record(self.usage.counts());
+        let bill = match self.outcome.as_ref() {
+            Some(o) if o.active => Bill::Inject {
+                stats: &o.stats,
+                allow_implicit: !self.had_markers,
+                reference: self.reference.as_ref().and_then(PendingReference::joined),
+            },
+            _ => Bill::Scrub,
+        };
+        let (frame, billed) = self.usage.finish(bill)?;
+        match billed {
+            Some(billed) => self.cache_billing.set(billed),
+            None => record_scrubbed(self.reference.as_ref(), &self.upstream_cached, &self.cache_billing),
+        }
+        Some(frame)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn defer_classify_into_stream(
     response: Response,
-    handle: tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
+    classify: AbortOnDrop<CacheResult<ClassifyOutcome>>,
     deadline: Duration,
     model_label: String,
     classifier: Classifier,
@@ -368,17 +548,27 @@ fn defer_classify_into_stream(
     cache_billing: CacheBilling,
     had_markers: bool,
     sse_buffer_limit: usize,
+    reference: Option<PendingReference>,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
     let body_stream = BodyExt::into_data_stream(body).map(|r| r.map_err(std::io::Error::other));
     let buffered = SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
+    let mut billing = StreamBilling {
+        classify,
+        outcome: None,
+        reference,
+        usage: StreamUsage::default(),
+        deadline,
+        model_label,
+        had_markers,
+        upstream_cached,
+        cache_billing,
+    };
 
     let stream = async_stream::stream! {
         futures::pin_mut!(buffered);
-        let mut handle = AbortOnDrop(Some(handle));
-        let mut outcome: Option<ClassifyOutcome> = None;
-        let mut edited = false;
+        let mut first_output = FirstTokenDetector::default();
         let mut saw_error = false;
         let mut saw_usage = false;
 
@@ -387,58 +577,52 @@ fn defer_classify_into_stream(
                 Ok(c) => c,
                 Err(e) => {
                     saw_error = true;
+                    if let Some(frame) = billing.settle().await {
+                        yield Ok(frame);
+                    }
                     yield Err(e);
                     continue;
                 }
             };
-            let probe = scan_edit_sse(&chunk, UsageEdit::Probe);
-            if let Some(v) = probe.upstream_cached_tokens {
-                upstream_cached.set(v);
+            if status_ok
+                && let Some(r) = billing.reference.as_mut()
+                && first_output.observe(&chunk)
+            {
+                r.first_token();
             }
-            saw_error |= probe.saw_error;
-            if probe.saw_usage && outcome.is_none() {
-                if let Some(h) = handle.as_mut() {
-                    outcome = Some(join_classify(h, deadline, &model_label).await);
-                }
-                handle.take();
+            let scan = billing.usage.observe(&chunk);
+            saw_error |= scan.saw_error;
+            saw_usage |= scan.saw_usage;
+            if (scan.done || scan.saw_error)
+                && let Some(frame) = billing.settle().await
+            {
+                yield Ok(frame);
             }
-            saw_usage |= probe.saw_usage;
-            let out = if !edited && probe.saw_usage {
-                let scan = match outcome.as_ref() {
-                    Some(o) if o.active => scan_edit_sse(
-                        &chunk,
-                        UsageEdit::Inject {
-                            stats: &o.stats,
-                            allow_implicit: !had_markers,
-                        },
-                    ),
-                    _ => scan_edit_sse(&chunk, UsageEdit::Scrub),
-                };
-                if let Some(billed) = scan.billing_stats {
-                    cache_billing.set(billed);
-                }
-                edited |= scan.rewritten.is_some();
-                scan.rewritten.unwrap_or(chunk)
-            } else {
-                chunk
-            };
-            yield Ok(out);
+            match scan.rewritten {
+                None => yield Ok(chunk),
+                Some(rewritten) if rewritten.is_empty() => {}
+                Some(rewritten) => yield Ok(rewritten),
+            }
+        }
+        if let Some(frame) = billing.settle().await {
+            yield Ok(frame);
         }
 
-        let outcome = match outcome {
+        let outcome = match billing.outcome.take() {
             Some(o) => o,
-            None => {
-                if let Some(h) = handle.as_mut() {
-                    let o = join_classify(h, deadline, &model_label).await;
-                    handle.take();
-                    o
-                } else {
-                    ClassifyOutcome::inactive()
-                }
-            }
+            None => join_guarded(&mut billing.classify, deadline, &billing.model_label).await,
         };
+        let success = status_ok && !saw_error && saw_usage;
+        settle_reference(
+            billing.reference.take(),
+            &billing.cache_billing,
+            &billing.upstream_cached,
+            !had_markers,
+            outcome.active,
+            success,
+        );
         if outcome.active && !outcome.pending.is_empty() {
-            if status_ok && !saw_error && saw_usage {
+            if success {
                 spawn_commit(classifier, outcome.pending);
             } else {
                 let reason = if !status_ok {

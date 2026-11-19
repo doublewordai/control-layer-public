@@ -168,6 +168,8 @@ where
     pub internal_credentials: auth::internal_credential::InternalCredentials,
     #[builder(default)]
     pub api_key_usage: api_key_usage::ApiKeyUsage,
+    #[builder(default)]
+    pub openrouter_refresh: openrouter::refresh::ListingRefresher,
 }
 
 impl<P> AppState<P>
@@ -1443,17 +1445,37 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let reference_cache = (config.reference_cache.enabled && analytics_writer.is_some()).then(|| {
-        tracing::info!(principals = config.reference_cache.orgs.len(), models = ?config.reference_cache.models, "Reference-cache estimate enabled");
-        Arc::new(crate::reference_cache::ReferenceCache::new(
+    let reference_cache = if config.reference_cache.enabled && config.cache.enabled && analytics_writer.is_some() {
+        let pool = sqlx_pool_router::DynPools::new(state.db.clone());
+        let assurance = Arc::new(crate::reference_cache::AssuranceBook::new(pool.clone()));
+        if let Err(e) = assurance.refresh().await {
+            crate::background_error!(
+                crate::metrics::errors::component::REFERENCE_CACHE,
+                "assurance_load",
+                Error,
+                error = %e,
+                "Failed to load cache-assurance terms; assured organisations bill from the engine until the next reload"
+            );
+        }
+        assurance.spawn_reloads();
+        tracing::info!(
+            principals = config.reference_cache.orgs.len(),
+            models = ?config.reference_cache.models,
+            assured_pairs = assurance.len(),
+            "Reference cache enabled"
+        );
+        Some(Arc::new(crate::reference_cache::ReferenceCache::new(
             &config.reference_cache,
-            sqlx_pool_router::DynPools::new(state.db.clone()),
+            pool,
             crate::prompt_cache::TelemetryPolicy::from_config(
                 config.cache.telemetry_blocks.strip_from_prompt,
                 &config.cache.telemetry_blocks.prefixes,
             ),
-        ))
-    });
+            assurance,
+        )))
+    } else {
+        None
+    };
 
     let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         state.metrics_recorder = metrics_recorder;
@@ -1475,11 +1497,8 @@ pub async fn build_router(
         }
 
         if let Some(writer) = analytics_writer {
-            let mut analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone())
+            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone())
                 .with_key_identity(state.internal_auth_state());
-            if let Some(cache) = &reference_cache {
-                analytics_handler = analytics_handler.with_reference_cache(cache.clone(), state.internal_auth_state());
-            }
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -1627,6 +1646,12 @@ pub async fn build_router(
         .route(
             "/models/{id}/cache-pricing",
             delete(api::handlers::cache_pricing::disable_cache_pricing),
+        )
+        .route(
+            "/accounts/{account}/models/{model}/prices",
+            get(api::handlers::account_prices::get_account_price)
+                .put(api::handlers::account_prices::set_account_price)
+                .delete(api::handlers::account_prices::end_account_price),
         )
         .route(
             "/provider-display-configs",
@@ -1984,15 +2009,16 @@ pub async fn build_router(
                 n => usize::try_from(n).unwrap_or(usize::MAX),
             };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
-            onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(
-                    classifier,
-                    body_limit,
-                    std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
-                )
-                .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit),
-                crate::prompt_cache::cache_middleware,
-            ))
+            let mut cache_state = crate::prompt_cache::CacheLayerState::new(
+                classifier,
+                body_limit,
+                std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
+            )
+            .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit);
+            if let Some(reference) = &reference_cache {
+                cache_state = cache_state.with_reference_cache(reference.clone());
+            }
+            onwards_router.layer(middleware::from_fn_with_state(cache_state, crate::prompt_cache::cache_middleware))
         } else {
             onwards_router
         }
@@ -2010,8 +2036,9 @@ pub async fn build_router(
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
             std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()),
         ];
-        let translation_registry =
-            crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
+        let translation_registry = crate::inference::translation::TranslationRegistry::new(translators)
+            .with_max_body_size(translation_body_limit)
+            .with_sse_buffer_limit(config.onwards.sse_buffer_limit);
         onwards_router.layer(middleware::from_fn_with_state(
             translation_registry,
             crate::inference::translation::middleware::translation_middleware,
@@ -2019,19 +2046,6 @@ pub async fn build_router(
     };
 
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        let onwards_router = match &reference_cache {
-            Some(cache) => onwards_router.layer(middleware::from_fn_with_state(
-                crate::reference_cache::layer::ReferenceLayerState {
-                    cache: cache.clone(),
-                    body_limit: match config.limits.requests.max_body_size {
-                        0 => usize::MAX,
-                        n => usize::try_from(n).unwrap_or(usize::MAX),
-                    },
-                },
-                crate::reference_cache::reference_cache_middleware,
-            )),
-            None => onwards_router,
-        };
         onwards_router
             .layer(middleware::from_fn(auth::internal_credential::carry_presented_key))
             .layer(middleware::from_fn(crate::telemetry::carry_trace_parent))
@@ -3759,6 +3773,10 @@ impl Application {
 
         let limiters = limits::Limiters::new(&config.limits);
 
+        let (openrouter_refresh, refresh_task) =
+            openrouter::refresh::ListingRefresher::spawn(shared_config.clone(), bg_services.shutdown_token());
+        bg_services.spawn("openrouter-listing-refresh", refresh_task);
+
         let mut app_state = AppState::builder()
             .db(db_pools.clone())
             .config(shared_config.clone())
@@ -3776,6 +3794,7 @@ impl Application {
             .onwards_targets(bg_services.onwards_targets.clone())
             .internal_credentials(internal_credentials)
             .api_key_usage(bg_services.api_key_usage.clone())
+            .openrouter_refresh(openrouter_refresh)
             .build();
 
         if let Some(config_path) = config_path {

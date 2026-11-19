@@ -1,81 +1,21 @@
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-
-use axum::body::{Body, Bytes};
-use axum::extract::{Request, State};
-use axum::http::{Method, header};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
-use http_body::{Frame, SizeHint};
-
-use super::ReferenceCache;
-use crate::auth::internal_credential::presented_key_hash;
+use serde_json::Value;
 
 const MAX_PENDING_EVENT: usize = 64 * 1024;
 
-#[derive(Clone)]
-pub struct ReferenceLayerState {
-    pub cache: Arc<ReferenceCache>,
-    pub body_limit: usize,
-}
-
-fn bearer_token(req: &Request) -> Option<&str> {
-    req.headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-}
-
-fn is_event_stream(response: &Response) -> bool {
-    response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
-}
-
-pub async fn reference_cache_middleware(State(state): State<ReferenceLayerState>, req: Request, next: Next) -> Response {
-    if req.method() != Method::POST || !req.uri().path().ends_with("/chat/completions") {
-        return next.run(req).await;
-    }
-    let Some(api_key) = presented_key_hash(req.extensions(), bearer_token(&req)) else {
-        return next.run(req).await;
-    };
-    let (parts, body) = req.into_parts();
-    let body = match axum::body::to_bytes(body, state.body_limit).await {
-        Ok(b) => b,
-        Err(e) => {
-            let body = serde_json::json!({
-                "error": {
-                    "message": format!("failed to read request body: {e}"),
-                    "type": "invalid_request_error",
-                }
-            });
-            return (axum::http::StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
-        }
-    };
-    let response = next.run(Request::from_parts(parts, Body::from(body.clone()))).await;
-    if !response.status().is_success() || !is_event_stream(&response) {
-        return response;
-    }
-    let (parts, inner) = response.into_parts();
-    let cache = state.cache;
-    let on_first_token: Box<dyn FnOnce() + Send> = Box::new(move || cache.observe_first_token(api_key, body));
-    Response::from_parts(parts, Body::new(FirstTokenBody::new(inner, on_first_token)))
-}
-
-struct FirstTokenBody {
-    inner: Body,
-    on_first_token: Option<Box<dyn FnOnce() + Send>>,
+pub struct FirstTokenDetector {
+    armed: bool,
     pending: BytesMut,
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+impl Default for FirstTokenDetector {
+    fn default() -> Self {
+        Self {
+            armed: true,
+            pending: BytesMut::new(),
+        }
+    }
 }
 
 fn event_end(buf: &[u8]) -> Option<usize> {
@@ -87,152 +27,237 @@ fn event_end(buf: &[u8]) -> Option<usize> {
     }
 }
 
-impl FirstTokenBody {
-    fn new(inner: Body, on_first_token: Box<dyn FnOnce() + Send>) -> Self {
-        Self {
-            inner,
-            on_first_token: Some(on_first_token),
-            pending: BytesMut::new(),
-        }
-    }
+enum Verdict {
+    Output,
+    Error,
+    Neither,
+}
 
-    fn observe(&mut self, data: &[u8]) {
-        self.pending.extend_from_slice(data);
-        while self.on_first_token.is_some()
-            && let Some(end) = event_end(&self.pending)
-        {
-            let event = self.pending.split_to(end);
-            if contains(&event, b"\"choices\"") {
-                if let Some(f) = self.on_first_token.take() {
-                    f();
-                }
-            } else if contains(&event, b"\"error\"") {
-                self.on_first_token = None;
-            }
-        }
-        if self.on_first_token.is_none() || self.pending.len() > MAX_PENDING_EVENT {
-            self.on_first_token = None;
-            self.pending = BytesMut::new();
-        }
+fn judge(event: &[u8]) -> Verdict {
+    let Ok(text) = std::str::from_utf8(event) else {
+        return Verdict::Neither;
+    };
+    let data: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|d| d.strip_prefix(' ').unwrap_or(d))
+        .collect();
+    let Ok(payload) = serde_json::from_str::<Value>(&data.join("\n")) else {
+        return Verdict::Neither;
+    };
+    if payload.get("error").is_some_and(|e| !e.is_null()) {
+        Verdict::Error
+    } else if payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| choices.iter().any(carries_output))
+    {
+        Verdict::Output
+    } else {
+        Verdict::Neither
     }
 }
 
-impl http_body::Body for FirstTokenBody {
-    type Data = Bytes;
-    type Error = axum::Error;
+fn carries_output(choice: &Value) -> bool {
+    let non_empty = |v: Option<&Value>| match v {
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        _ => false,
+    };
+    if non_empty(choice.get("text")) {
+        return true;
+    }
+    let Some(delta) = choice.get("delta") else {
+        return false;
+    };
+    [
+        "content",
+        "reasoning_content",
+        "reasoning",
+        "refusal",
+        "tool_calls",
+        "function_call",
+    ]
+    .iter()
+    .any(|key| non_empty(delta.get(*key)))
+        || delta
+            .get("reasoning_details")
+            .and_then(Value::as_array)
+            .is_some_and(|details| {
+                details
+                    .iter()
+                    .any(|d| ["text", "summary", "data"].iter().any(|key| non_empty(d.get(*key))))
+            })
+}
 
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
-        let poll = Pin::new(&mut self.inner).poll_frame(cx);
-        if self.on_first_token.is_some()
-            && let Poll::Ready(Some(Ok(frame))) = &poll
-            && let Some(data) = frame.data_ref()
-        {
-            let data = data.clone();
-            self.observe(&data);
+impl FirstTokenDetector {
+    pub fn observe(&mut self, data: &[u8]) -> bool {
+        if !self.armed {
+            return false;
         }
-        poll
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        self.pending.extend_from_slice(data);
+        let mut fired = false;
+        while self.armed
+            && let Some(end) = event_end(&self.pending)
+        {
+            let event = self.pending.split_to(end);
+            match judge(&event) {
+                Verdict::Output => {
+                    fired = true;
+                    self.armed = false;
+                }
+                Verdict::Error => self.armed = false,
+                Verdict::Neither => {}
+            }
+        }
+        if !self.armed || self.pending.len() > MAX_PENDING_EVENT {
+            self.armed = false;
+            self.pending = BytesMut::new();
+        }
+        fired
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
 
-    fn tracked(frames: Vec<&'static str>) -> (FirstTokenBody, Arc<std::sync::atomic::AtomicUsize>) {
-        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let f = fired.clone();
-        let stream = futures::stream::iter(
-            frames
-                .into_iter()
-                .map(|s| Ok::<_, std::io::Error>(Bytes::from_static(s.as_bytes()))),
-        );
-        (
-            FirstTokenBody::new(
-                Body::from_stream(stream),
-                Box::new(move || {
-                    f.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }),
-            ),
-            fired,
-        )
+    fn fired(frames: &[&str]) -> usize {
+        let mut d = FirstTokenDetector::default();
+        frames.iter().filter(|f| d.observe(f.as_bytes())).count()
     }
 
-    async fn drain(body: FirstTokenBody) -> Vec<Bytes> {
-        Body::new(body).into_data_stream().map(|r| r.unwrap()).collect().await
-    }
-
-    #[tokio::test]
-    async fn fires_once_on_the_first_chunk_with_output_and_passes_frames_through() {
-        let (body, fired) = tracked(vec![
+    #[test]
+    fn fires_once_on_the_first_chunk_with_output() {
+        let frames = [
             ": keep-alive\n\n",
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
             "data: [DONE]\n\n",
-        ]);
-        let frames = drain(body).await;
-        assert_eq!(frames.len(), 4, "frames are forwarded untouched");
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn an_error_before_any_output_disarms() {
-        let (body, fired) = tracked(vec![
-            "data: {\"error\":{\"message\":\"overloaded\"}}\n\n",
-            "data: {\"choices\":[]}\n\n",
-        ]);
-        drain(body).await;
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn an_error_after_output_does_not_undo_it() {
-        let (body, fired) = tracked(vec!["data: {\"choices\":[]}\n\n", "data: {\"error\":{\"message\":\"cut\"}}\n\n"]);
-        drain(body).await;
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn an_event_split_across_frames_still_fires() {
-        let (body, fired) = tracked(vec!["data: {\"cho", "ices\":[{\"delta\":{\"content\":\"x\"}}]}", "\r\n\r\n"]);
-        let frames = drain(body).await;
-        assert_eq!(frames.len(), 3, "frames are forwarded as they came");
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn an_error_coalesced_ahead_of_output_disarms() {
-        let (body, fired) = tracked(vec!["data: {\"error\":{\"message\":\"overloaded\"}}\n\ndata: {\"choices\":[]}\n\n"]);
-        drain(body).await;
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn an_unterminated_oversized_event_gives_up() {
-        let big: &'static str = Box::leak(format!("data: {{\"pad\":\"{}\"", "x".repeat(MAX_PENDING_EVENT)).into_boxed_str());
-        let (body, fired) = tracked(vec![big, ",\"choices\":[]}\n\n"]);
-        drain(body).await;
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 0, "left to the completion write");
+        ];
+        let mut d = FirstTokenDetector::default();
+        let fired_at: Vec<bool> = frames.iter().map(|f| d.observe(f.as_bytes())).collect();
+        assert_eq!(
+            fired_at,
+            vec![false, false, true, false],
+            "the role-only opening delta is not output"
+        );
     }
 
     #[test]
-    fn the_content_type_match_ignores_case_and_parameters() {
-        let with = |ct: &str| {
-            let mut r = Response::new(Body::empty());
-            r.headers_mut().insert(header::CONTENT_TYPE, ct.parse().unwrap());
-            is_event_stream(&r)
-        };
-        assert!(with("text/event-stream"));
-        assert!(with("Text/Event-Stream; charset=utf-8"));
-        assert!(!with("text/event-streaming"));
-        assert!(!with("application/json"));
+    fn an_error_before_any_output_disarms() {
+        assert_eq!(
+            fired(&[
+                "data: {\"error\":{\"message\":\"overloaded\"}}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn content_that_reads_error_is_still_output() {
+        assert_eq!(fired(&["data: {\"choices\":[{\"delta\":{\"content\":\"error\"}}]}\n\n"]), 1);
+        assert_eq!(
+            fired(&["data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}],\"error\":null}\n\n"]),
+            1,
+            "a null error is no error"
+        );
+    }
+
+    #[test]
+    fn a_role_only_opening_then_an_error_writes_nothing() {
+        assert_eq!(
+            fired(&[
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+                "data: {\"error\":{\"message\":\"overloaded\"}}\n\n"
+            ]),
+            0
+        );
+        for output in [
+            r#"{"choices":[{"delta":{"reasoning_content":"thinking"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"f"}}]}}]}"#,
+            r#"{"choices":[{"text":"legacy"}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"step"}]}}]}"#,
+        ] {
+            assert_eq!(fired(&[&format!("data: {output}\n\n")]), 1, "{output}");
+        }
+    }
+
+    #[test]
+    fn empty_reasoning_details_are_not_output() {
+        assert_eq!(
+            fired(&[
+                "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"\"}]}}]}\n\n",
+                "data: {\"error\":{\"message\":\"cut\"}}\n\n"
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn usage_only_events_are_not_output() {
+        assert_eq!(
+            fired(&[
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1}}\n\n",
+                "data: {\"error\":{\"message\":\"cut\"}}\n\n"
+            ]),
+            0,
+            "a usage frame before the error is not output, so nothing is written"
+        );
+    }
+
+    #[test]
+    fn an_error_event_with_empty_choices_is_not_output() {
+        assert_eq!(
+            fired(&[
+                "data: {\"choices\":[],\"error\":{\"message\":\"overloaded\"}}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"
+            ]),
+            0
+        );
+        assert_eq!(
+            fired(&["data: {\"choices\":[{\"delta\":{\"content\":\"the \\\"error\\\" key\"}}]}\n\n"]),
+            1,
+            "an escaped \"error\" inside content is not an error event"
+        );
+    }
+
+    #[test]
+    fn an_error_after_output_does_not_undo_it() {
+        assert_eq!(
+            fired(&[
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+                "data: {\"error\":{\"message\":\"cut\"}}\n\n"
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn an_event_split_across_frames_still_fires() {
+        let mut d = FirstTokenDetector::default();
+        assert!(!d.observe(b"data: {\"cho"));
+        assert!(!d.observe(b"ices\":[{\"delta\":{\"content\":\"x\"}}]}"));
+        assert!(d.observe(b"\r\n\r\n"), "fires on the frame that completes the event");
+    }
+
+    #[test]
+    fn an_error_coalesced_ahead_of_output_disarms() {
+        assert_eq!(
+            fired(&["data: {\"error\":{\"message\":\"overloaded\"}}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"]),
+            0
+        );
+    }
+
+    #[test]
+    fn an_unterminated_oversized_event_gives_up() {
+        let big = format!("data: {{\"pad\":\"{}\"", "x".repeat(MAX_PENDING_EVENT));
+        assert_eq!(
+            fired(&[&big, ",\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n"]),
+            0,
+            "left to the completion write"
+        );
     }
 }

@@ -1,3 +1,4 @@
+pub mod account_prices;
 pub mod ai_models;
 pub mod anthropic;
 pub mod api_key_hash_auth;

@@ -156,6 +156,7 @@ pub struct SetupIntent {
     pub payment_method_id: Option<String>,
     pub purpose: SetupPurpose,
     pub fingerprint: Option<String>,
+    pub cvc_check_failed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +217,14 @@ fn instrument_fingerprint(pm: &PaymentMethod) -> Option<String> {
         .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
 }
 
+fn cvc_check_failed(pm: &PaymentMethod) -> bool {
+    pm.card
+        .as_ref()
+        .and_then(|card| card.checks.as_ref())
+        .and_then(|checks| checks.cvc_check.as_deref())
+        == Some("fail")
+}
+
 fn pretax_credit_cents(session: &stripe_checkout::CheckoutSession) -> Option<i64> {
     session
         .line_items
@@ -235,6 +244,11 @@ fn summarize_session(session: &stripe_checkout::CheckoutSession) -> CheckoutSess
                 .as_ref()
                 .and_then(|pm| pm.as_object())
                 .and_then(instrument_fingerprint),
+            cvc_check_failed: setup_intent
+                .payment_method
+                .as_ref()
+                .and_then(|pm| pm.as_object())
+                .is_some_and(cvc_check_failed),
         }),
         _ => None,
     };
@@ -383,6 +397,15 @@ impl StripeClient {
     }
 }
 
+const CHECKOUT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(31 * 60);
+
+fn checkout_expiry() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from((now + CHECKOUT_LIFETIME).as_secs()).unwrap_or(i64::MAX)
+}
+
 #[async_trait]
 impl StripeApi for StripeClient {
     async fn create_payment_checkout_session(&self, checkout: PaymentCheckout<'_>) -> Result<CreatedCheckout> {
@@ -400,6 +423,7 @@ impl StripeApi for StripeClient {
             .automatic_tax(CreateCheckoutSessionAutomaticTax::new(true))
             .mode(CheckoutSessionMode::Payment)
             .ui_mode(CheckoutSessionUiMode::HostedPage)
+            .expires_at(checkout_expiry())
             .expand(vec!["line_items".to_string()])
             .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
             .name_collection(CreateCheckoutSessionNameCollection {
@@ -469,6 +493,7 @@ impl StripeApi for StripeClient {
             .client_reference_id(payer.reference_id)
             .mode(CheckoutSessionMode::Setup)
             .ui_mode(CheckoutSessionUiMode::HostedPage)
+            .expires_at(checkout_expiry())
             .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
             .name_collection(CreateCheckoutSessionNameCollection {
                 business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
@@ -791,6 +816,26 @@ mod tests {
             r#""card":{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242"}"#,
         );
         assert_eq!(instrument_fingerprint(&bare), None);
+    }
+
+    #[test]
+    fn test_cvc_check_failed_only_on_an_explicit_fail() {
+        let card_with = |checks: &str| {
+            payment_method_json(
+                "card",
+                &format!(
+                    r#""card":{{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242","fingerprint":"fp_card"{checks}}}"#
+                ),
+            )
+        };
+        assert!(cvc_check_failed(&card_with(r#","checks":{"cvc_check":"fail"}"#)));
+        assert!(!cvc_check_failed(&card_with(r#","checks":{"cvc_check":"pass"}"#)));
+        assert!(!cvc_check_failed(&card_with(r#","checks":{"cvc_check":"unavailable"}"#)));
+        assert!(!cvc_check_failed(&card_with(r#","checks":{"cvc_check":null}"#)));
+        assert!(!cvc_check_failed(&card_with("")));
+
+        let link = payment_method_json("link", r#""link":{"email":"someone@example.com"}"#);
+        assert!(!cvc_check_failed(&link));
     }
 
     #[test]

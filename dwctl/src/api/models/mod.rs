@@ -1,3 +1,4 @@
+pub mod account_prices;
 pub mod api_keys;
 pub mod auth;
 pub mod batch_requests;

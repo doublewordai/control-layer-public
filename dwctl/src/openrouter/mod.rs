@@ -2,6 +2,7 @@
 pub mod document;
 pub mod feed;
 pub mod listing;
+pub mod refresh;
 
 #[cfg(test)]
 pub(crate) mod schema_check {

@@ -168,6 +168,21 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(request, "doubleword.error.source").as_deref(), Some("gateway"));
     assert_eq!(attr(request, "doubleword.rejection.code").as_deref(), Some("model_not_found"));
     assert_eq!(attr(request, "http.response.status_code").as_deref(), Some("404"));
+
+    let refused_early = server
+        .post(path_chat)
+        .add_header("Authorization", &auth)
+        .json(&json!({
+            "model": "gpt-4o:fast", "service_tier": "flex",
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_object"},
+        }))
+        .await;
+    assert_eq!(refused_early.status_code().as_u16(), 404);
+    let early_spans = take(&provider, &exported);
+    let early = root(&early_spans, path_chat);
+    assert_eq!(attr(early, "doubleword.rejection.code").as_deref(), Some("model_not_found"));
+    assert_eq!(attr(early, "doubleword.response_format").as_deref(), Some("json_object"));
     let inner = onwards_request(&spans, request);
     assert_eq!(attr(inner, "error.type").as_deref(), Some("model_not_found"));
     assert_eq!(attr(inner, "onwards.account"), Some(owner.to_string()));
@@ -217,6 +232,28 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     assert_eq!(attr(request, "gen_ai.request.model").as_deref(), Some("gpt-4o"));
     let inner = onwards_request(&spans, request);
     assert_eq!(attr(inner, "http.response.status_code").as_deref(), Some("422"));
+    assert_eq!(attr(request, "doubleword.response_format"), None, "a plain request names no format");
+
+    let structured = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+        "max_tokens": 200,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "private-schema", "schema": {"type": "object"}}},
+        "tools": [{"type": "function", "function": {"name": "private-tool", "parameters": {"type": "object"}}}],
+        "tool_choice": {"type": "function", "function": {"name": "private-tool"}},
+    });
+    let rejected = server.post(path_chat).add_header("Authorization", &auth).json(&structured).await;
+    assert_eq!(rejected.status_code().as_u16(), 422);
+    let spans = take(&provider, &exported);
+    let request = root(&spans, path_chat);
+    assert_eq!(attr(request, "doubleword.response_format").as_deref(), Some("json_schema"));
+    assert_eq!(attr(request, "doubleword.tool_choice").as_deref(), Some("function"));
+    assert_eq!(attr(request, "doubleword.tool_count").as_deref(), Some("1"));
+    assert_eq!(attr(request, "gen_ai.request.max_tokens").as_deref(), Some("200"));
+    assert_eq!(attr(request, "doubleword.stream").as_deref(), Some("true"));
+    let recorded = format!("{:?}", request.attributes);
+    assert!(!recorded.contains("private-"), "{recorded}");
 
     mock.reset().await;
     Mock::given(method("POST"))

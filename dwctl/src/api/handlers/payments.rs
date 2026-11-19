@@ -149,6 +149,8 @@ async fn abandon_checkout<P: PoolProvider>(state: &AppState<P>, attempt_id: Uuid
     }
 }
 
+const VERIFY_CARD_FIRST: &str = "Please verify your card before enabling auto top-up.";
+
 async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnection) -> Result<BillingTarget, StatusCode> {
     if let Some(org_id) = user.active_organization {
         let can_manage = permissions::can_manage_org_resource(user, org_id, conn).await.map_err(|e| {
@@ -786,6 +788,10 @@ pub async fn process_auto_topup<P: PoolProvider>(
                 )
                     .into_response());
             }
+            payment_providers::PaymentError::CardNotVerified => {
+                tracing::warn!(user_id = %user.id, "Auto top-up refused: the saved card failed verification");
+                return Ok((StatusCode::FORBIDDEN, Json(json!({ "message": VERIFY_CARD_FIRST }))).into_response());
+            }
             _ => {
                 tracing::error!("Failed to validate auto top-up session: {:?}", e);
                 return Ok((
@@ -870,6 +876,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
     responses(
         (status = 200, description = "Result of the enable attempt", body = inline(Object)),
         (status = 400, description = "Invalid threshold or amount"),
+        (status = 403, description = "Billing account has not verified a card yet"),
         (status = 404, description = "Target organization not found"),
         (status = 503, description = "No payment provider configured"),
     ),
@@ -927,6 +934,20 @@ pub async fn enable_auto_topup<P: PoolProvider>(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     let target = resolve_billing_target(&user, &mut conn).await?;
+
+    let verified = sqlx::query_scalar::<_, bool>("SELECT verified FROM users WHERE id = $1")
+        .bind(target.id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to read verified flag: {:?}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .unwrap_or(false);
+    if !verified {
+        tracing::warn!(user_id = %user.id, target_id = %target.id, "Auto top-up refused: billing account is not verified");
+        return Ok((StatusCode::FORBIDDEN, Json(json!({ "message": VERIFY_CARD_FIRST }))).into_response());
+    }
 
     let customer_id = match &target.payment_provider_id {
         Some(id) if !id.is_empty() => id.clone(),
@@ -1516,6 +1537,14 @@ mod tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
+    async fn mark_verified(pool: &PgPool, id: Uuid) {
+        sqlx::query("UPDATE users SET verified = true WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
     #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_with_payment_method(pool: PgPool) {
         let mut config = create_test_config();
@@ -1541,6 +1570,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        mark_verified(&pool, user.id).await;
 
         let auth_headers = crate::test::utils::add_auth_headers(&user);
 
@@ -1582,6 +1612,48 @@ mod tests {
     }
 
     #[dwctl_test_macros::test]
+    async fn test_enable_auto_topup_refuses_unverified_account(pool: PgPool) {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        sqlx::query("UPDATE users SET payment_provider_id = $1 WHERE id = $2")
+            .bind("cus_test_unverified")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/auto-topup/enable").json(&serde_json::json!({
+            "threshold": 5.0,
+            "amount": 25.0
+        }));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::FORBIDDEN);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["message"], VERIFY_CARD_FIRST);
+
+        let amount: Option<f32> = sqlx::query_scalar("SELECT auto_topup_amount FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(amount, None, "auto top-up must stay off");
+    }
+
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_no_customer(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1591,6 +1663,7 @@ mod tests {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        mark_verified(&pool, user.id).await;
         let auth_headers = crate::test::utils::add_auth_headers(&user);
 
         let app = Router::new().route("/auto-topup/enable", post(enable_auto_topup)).with_state(state);
@@ -1633,6 +1706,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        mark_verified(&pool, org.id).await;
 
         let mut auth_headers = crate::test::utils::add_auth_headers(&user);
         auth_headers.push(("x-organization-id".to_string(), org.id.to_string()));

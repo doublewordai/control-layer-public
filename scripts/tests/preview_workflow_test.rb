@@ -25,7 +25,7 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes backend_gate, "preview-artifact-published"
     assert_includes backend_gate, "artifact_kind: 'image'"
     assert_includes backend_gate,
-                    "artifact_repository: 'ghcr.io/doublewordai/control-layer'"
+                    "artifact_repository: 'ghcr.io/doublewordai/dwctl'"
     refute_match(/^  workflow-contract:/, workflow)
     refute_match(/^  preview:/, workflow)
     refute_includes workflow, "pull_request_target"

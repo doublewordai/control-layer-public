@@ -202,7 +202,7 @@ fn system_to_message(system: &Content) -> Option<Value> {
 
 fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), TranslationError> {
     match m.role.as_str() {
-        "assistant" => out.push(convert_assistant(&m.content)),
+        "assistant" => out.push(convert_assistant(&m.content)?),
         "user" => convert_user(&m.content, out),
         "system" => out.extend(system_to_message(&m.content)),
         other => {
@@ -215,7 +215,7 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
     Ok(())
 }
 
-fn convert_assistant(content: &Content) -> Value {
+fn convert_assistant(content: &Content) -> Result<Value, TranslationError> {
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
@@ -270,6 +270,12 @@ fn convert_assistant(content: &Content) -> Value {
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), json!("assistant"));
     if text.is_empty() {
+        if marker.is_some() {
+            return Err(TranslationError::InvalidParameter {
+                param: "messages[].content",
+                message: "messages[].content: cache_control cannot be set on an empty text block".to_string(),
+            });
+        }
         msg.insert("content".into(), Value::Null);
     } else if let Some(cc) = marker {
         msg.insert("content".into(), json!([{ "type": "text", "text": text, "cache_control": cc }]));
@@ -282,7 +288,7 @@ fn convert_assistant(content: &Content) -> Value {
     if !tool_calls.is_empty() {
         msg.insert("tool_calls".into(), Value::Array(tool_calls));
     }
-    Value::Object(msg)
+    Ok(Value::Object(msg))
 }
 
 fn convert_user(content: &Content, out: &mut Vec<Value>) {
@@ -313,9 +319,14 @@ fn convert_user(content: &Content, out: &mut Vec<Value>) {
                         ..
                     } => {
                         let result_text = tool_result_to_text(content);
-                        let content_val = match cache_control {
-                            Some(cc) if !cc.is_null() => json!([{ "type": "text", "text": result_text, "cache_control": cc }]),
-                            _ => json!(result_text),
+                        let marker = cache_control
+                            .as_ref()
+                            .filter(|cc| !cc.is_null())
+                            .cloned()
+                            .or_else(|| nested_tool_result_marker(content));
+                        let content_val = match marker {
+                            Some(cc) => json!([{ "type": "text", "text": result_text, "cache_control": cc }]),
+                            None => json!(result_text),
                         };
                         tool_messages.push(json!({
                             "role": "tool",
@@ -351,6 +362,18 @@ fn image_source_to_url(source: &ImageSource) -> String {
     match source {
         ImageSource::Url { url } => url.clone(),
         ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
+    }
+}
+
+fn nested_tool_result_marker(content: &Option<ToolResultContent>) -> Option<Value> {
+    match content {
+        Some(ToolResultContent::Blocks(blocks)) => blocks
+            .iter()
+            .rev()
+            .filter_map(|b| b.get("cache_control"))
+            .find(|cc| !cc.is_null())
+            .cloned(),
+        _ => None,
     }
 }
 

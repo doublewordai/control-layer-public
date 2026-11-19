@@ -76,6 +76,7 @@ export function useUsers(options?: UsersQuery & { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.users.query(queryOptions),
     queryFn: () => dwctlApi.users.list(queryOptions),
+    placeholderData: keepPreviousData,
     enabled,
   });
 }
@@ -457,6 +458,7 @@ export function useGroups(options?: GroupsQuery & { enabled?: boolean }) {
   return useQuery({
     queryKey: queryKeys.groups.query(queryOptions),
     queryFn: () => dwctlApi.groups.list(queryOptions),
+    placeholderData: keepPreviousData,
     enabled,
   });
 }
@@ -1364,6 +1366,7 @@ export function useTransactions(query?: TransactionsQuery) {
   return useQuery({
     queryKey: ["cost", "transactions", query],
     queryFn: () => dwctlApi.cost.listTransactions(query),
+    placeholderData: keepPreviousData,
     staleTime: 30 * 1000,
   });
 }
@@ -1553,6 +1556,7 @@ export function useOrganizations(
   return useQuery({
     queryKey: queryKeys.organizations.query(queryOptions),
     queryFn: () => dwctlApi.organizations.list(queryOptions),
+    placeholderData: keepPreviousData,
     enabled,
   });
 }

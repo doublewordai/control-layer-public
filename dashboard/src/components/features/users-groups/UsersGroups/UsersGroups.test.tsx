@@ -59,6 +59,48 @@ describe("UsersGroups Component", () => {
     });
   });
 
+  it("keeps the user search box mounted and focused while results reload", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<UsersGroups />, { wrapper: createWrapper() });
+
+    const searchInput = await within(container).findByRole("textbox", {
+      name: /search users/i,
+    });
+
+    let releaseSearch: () => void = () => {};
+    let searchRequested = false;
+    server.use(
+      http.get("/admin/api/v1/users", async ({ request }) => {
+        if (new URL(request.url).searchParams.get("search") !== "Sarah") {
+          return undefined;
+        }
+        searchRequested = true;
+        await new Promise<void>((resolve) => {
+          releaseSearch = resolve;
+        });
+        return HttpResponse.json({ data: [], total_count: 0, skip: 0, limit: 10 });
+      }),
+    );
+
+    await user.type(searchInput, "Sarah");
+    await waitFor(() => expect(searchRequested).toBe(true));
+
+    expect(
+      within(container).queryByText("Loading users and groups..."),
+    ).not.toBeInTheDocument();
+    expect(searchInput).toBeInTheDocument();
+    expect(searchInput).toHaveFocus();
+    expect(searchInput).toHaveValue("Sarah");
+
+    releaseSearch();
+    await waitFor(() => {
+      expect(
+        within(container).queryByText("Sarah Chen"),
+      ).not.toBeInTheDocument();
+    });
+    expect(searchInput).toHaveFocus();
+  });
+
   it("renders error state when API fails", async () => {
     server.use(
       http.get("/admin/api/v1/users", () => {

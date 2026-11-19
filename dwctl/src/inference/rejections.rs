@@ -105,10 +105,7 @@ pub(crate) fn refuse_mismatch<'a>(
 
 pub(crate) fn record_caller<'a>(origin: impl Into<Origin<'a>>, model: Option<&str>) {
     let origin = origin.into();
-    let span = origin
-        .extensions
-        .and_then(|extensions| extensions.get::<crate::telemetry::RequestSpan>())
-        .map_or_else(tracing::Span::current, |root| root.0.clone());
+    let span = crate::telemetry::RequestSpan::of(origin.extensions);
     let Some((targets, mut context)) = Scope::of(origin).caller else {
         return;
     };

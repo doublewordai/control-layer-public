@@ -894,8 +894,8 @@ security-scan target="latest" *args="":
     
     # Use environment variable if set, otherwise use the provided target as tag
     SCAN_TAG="${TAG:-{{target}}}"
-    REGISTRY="ghcr.io/doublewordai/control-layer/"
-    CONTROL_LAYER_TAG="${REGISTRY}control-layer:$SCAN_TAG"
+    REGISTRY="ghcr.io/doublewordai/dwctl"
+    CONTROL_LAYER_TAG="${REGISTRY}:$SCAN_TAG"
 
     echo "🔍 Scanning published container images for vulnerabilities..."
     echo "Tag: $SCAN_TAG"
@@ -915,10 +915,11 @@ security-scan target="latest" *args="":
     # Scan each image
     echo ""
     echo "Scanning control-layer image: $CONTROL_LAYER_TAG"
-    grype "$CONTROL_LAYER_TAG" --output json --file control-layer-vulnerabilities.json --quiet || {
-        echo "⚠️  Control Layer scan failed, skipping..."
-        echo '{"matches": []}' > control-layer-vulnerabilities.json
-    }
+    if ! grype "$CONTROL_LAYER_TAG" --output json --file control-layer-vulnerabilities.json --quiet; then
+        echo "❌ Error: could not scan $CONTROL_LAYER_TAG" >&2
+        echo "   The package is private; run docker login ghcr.io and try again." >&2
+        exit 1
+    fi
 
     # Calculate metrics for each component
     CONTROL_LAYER_CRITICAL=$(calculate_vulns control-layer-vulnerabilities.json "Critical")

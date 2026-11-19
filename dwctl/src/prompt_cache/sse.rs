@@ -44,12 +44,12 @@ where
                 tracing::error!(
                     buffered_bytes = this.buffer.len(),
                     limit_bytes = this.limit,
-                    "Unfinished cache SSE event exceeded buffer limit"
+                    "Unfinished SSE event exceeded buffer limit"
                 );
                 this.buffer = BytesMut::new();
                 this.inner = None;
                 return Poll::Ready(Some(Err(E::from(std::io::Error::other(format!(
-                    "Unfinished cache SSE event exceeded buffer limit of {} bytes",
+                    "Unfinished SSE event exceeded buffer limit of {} bytes",
                     this.limit
                 ))))));
             }

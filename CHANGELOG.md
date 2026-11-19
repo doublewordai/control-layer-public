@@ -1,5 +1,35 @@
 # Changelog
 
+## [17.5.0](https://github.com/doublewordai/control-layer/compare/v17.4.0...v17.5.0) (2026-11-19)
+
+
+### Features
+
+* **cache:** assured cache billing from the reference cache ([#2183](https://github.com/doublewordai/control-layer/issues/2183)) ([52d0dde](https://github.com/doublewordai/control-layer/commit/52d0dde164c705d3132856b1af2f8475faa39a2b))
+* **pricing:** admin API for account prices; OpenRouter's feed shows what billing charges (DW-1307) ([#2212](https://github.com/doublewordai/control-layer/issues/2212)) ([6febdb0](https://github.com/doublewordai/control-layer/commit/6febdb0d2c1e7c63fe18c0c1c2c30640faa93b19))
+* **telemetry:** record what output a request asked for on its root span ([#2219](https://github.com/doublewordai/control-layer/issues/2219)) ([5c698dd](https://github.com/doublewordai/control-layer/commit/5c698dd2a6a4d54dab730b3e43ccc8519477cbcc))
+
+
+### Bug Fixes
+
+* **dashboard:** keep search inputs focused while results reload ([#2216](https://github.com/doublewordai/control-layer/issues/2216)) ([5188718](https://github.com/doublewordai/control-layer/commit/5188718d6dc849ff7969790048991e73b1581186))
+* **payments:** expire hosted checkouts after about 30 minutes ([#2211](https://github.com/doublewordai/control-layer/issues/2211)) ([376e624](https://github.com/doublewordai/control-layer/commit/376e6243c8eb9e55ffa1611795b8d0870df215cd))
+* **payments:** refuse card verification when the CVC check fails ([#2220](https://github.com/doublewordai/control-layer/issues/2220)) ([9aa8b00](https://github.com/doublewordai/control-layer/commit/9aa8b00339d2bcdfdf71c989cf55e0aca9d0f1b7))
+* **payments:** require a verified card before enabling auto top-up ([#2222](https://github.com/doublewordai/control-layer/issues/2222)) ([c68fa5b](https://github.com/doublewordai/control-layer/commit/c68fa5b47da6ef92ccff79b562762ac860bdb83c))
+* **translation:** frame upstream SSE with the shared CRLF-aware framer ([#2206](https://github.com/doublewordai/control-layer/issues/2206)) ([d9ea01f](https://github.com/doublewordai/control-layer/commit/d9ea01f58f91c7552e9e04d31b1bce1fdba3e0b1))
+
+
+### Performance Improvements
+
+* **openrouter:** build the refresh client only when a refresh can be sent (DW-1033) ([#2217](https://github.com/doublewordai/control-layer/issues/2217)) ([e6889ed](https://github.com/doublewordai/control-layer/commit/e6889ed0feb12e511b569da59f321e258547ea97))
+
+
+### Continuous Integration
+
+* a control-layer release no longer builds or tags the dwctl image (SD-26) ([#2213](https://github.com/doublewordai/control-layer/issues/2213)) ([29cdd9a](https://github.com/doublewordai/control-layer/commit/29cdd9ad84fcecaebb7e2adb33196f11ef288709))
+* push the dwctl image to the private package ghcr.io/doublewordai/dwctl (SD-61) ([#2215](https://github.com/doublewordai/control-layer/issues/2215)) ([c419b5a](https://github.com/doublewordai/control-layer/commit/c419b5ae7c23a8a893843bb42d933c76f9c60f34))
+* run onwards passthrough compliance against the image the run builds (DW-1326) ([#2224](https://github.com/doublewordai/control-layer/issues/2224)) ([936f5c1](https://github.com/doublewordai/control-layer/commit/936f5c16e758124c7c67e13fee46a5b82a6838e3))
+
 ## [17.4.0](https://github.com/doublewordai/control-layer/compare/v17.3.0...v17.4.0) (2026-11-18)
 
 

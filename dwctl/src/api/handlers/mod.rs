@@ -1,4 +1,5 @@
 
+pub mod account_prices;
 pub mod ai_models;
 pub mod api_keys;
 

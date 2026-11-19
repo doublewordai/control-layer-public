@@ -96,6 +96,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    crate::telemetry::record_request_shape(&request_value, &crate::telemetry::RequestSpan::of(Some(&parts.extensions)));
+
     let nested_path = parts.uri.path();
     let is_responses_api = nested_path.ends_with("/responses");
     let is_chat_completions_api = nested_path.ends_with("/chat/completions");

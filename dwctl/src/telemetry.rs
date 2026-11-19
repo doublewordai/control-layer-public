@@ -88,6 +88,41 @@ pub fn record_ai_response_attributes<B>(response: &axum::http::Response<B>, span
 #[derive(Clone, Debug)]
 pub struct RequestSpan(pub tracing::Span);
 
+impl RequestSpan {
+    pub fn of(extensions: Option<&axum::http::Extensions>) -> tracing::Span {
+        extensions
+            .and_then(|extensions| extensions.get::<Self>())
+            .map_or_else(tracing::Span::current, |root| root.0.clone())
+    }
+}
+
+pub fn record_request_shape(body: &serde_json::Value, span: &tracing::Span) {
+    use crate::request_logging::{structured_output::response_format_label, tool_calls::tool_choice_mode};
+
+    let format = body
+        .pointer("/response_format/type")
+        .or_else(|| body.pointer("/text/format/type"))
+        .and_then(serde_json::Value::as_str);
+    if let Some(format) = format {
+        span.set_attribute("doubleword.response_format", response_format_label(format));
+    }
+    if let Some(mode) = body.get("tool_choice").and_then(tool_choice_mode) {
+        span.set_attribute("doubleword.tool_choice", mode);
+    }
+    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
+        span.set_attribute("doubleword.tool_count", i64::try_from(tools.len()).unwrap_or(i64::MAX));
+    }
+    let max_tokens = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(serde_json::Value::as_i64));
+    if let Some(max_tokens) = max_tokens {
+        span.set_attribute("gen_ai.request.max_tokens", max_tokens);
+    }
+    if let Some(stream) = body.get("stream").and_then(serde_json::Value::as_bool) {
+        span.set_attribute("doubleword.stream", stream);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TraceParent(pub opentelemetry::trace::SpanContext);
 
@@ -439,6 +474,40 @@ struct OtlpSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shape(body: serde_json::Value) -> impl Fn(&str) -> Option<String> {
+        let (spans, _) = crate::request_logging::json_output::testing::recorded(|| {
+            let span = tracing::info_span!("shape");
+            record_request_shape(&body, &span);
+        });
+        move |key| crate::request_logging::json_output::testing::attribute(&spans, "shape", key)
+    }
+
+    #[test]
+    fn a_request_shape_is_recorded_as_bounded_labels() {
+        let chat = shape(serde_json::json!({
+            "max_tokens": 100, "max_completion_tokens": 512, "stream": false,
+            "response_format": {"type": "json_object"}, "tool_choice": "required", "tools": [{}, {}],
+        }));
+        assert_eq!(chat("doubleword.response_format").as_deref(), Some("json_object"));
+        assert_eq!(chat("doubleword.tool_choice").as_deref(), Some("required"));
+        assert_eq!(chat("doubleword.tool_count").as_deref(), Some("2"));
+        assert_eq!(
+            chat("gen_ai.request.max_tokens").as_deref(),
+            Some("512"),
+            "max_completion_tokens wins"
+        );
+        assert_eq!(chat("doubleword.stream").as_deref(), Some("false"));
+
+        let responses = shape(serde_json::json!({"text": {"format": {"type": "json_schema"}}, "max_output_tokens": 64}));
+        assert_eq!(responses("doubleword.response_format").as_deref(), Some("json_schema"));
+        assert_eq!(responses("gen_ai.request.max_tokens").as_deref(), Some("64"));
+
+        let plain = shape(serde_json::json!({"response_format": {"type": "private-grammar"}}));
+        assert_eq!(plain("doubleword.response_format").as_deref(), Some("other"));
+        assert_eq!(plain("doubleword.tool_choice"), None);
+        assert_eq!(plain("doubleword.tool_count"), None);
+    }
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::SpanData;
     use std::sync::{Arc, Mutex};

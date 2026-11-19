@@ -1,6 +1,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
+
 use axum::{
     Extension, Json,
     extract::State,
@@ -11,21 +13,18 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::{
     AppState,
-    api::{
-        handlers::ai_models::{customer_priced_models, database_error, presented_key_hash, resolve_discovery_key},
-        models::{cache_pricing::CachePricingResponse, tariffs::TariffResponse},
-    },
-    db::{
-        handlers::Deployments,
-        models::{api_keys::ApiKeyPurpose, deployments::ModelType},
-    },
+    api::handlers::ai_models::{customer_priced_models, database_error, presented_key_hash, resolve_discovery_key},
+    db::{handlers::Deployments, models::deployments::ModelType},
     inference::rejections::{Origin, Recorder},
     openrouter::{
         document::{ModelDocument, ModelFeed},
         feed::{CacheMultipliers, ListedModel, Prices, model_document},
         listing::OpenRouterListing,
     },
+    pricing::{BilledPrice, billed_realtime_prices},
 };
+
+pub(crate) const OPENROUTER_SERVING_CLASS: &str = "standard";
 
 #[allow(clippy::result_large_err)]
 #[tracing::instrument(skip_all)]
@@ -64,6 +63,22 @@ pub async fn list_openrouter_models<P: PoolProvider>(
     let mut models = customer_priced_models(&state, conn, model_ids, user_id).await?;
     models.sort_by(|a, b| a.alias.cmp(&b.alias));
 
+    let aliases: Vec<String> = models.iter().map(|model| model.alias.clone()).collect();
+    let mut tx = state
+        .db
+        .write()
+        .begin()
+        .await
+        .map_err(|e| database_error("begin_price_snapshot", e))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| database_error("begin_price_snapshot", e))?;
+    let prices = billed_realtime_prices(&mut tx, &aliases, user_id, OPENROUTER_SERVING_CLASS, Utc::now())
+        .await
+        .map_err(|e| database_error("load_billed_prices", e))?;
+    tx.rollback().await.map_err(|e| database_error("end_price_snapshot", e))?;
+
     let config = state.current_config();
     let datacenters = &config.integrations.openrouter.datacenters;
     let data: Vec<ModelDocument> = models
@@ -88,7 +103,7 @@ pub async fn list_openrouter_models<P: PoolProvider>(
                     context_window: metadata.and_then(|metadata| metadata.context_window),
                     quantization: metadata.and_then(|metadata| metadata.quantization.as_deref()),
                     listing,
-                    prices: realtime_prices(model.tariffs.as_deref(), model.cache_pricing.as_ref()),
+                    prices: prices.get(&model.alias).map(feed_prices),
                 },
                 &refused,
                 datacenters,
@@ -106,21 +121,15 @@ fn refused_params<'a>(rejected: &'a [String], allowed: Option<&Vec<String>>) -> 
         .collect()
 }
 
-fn realtime_prices(tariffs: Option<&[TariffResponse]>, cache: Option<&CachePricingResponse>) -> Option<Prices> {
-    let tariff = tariffs?
-        .iter()
-        .find(|tariff| tariff.is_active && tariff.api_key_purpose == Some(ApiKeyPurpose::Realtime))?;
-    let cache = cache.filter(|cache| cache.enabled).and_then(|cache| {
-        Some(CacheMultipliers {
-            read: cache.read_multiplier?,
-            write_5m: cache.write_multiplier_5m?,
-            write_1h: cache.write_multiplier_1h?,
-            write_24h: cache.write_multiplier_24h?,
-        })
-    });
-    Some(Prices {
-        input: tariff.input_price_per_token,
-        output: tariff.output_price_per_token,
-        cache,
-    })
+fn feed_prices(price: &BilledPrice) -> Prices {
+    Prices {
+        input: price.input,
+        output: price.output,
+        cache: price.cache.map(|cache| CacheMultipliers {
+            read: cache.read,
+            write_5m: cache.write_5m,
+            write_1h: cache.write_1h,
+            write_24h: cache.write_24h,
+        }),
+    }
 }

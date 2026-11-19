@@ -3077,6 +3077,10 @@ mod integration_tests {
         assert_eq!(clamped.read, Decimal::ONE);
         assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
         assert_eq!(
+            clamp_implicit_read_multiplier(Some(mults), Some("reference")).unwrap().read,
+            Decimal::ONE
+        );
+        assert_eq!(
             clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,
             Decimal::new(15, 1)
         );

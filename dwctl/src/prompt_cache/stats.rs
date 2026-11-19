@@ -9,6 +9,7 @@ use super::index::{CacheEntry, IndexScope, PrefixHash, TtlTier};
 pub enum CacheReadSource {
     Module,
     Engine,
+    Reference,
 }
 
 impl CacheReadSource {
@@ -16,7 +17,12 @@ impl CacheReadSource {
         match self {
             Self::Module => "module",
             Self::Engine => "engine",
+            Self::Reference => "reference",
         }
+    }
+
+    pub fn is_implicit(self) -> bool {
+        matches!(self, Self::Engine | Self::Reference)
     }
 }
 
@@ -24,6 +30,7 @@ impl CacheReadSource {
 pub struct BilledCache {
     pub stats: CacheStats,
     pub read_source: Option<CacheReadSource>,
+    pub reference: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]

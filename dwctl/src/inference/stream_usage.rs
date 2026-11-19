@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::prompt_cache::sse::SseBufferedStream;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientUsage {
     Omitted,
     Final,

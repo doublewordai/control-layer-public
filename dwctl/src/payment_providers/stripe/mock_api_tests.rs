@@ -814,6 +814,49 @@ async fn payment_methods_without_a_fingerprint_cannot_verify(pool: PgPool) {
 }
 
 #[dwctl_test_macros::test]
+async fn cards_that_fail_the_cvc_check_cannot_verify(pool: PgPool) {
+    let server = MockServer::start().await;
+    let user = create_test_user(&pool, Role::StandardUser).await.id;
+    mock_json(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}"), 200, fixture("customer")).await;
+    let provider = provider(&server);
+
+    let mut failed = setup_session("cs_test_verify_badcvc", user, "verification", Some("fp_badcvc"));
+    failed["setup_intent"]["payment_method"]["card"]["checks"] = json!({ "cvc_check": "fail" });
+    mock_session(&server, &failed).await;
+    let result = provider
+        .process_payment_session(&pool, "cs_test_verify_badcvc", &credits_with_verification(5))
+        .await;
+    assert!(
+        matches!(&result, Err(PaymentError::InvalidData(m)) if m.contains("CVC")),
+        "got {result:?}"
+    );
+    assert!(!is_verified(&pool, user).await);
+    assert_eq!(balance(&pool, user).await, Decimal::ZERO);
+
+    let mut topup = setup_session("cs_test_topup_badcvc", user, "auto_topup", Some("fp_badcvc"));
+    topup["setup_intent"]["payment_method"]["card"]["checks"] = json!({ "cvc_check": "fail" });
+    mock_session(&server, &topup).await;
+    provider
+        .process_payment_session(&pool, "cs_test_topup_badcvc", &credits_with_verification(5))
+        .await
+        .unwrap();
+    assert!(!is_verified(&pool, user).await);
+    assert_eq!(balance(&pool, user).await, Decimal::ZERO);
+
+    assert_eq!(count_requests(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}")).await, 0);
+
+    let mut passed = setup_session("cs_test_verify_goodcvc", user, "verification", Some("fp_badcvc"));
+    passed["setup_intent"]["payment_method"]["card"]["checks"] = json!({ "cvc_check": "pass" });
+    mock_session(&server, &passed).await;
+    provider
+        .process_payment_session(&pool, "cs_test_verify_goodcvc", &credits_with_verification(5))
+        .await
+        .unwrap();
+    assert!(is_verified(&pool, user).await);
+    assert_eq!(balance(&pool, user).await, Decimal::from(5));
+}
+
+#[dwctl_test_macros::test]
 async fn setup_sessions_that_did_not_complete_are_refused(pool: PgPool) {
     let server = MockServer::start().await;
     let user = create_test_user(&pool, Role::StandardUser).await.id;
@@ -903,6 +946,22 @@ async fn process_auto_topup_session_returns_customer_and_user_and_sets_default()
         update.form_value("invoice_settings[default_payment_method]"),
         Some("pm_ExamplePaymentMethod")
     );
+}
+
+#[tokio::test]
+async fn process_auto_topup_session_refuses_a_card_that_failed_the_cvc_check() {
+    let server = MockServer::start().await;
+    let user = UserId::new_v4();
+    let mut session = setup_session("cs_test_topup_badcvc_front", user, "auto_topup", Some("fp_topup"));
+    session["setup_intent"]["payment_method"]["card"]["checks"] = json!({ "cvc_check": "fail" });
+    mock_session(&server, &session).await;
+
+    let pool = PgPool::connect_lazy("postgres://unused@127.0.0.1:1/unused").unwrap();
+    let result = provider(&server)
+        .process_auto_topup_session(&pool, "cs_test_topup_badcvc_front")
+        .await;
+    assert!(matches!(result, Err(PaymentError::CardNotVerified)), "got {result:?}");
+    assert_eq!(count_requests(&server, "POST", &format!("/v1/customers/{CUSTOMER_ID}")).await, 0);
 }
 
 #[tokio::test]
@@ -1266,6 +1325,14 @@ async fn create_checkout_session_for_a_new_customer() {
     assert_eq!(request.form_value("customer_creation"), Some("always"));
     assert_eq!(request.form_value("customer"), None);
     assert!(!request.has_form_key_with_prefix("invoice_creation"), "off unless configured");
+    assert_expires_in_about_half_an_hour(&request);
+}
+
+fn assert_expires_in_about_half_an_hour(request: &Recorded) {
+    let expires_at: i64 = request.form_value("expires_at").expect("expires_at is set").parse().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let lifetime = expires_at - now;
+    assert!((30 * 60..=32 * 60).contains(&lifetime), "expires in {lifetime}s");
 }
 
 #[tokio::test]
@@ -1342,6 +1409,7 @@ async fn setup_checkout_sessions_differ_in_purpose_and_offered_methods() {
     assert_eq!(request.form_value("client_reference_id"), Some(target.to_string().as_str()));
     assert_eq!(request.form_array("payment_method_types"), ["card"]);
     assert_eq!(request.form_value("setup_intent_data[metadata][purpose]"), Some("verification"));
+    assert_expires_in_about_half_an_hour(&request);
     assert_eq!(
         request.form_value("setup_intent_data[description]"),
         Some("Payment method verification")

@@ -32,6 +32,10 @@ impl PrincipalResolver {
         }
     }
 
+    pub async fn cached(&self, token_hash: &ApiKeyHash) -> Option<Option<UserId>> {
+        self.l1.get(token_hash).await
+    }
+
     pub async fn resolve(&self, token_hash: &ApiKeyHash) -> CacheResult<Option<UserId>> {
         if let Some(cached) = self.l1.get(token_hash).await {
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });

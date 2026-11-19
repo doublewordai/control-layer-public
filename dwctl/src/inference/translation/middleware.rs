@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use super::{ProtocolTranslator, TranslationError, TranslationRegistry};
 use crate::inference::rejections;
+use crate::prompt_cache::sse::SseBufferedStream;
 
 pub async fn translation_middleware(State(registry): State<TranslationRegistry>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_string();
@@ -91,7 +92,15 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let response = next.run(downstream_req).await;
     let extensions = response.extensions().clone();
-    let mut translated = translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), rejection, response).await;
+    let mut translated = translate_response_back(
+        translator.as_ref(),
+        &original_request,
+        response_id.as_deref(),
+        rejection,
+        registry.sse_buffer_limit(),
+        response,
+    )
+    .await;
     translated.extensions_mut().extend(extensions);
     translated
 }
@@ -101,6 +110,7 @@ async fn translate_response_back(
     request: &Bytes,
     response_id: Option<&str>,
     rejection: rejections::Scope,
+    sse_buffer_limit: usize,
     response: Response,
 ) -> Response {
     let (parts, body) = response.into_parts();
@@ -114,7 +124,7 @@ async fn translate_response_back(
         .unwrap_or(false);
 
     if is_sse {
-        return reframe_sse(translator, request, response_id, status, body);
+        return reframe_sse(translator, request, response_id, status, body, sse_buffer_limit);
     }
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -165,15 +175,16 @@ fn reframe_sse(
     response_id: Option<&str>,
     status: StatusCode,
     body: Body,
+    sse_buffer_limit: usize,
 ) -> Response {
     let mut reframer = translator.stream_reframer(request, response_id);
-    let mut data = body.into_data_stream();
+    let reads = body.into_data_stream().map(|read| read.map_err(std::io::Error::other));
+    let mut events = SseBufferedStream::with_limit(reads, sse_buffer_limit);
 
     let out = async_stream::stream! {
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(item) = data.next().await {
-            let chunk = match item {
-                Ok(c) => c,
+        while let Some(item) = events.next().await {
+            let event = match item {
+                Ok(event) => event,
                 Err(e) => {
                     warn!(error = %e, "edge translation: upstream SSE transport error");
                     let ev = reframer.error("upstream stream error");
@@ -183,25 +194,21 @@ fn reframe_sse(
                     return;
                 }
             };
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = find_subsequence(&buf, b"\n\n") {
-                let block: Vec<u8> = buf.drain(..pos + 2).collect();
-                for line in String::from_utf8_lossy(&block).lines() {
-                    let Some(data_part) = line.strip_prefix("data:") else { continue };
-                    let data_part = data_part.trim();
-                    if data_part.is_empty() || data_part == "[DONE]" {
-                        continue;
+            for line in String::from_utf8_lossy(&event).lines() {
+                let Some(data_part) = line.strip_prefix("data:") else { continue };
+                let data_part = data_part.trim();
+                if data_part.is_empty() || data_part == "[DONE]" {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(data_part) {
+                    Ok(val) => {
+                        let emitted = reframer.push(&val);
+                        if !emitted.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(emitted));
+                        }
                     }
-                    match serde_json::from_str::<serde_json::Value>(data_part) {
-                        Ok(val) => {
-                            let emitted = reframer.push(&val);
-                            if !emitted.is_empty() {
-                                yield Ok::<Bytes, std::io::Error>(Bytes::from(emitted));
-                            }
-                        }
-                        Err(e) => {
-                            debug!(error = %e, "edge translation: dropping unparseable SSE data line");
-                        }
+                    Err(e) => {
+                        debug!(error = %e, "edge translation: dropping unparseable SSE data line");
                     }
                 }
             }
@@ -219,15 +226,12 @@ fn reframe_sse(
     resp
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inference::translation::TranslationRegistry;
     use crate::inference::translation::anthropic::AnthropicMessages;
+    use crate::inference::translation::responses::OpenResponses;
     use axum::{Router, extract::Request, routing::post};
     use std::sync::Arc;
 
@@ -660,5 +664,222 @@ mod tests {
         assert_eq!(response.status_code().as_u16(), 200);
         let body: serde_json::Value = response.json();
         assert_eq!(body["model"], "gpt-x");
+    }
+
+    const FRAMING_EVENTS: [&str; 6] = [
+        r#"{"id":"chatcmpl-frame","object":"chat.completion.chunk","created":0,"model":"model-x","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}"#,
+        r#"{"id":"chatcmpl-frame","object":"chat.completion.chunk","created":0,"model":"model-x","choices":[{"index":0,"delta":{"content":"Hel"}}]}"#,
+        r#"{"id":"chatcmpl-frame","object":"chat.completion.chunk","created":0,"model":"model-x","choices":[{"index":0,"delta":{"content":"lo"}}]}"#,
+        r#"{"id":"chatcmpl-frame","object":"chat.completion.chunk","created":0,"model":"model-x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"{"id":"chatcmpl-frame","object":"chat.completion.chunk","created":0,"model":"model-x","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}"#,
+        "[DONE]",
+    ];
+
+    const LF: &str = "\n\n";
+    const CRLF: &str = "\r\n\r\n";
+
+    const FRAMINGS: [(&str, &[&str]); 3] = [
+        ("crlf", &[CRLF, CRLF, CRLF, CRLF, CRLF, CRLF]),
+        ("mixed", &[LF, CRLF, LF, LF, CRLF, CRLF]),
+        ("unterminated_usage", &[CRLF, LF, CRLF, LF, ""]),
+    ];
+
+    const READ_SIZES: [usize; 3] = [1, 7, usize::MAX];
+
+    fn framed_body(terminators: &[&str]) -> String {
+        FRAMING_EVENTS
+            .iter()
+            .zip(terminators)
+            .map(|(event, terminator)| format!("data: {event}{terminator}"))
+            .collect()
+    }
+
+    fn chunked_sse(body: &str, read_size: usize) -> Response {
+        let reads: Vec<Result<Bytes, std::io::Error>> = body
+            .as_bytes()
+            .chunks(read_size.min(body.len()))
+            .map(|read| Ok(Bytes::copy_from_slice(read)))
+            .collect();
+        let mut resp = Response::new(Body::from_stream(futures::stream::iter(reads)));
+        resp.headers_mut()
+            .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+        resp
+    }
+
+    async fn translated_stream(
+        translator: Arc<dyn ProtocolTranslator>,
+        path: &str,
+        request: serde_json::Value,
+        body: String,
+        read_size: usize,
+    ) -> String {
+        let registry = TranslationRegistry::new(vec![translator]);
+        let inner = Router::new()
+            .route(
+                path,
+                post(move || {
+                    let body = body.clone();
+                    async move { chunked_sse(&body, read_size) }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+        let response = server.post(&format!("/ai/v1{path}")).json(&request).await;
+        assert_eq!(response.status_code().as_u16(), 200);
+        response.text()
+    }
+
+    fn output_events(text: &str) -> Vec<(String, serde_json::Value)> {
+        text.split("\n\n")
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| {
+                let field = |name: &str| block.lines().find_map(|line| line.strip_prefix(name)).map(str::trim);
+                let event = field("event:").expect("event line").to_string();
+                let data = serde_json::from_str(field("data:").expect("data line")).expect("data JSON");
+                (event, data)
+            })
+            .collect()
+    }
+
+    async fn anthropic_stream(body: String, read_size: usize) -> String {
+        let request = serde_json::json!({
+            "model": "model-x", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        translated_stream(Arc::new(AnthropicMessages::new(true)), "/messages", request, body, read_size).await
+    }
+
+    #[tokio::test]
+    async fn anthropic_reframer_handles_crlf_and_mixed_framing() {
+        let lf = anthropic_stream(framed_body(&[LF; 6]), usize::MAX).await;
+        let events = output_events(&lf);
+        let text: String = events
+            .iter()
+            .filter(|(event, _)| event == "content_block_delta")
+            .map(|(_, data)| data["delta"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(text, "Hello", "{lf}");
+        let (_, delta) = events.iter().find(|(event, _)| event == "message_delta").expect("message_delta");
+        assert_eq!(delta["usage"]["input_tokens"], 7, "{lf}");
+        assert_eq!(delta["usage"]["output_tokens"], 2, "{lf}");
+        assert_eq!(events.iter().filter(|(event, _)| event == "message_stop").count(), 1, "{lf}");
+        assert_eq!(events.last().unwrap().0, "message_stop", "{lf}");
+
+        for (name, terminators) in FRAMINGS {
+            for read_size in READ_SIZES {
+                let out = anthropic_stream(framed_body(terminators), read_size).await;
+                assert_eq!(out, lf, "{name} framing in {read_size}-byte reads");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_reframer_handles_crlf_and_mixed_framing() {
+        let request = serde_json::json!({ "model": "model-x", "input": "hi", "stream": true });
+        for (name, terminators) in [("lf", &[LF; 6] as &[&str])].into_iter().chain(FRAMINGS) {
+            for read_size in READ_SIZES {
+                let context = format!("{name} framing in {read_size}-byte reads");
+                let out = translated_stream(
+                    Arc::new(OpenResponses::new()),
+                    "/responses",
+                    request.clone(),
+                    framed_body(terminators),
+                    read_size,
+                )
+                .await;
+                let events = output_events(&out);
+                let text: String = events
+                    .iter()
+                    .filter(|(event, _)| event == "response.output_text.delta")
+                    .map(|(_, data)| data["delta"].as_str().unwrap())
+                    .collect();
+                assert_eq!(text, "Hello", "{context}:\n{out}");
+                assert_eq!(
+                    events.iter().filter(|(event, _)| event == "response.completed").count(),
+                    1,
+                    "{context}:\n{out}"
+                );
+                let (last, completed) = events.last().unwrap();
+                assert_eq!(last, "response.completed", "{context}:\n{out}");
+                assert_eq!(completed["response"]["usage"]["input_tokens"], 7, "{context}:\n{out}");
+                assert_eq!(completed["response"]["usage"]["output_tokens"], 2, "{context}:\n{out}");
+            }
+        }
+    }
+
+    fn anthropic_reframe(reads: futures::channel::mpsc::UnboundedReceiver<Result<Bytes, std::io::Error>>, limit: usize) -> Body {
+        let request = Bytes::from_static(br#"{"model":"model-x","max_tokens":10,"stream":true,"messages":[]}"#);
+        let response = reframe_sse(
+            &AnthropicMessages::new(true),
+            &request,
+            None,
+            StatusCode::OK,
+            Body::from_stream(reads),
+            limit,
+        );
+        response.into_body()
+    }
+
+    async fn read_until(body: &mut axum::body::BodyDataStream, out: &mut String, needle: &str) {
+        while !out.contains(needle) {
+            let read = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+                .await
+                .unwrap_or_else(|_| panic!("stalled before {needle:?}; got:\n{out}"))
+                .unwrap_or_else(|| panic!("ended before {needle:?}; got:\n{out}"))
+                .expect("translated body read");
+            out.push_str(std::str::from_utf8(&read).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn crlf_events_are_translated_before_the_upstream_ends() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut body = anthropic_reframe(rx, onwards::sse::DEFAULT_SSE_BUFFER_LIMIT).into_data_stream();
+        let mut out = String::new();
+
+        tx.unbounded_send(Ok(Bytes::from(format!("data: {}\r\n\r\n", FRAMING_EVENTS[0]))))
+            .unwrap();
+        tx.unbounded_send(Ok(Bytes::from(format!("data: {}\r\n", FRAMING_EVENTS[1]))))
+            .unwrap();
+        tx.unbounded_send(Ok(Bytes::from_static(b"\r\n"))).unwrap();
+        read_until(&mut body, &mut out, r#""text":"Hel""#).await;
+        assert!(!out.contains("message_stop"), "closed before the upstream ended:\n{out}");
+
+        drop(tx);
+        read_until(&mut body, &mut out, "event: message_stop").await;
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn over_limit_event_ends_with_an_error_event() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut body = anthropic_reframe(rx, 256).into_data_stream();
+        let mut out = String::new();
+
+        tx.unbounded_send(Ok(Bytes::from(format!("data: {}\r\n\r\n", FRAMING_EVENTS[1]))))
+            .unwrap();
+        read_until(&mut body, &mut out, r#""text":"Hel""#).await;
+        for _ in 0..3 {
+            tx.unbounded_send(Ok(Bytes::from(format!("data: {{\"pad\":\"{}", "x".repeat(100)))))
+                .unwrap();
+        }
+        read_until(&mut body, &mut out, "event: error").await;
+        assert!(body.next().await.is_none(), "error must be terminal:\n{out}");
+        assert!(!out.contains("message_stop"), "over-limit stream closed normally:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_ends_with_an_error_event() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let mut body = anthropic_reframe(rx, onwards::sse::DEFAULT_SSE_BUFFER_LIMIT).into_data_stream();
+        let mut out = String::new();
+
+        tx.unbounded_send(Ok(Bytes::from(format!("data: {}\r\n\r\ndata: {{\"partial", FRAMING_EVENTS[1]))))
+            .unwrap();
+        tx.unbounded_send(Err(std::io::Error::other("connection reset"))).unwrap();
+        read_until(&mut body, &mut out, "event: error").await;
+        assert!(out.contains(r#""text":"Hel""#), "{out}");
+        assert!(body.next().await.is_none(), "error must be terminal:\n{out}");
+        assert!(!out.contains("message_stop"), "errored stream closed normally:\n{out}");
     }
 }

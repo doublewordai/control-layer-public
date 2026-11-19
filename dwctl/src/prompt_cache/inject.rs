@@ -3,22 +3,40 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde_json::Value;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use tracing::error;
 
 use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
 use super::stats::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
+use crate::reference_cache::Joined;
 
 #[derive(Clone, Debug, Default)]
-pub struct UpstreamCachedTokens(Arc<OnceLock<u64>>);
+pub struct UpstreamCachedTokens(Arc<Mutex<UpstreamUsage>>);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UpstreamUsage {
+    cached: Option<u64>,
+    prompt: Option<u64>,
+}
 
 impl UpstreamCachedTokens {
     pub fn get(&self) -> Option<u64> {
-        self.0.get().copied()
+        self.0.lock().expect("not poisoned").cached
     }
 
+    #[cfg(test)]
     pub(crate) fn set(&self, value: u64) {
-        let _ = self.0.set(value);
+        self.0.lock().expect("not poisoned").cached = Some(value);
+    }
+
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        self.0.lock().expect("not poisoned").prompt
+    }
+
+    pub(crate) fn record(&self, counts: UsageCounts) {
+        let mut cell = self.0.lock().expect("not poisoned");
+        cell.cached = counts.engine.or(cell.cached);
+        cell.prompt = counts.prompt.or(cell.prompt);
     }
 }
 
@@ -30,6 +48,7 @@ fn upstream_cached_tokens(usage: &serde_json::Map<String, Value>) -> Option<u64>
         .and_then(Value::as_u64)
 }
 
+#[cfg(test)]
 pub(crate) fn read_upstream_cached_tokens_json(body: &[u8]) -> Option<u64> {
     let json: Value = serde_json::from_slice(body).ok()?;
     upstream_cached_tokens(json.get("usage")?.as_object()?)
@@ -144,13 +163,90 @@ pub(crate) fn scrub_provider_cache_fields(usage: &mut serde_json::Map<String, Va
     changed
 }
 
-pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
+pub fn scrub_usage_json(body: &[u8], capture: &UpstreamCachedTokens) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let usage = json.as_object_mut()?.get_mut("usage")?.as_object_mut()?;
+    capture.record(UsageCounts::of(usage));
     if !scrub_provider_cache_fields(usage) {
         return None;
     }
     serde_json::to_vec(&json).ok().map(Bytes::from)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct UsageCounts {
+    pub prompt: Option<u64>,
+    pub completion: Option<u64>,
+    pub total: Option<u64>,
+    pub engine: Option<u64>,
+}
+
+impl UsageCounts {
+    fn of(usage: &serde_json::Map<String, Value>) -> Self {
+        let mut counts = Self::default();
+        counts.observe(usage);
+        counts
+    }
+
+    fn observe(&mut self, usage: &serde_json::Map<String, Value>) {
+        let max = u64::from(u32::MAX);
+        let count = |key: &str| usage.get(key).and_then(Value::as_u64).filter(|&v| v <= max);
+        let (p, c, t) = (count("prompt_tokens"), count("completion_tokens"), count("total_tokens"));
+        let prompt = p.or_else(|| t?.checked_sub(c?)).or(self.prompt);
+        let completion = c.or_else(|| t?.checked_sub(prompt?)).or(self.completion);
+        let total = match (p, c, t) {
+            (Some(_), Some(_), Some(t)) => Some(t),
+            _ => prompt
+                .zip(completion)
+                .map(|(p, c)| p + c)
+                .filter(|&t| t <= max)
+                .or(t)
+                .or(self.total),
+        };
+        *self = Self {
+            prompt,
+            completion,
+            total,
+            engine: upstream_cached_tokens(usage).or(self.engine),
+        };
+    }
+
+    fn write(&self, usage: &mut serde_json::Map<String, Value>) {
+        for (key, value) in [
+            ("prompt_tokens", self.prompt),
+            ("completion_tokens", self.completion),
+            ("total_tokens", self.total),
+        ] {
+            if let Some(value) = value {
+                usage.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        if let Some(engine) = self.engine {
+            details_object(usage).insert("cached_tokens".to_string(), serde_json::json!(engine));
+        }
+    }
+}
+
+fn details_object(usage: &mut serde_json::Map<String, Value>) -> &mut serde_json::Map<String, Value> {
+    let details = usage.entry("prompt_tokens_details").or_insert_with(|| serde_json::json!({}));
+    if !details.is_object() {
+        *details = serde_json::json!({});
+    }
+    details.as_object_mut().expect("replaced by an object above")
+}
+
+fn write_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
+    details_object(usage).insert("cached_tokens".to_string(), serde_json::json!(stats.read));
+    usage.insert("cache_read_input_tokens".to_string(), serde_json::json!(stats.read));
+    usage.insert("cache_creation_input_tokens".to_string(), serde_json::json!(stats.creation_total()));
+    usage.insert(
+        "cache_creation".to_string(),
+        serde_json::json!({
+            "ephemeral_5m_input_tokens": stats.creation_5m,
+            "ephemeral_1h_input_tokens": stats.creation_1h,
+            "ephemeral_24h_input_tokens": stats.creation_24h,
+        }),
+    );
 }
 
 fn splice_cache_fields(
@@ -158,6 +254,7 @@ fn splice_cache_fields(
     stats: &CacheStats,
     model: Option<&str>,
     allow_implicit: bool,
+    reference: Option<&Joined>,
 ) -> BilledCache {
     let engine_reported = upstream_cached_tokens(usage);
     scrub_provider_cache_fields(usage);
@@ -181,30 +278,33 @@ fn splice_cache_fields(
         }
     }
 
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let estimate = reference.zip(prompt_tokens).and_then(|(r, prompt)| r.estimate(prompt));
     let mut read_source = (read > 0).then_some(CacheReadSource::Module);
-    if allow_implicit && let (Some(engine), Some(prompt)) = (engine_reported, usage.get("prompt_tokens").and_then(Value::as_u64)) {
-        let engine_capped = engine.min(prompt);
-        if engine_capped > 0 {
-            read = engine_capped;
-            read_source = Some(CacheReadSource::Engine);
+    if allow_implicit && let Some(prompt) = prompt_tokens {
+        let engine_capped = engine_reported.map(|engine| engine.min(prompt));
+        match (reference.and_then(Joined::terms), estimate) {
+            (Some(terms), Some(estimate)) => {
+                let engine = engine_capped.unwrap_or(0);
+                read = terms.billed_read(engine, estimate, prompt);
+                read_source = if read > engine {
+                    Some(CacheReadSource::Reference)
+                } else {
+                    (read > 0).then_some(CacheReadSource::Engine)
+                };
+            }
+            _ => {
+                if let Some(engine_capped) = engine_capped
+                    && engine_capped > 0
+                {
+                    read = engine_capped;
+                    read_source = Some(CacheReadSource::Engine);
+                }
+            }
         }
     }
 
-    let details = usage.entry("prompt_tokens_details").or_insert_with(|| serde_json::json!({}));
-    if let Some(details_obj) = details.as_object_mut() {
-        details_obj.insert("cached_tokens".to_string(), serde_json::json!(read));
-    }
-    usage.insert("cache_read_input_tokens".to_string(), serde_json::json!(read));
-    usage.insert("cache_creation_input_tokens".to_string(), serde_json::json!(c5 + c1 + c24));
-    usage.insert(
-        "cache_creation".to_string(),
-        serde_json::json!({
-            "ephemeral_5m_input_tokens": c5,
-            "ephemeral_1h_input_tokens": c1,
-            "ephemeral_24h_input_tokens": c24,
-        }),
-    );
-    BilledCache {
+    let billed = BilledCache {
         stats: CacheStats {
             read,
             creation_5m: c5,
@@ -213,124 +313,187 @@ fn splice_cache_fields(
             ..*stats
         },
         read_source,
-    }
+        reference: estimate,
+    };
+    write_cache_fields(usage, &billed.stats);
+    billed
 }
 
-pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<(Bytes, BilledCache)> {
+pub fn inject_into_usage_json(
+    body: &[u8],
+    stats: &CacheStats,
+    allow_implicit: bool,
+    reference: Option<&Joined>,
+    capture: &UpstreamCachedTokens,
+) -> Option<(Bytes, BilledCache)> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
     let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
-    let billed = splice_cache_fields(usage, stats, model.as_deref(), allow_implicit);
+    let counts = UsageCounts::of(usage);
+    capture.record(counts);
+    counts.write(usage);
+    let billed = splice_cache_fields(usage, stats, model.as_deref(), allow_implicit, reference);
     serde_json::to_vec(&json).ok().map(|body| (Bytes::from(body), billed))
 }
 
-pub(crate) struct SseScan {
+#[derive(Debug, Default)]
+pub(crate) struct StreamUsage {
+    counts: UsageCounts,
+    usage: Option<serde_json::Map<String, Value>>,
+    envelope: Option<serde_json::Map<String, Value>>,
+    crlf: bool,
+    open_tail: &'static str,
+    finished: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EventScan {
     pub rewritten: Option<Bytes>,
     pub saw_error: bool,
     pub saw_usage: bool,
-    pub upstream_cached_tokens: Option<u64>,
-    pub billing_stats: Option<BilledCache>,
+    pub done: bool,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum UsageEdit<'a> {
-    Probe,
-    Inject { stats: &'a CacheStats, allow_implicit: bool },
+pub(crate) enum Bill<'a> {
+    Inject {
+        stats: &'a CacheStats,
+        allow_implicit: bool,
+        reference: Option<&'a Joined>,
+    },
     Scrub,
 }
 
-pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
-    let Ok(body_str) = std::str::from_utf8(body) else {
-        return SseScan {
-            rewritten: None,
-            saw_error: false,
-            saw_usage: false,
-            upstream_cached_tokens: None,
-            billing_stats: None,
-        };
-    };
-
-    if matches!(edit, UsageEdit::Probe) {
-        let mut saw_error = false;
-        let mut saw_usage = false;
-        let mut upstream = None;
-        for line in body_str.split('\n') {
-            if let Some(chunk) = sse_data_json(line) {
-                saw_error |= chunk.get("error").is_some();
-                if let Some(usage) = chunk.get("usage").and_then(Value::as_object) {
-                    saw_usage = true;
-                    upstream = upstream.or_else(|| upstream_cached_tokens(usage));
-                }
-            }
+impl StreamUsage {
+    pub fn observe(&mut self, event: &[u8]) -> EventScan {
+        let scan = self.scan(event);
+        let forwarded = scan.rewritten.as_deref().unwrap_or(event);
+        if !scan.done && !forwarded.is_empty() {
+            self.open_tail = missing_terminator(forwarded);
         }
-        return SseScan {
-            rewritten: None,
-            saw_error,
-            saw_usage,
-            upstream_cached_tokens: upstream,
-            billing_stats: None,
-        };
+        scan
     }
 
-    let mut out = String::with_capacity(body_str.len() + 256);
-    let mut edited = false;
-    let mut saw_error = false;
-    let mut saw_usage = false;
-    let mut upstream = None;
-    let mut billing_stats = None;
-
-    let mut first = true;
-    for line in body_str.split('\n') {
-        if !first {
-            out.push('\n');
+    fn scan(&mut self, event: &[u8]) -> EventScan {
+        let mut scan = EventScan::default();
+        let Ok(text) = std::str::from_utf8(event) else {
+            return scan;
+        };
+        if !(text.contains("usage") || text.contains("error") || text.contains("[DONE]")) {
+            return scan;
         }
-        first = false;
-
-        if let Some(mut chunk) = sse_data_json(line) {
+        let mut out = String::with_capacity(text.len());
+        let mut changed = false;
+        for line in text.split_inclusive('\n') {
+            let content = line.trim_end_matches(['\n', '\r']);
+            let ending = &line[content.len()..];
+            let Some(data) = content.strip_prefix("data:") else {
+                out.push_str(line);
+                continue;
+            };
+            scan.done |= data.trim() == "[DONE]";
+            let Some(mut chunk) = sse_data_json(content) else {
+                out.push_str(line);
+                continue;
+            };
             let chunk_obj = chunk.as_object_mut().expect("sse_data_json returns only objects");
-            if chunk_obj.contains_key("error") {
-                saw_error = true;
-            }
-            let model = chunk_obj.get("model").and_then(Value::as_str).map(String::from);
-            if let Some(usage) = chunk_obj.get_mut("usage")
-                && let Some(usage_obj) = usage.as_object_mut()
-            {
-                saw_usage = true;
-                upstream = upstream.or_else(|| upstream_cached_tokens(usage_obj));
-                if !edited {
-                    let has_cr = line.ends_with('\r');
-                    let mut billed = None;
-                    let changed = match edit {
-                        UsageEdit::Probe => false,
-                        UsageEdit::Inject { stats, allow_implicit } => {
-                            billed = Some(splice_cache_fields(usage_obj, stats, model.as_deref(), allow_implicit));
-                            true
-                        }
-                        UsageEdit::Scrub => scrub_provider_cache_fields(usage_obj),
-                    };
-                    if changed && let Ok(reserialized) = serde_json::to_string(&chunk) {
-                        billing_stats = billed;
-                        out.push_str("data: ");
-                        out.push_str(&reserialized);
-                        if has_cr {
-                            out.push('\r');
-                        }
-                        edited = true;
-                        continue;
-                    }
+            let error = chunk_obj.contains_key("error");
+            scan.saw_error |= error;
+            let Some(usage) = chunk_obj.get("usage").and_then(Value::as_object).cloned() else {
+                out.push_str(line);
+                continue;
+            };
+            scan.saw_usage = true;
+            let usage_only = !error
+                && chunk_obj
+                    .get("choices")
+                    .is_none_or(|c| c.is_null() || c.as_array().is_some_and(Vec::is_empty));
+            let rewrite = if self.finished {
+                chunk_obj.shift_remove("usage");
+                true
+            } else {
+                self.counts.observe(&usage);
+                self.usage = Some(usage);
+                self.crlf = ending == "\r\n";
+                if error {
+                    chunk_obj.shift_remove("usage");
+                    true
+                } else {
+                    let mut envelope = chunk_obj.clone();
+                    envelope.shift_remove("usage");
+                    self.envelope = Some(envelope);
+                    chunk_obj
+                        .get_mut("usage")
+                        .and_then(Value::as_object_mut)
+                        .is_some_and(scrub_provider_cache_fields)
                 }
+            };
+            if usage_only {
+                changed = true;
+                continue;
+            }
+            match serde_json::to_string(&chunk) {
+                Ok(json) if rewrite => {
+                    out.push_str("data: ");
+                    out.push_str(&json);
+                    out.push_str(ending);
+                    changed = true;
+                }
+                _ => out.push_str(line),
             }
         }
-        out.push_str(line);
+        if changed {
+            scan.rewritten = Some(if out.trim().is_empty() { Bytes::new() } else { Bytes::from(out) });
+        }
+        scan
     }
 
-    SseScan {
-        rewritten: if edited { Some(Bytes::from(out)) } else { None },
-        saw_error,
-        saw_usage,
-        upstream_cached_tokens: upstream,
-        billing_stats,
+    pub fn pending(&self) -> bool {
+        !self.finished && self.usage.is_some()
+    }
+
+    pub fn counts(&self) -> UsageCounts {
+        self.counts
+    }
+
+    pub fn finish(&mut self, bill: Bill) -> Option<(Bytes, Option<BilledCache>)> {
+        if !self.pending() {
+            return None;
+        }
+        self.finished = true;
+        let mut usage = self.usage.take()?;
+        self.counts.write(&mut usage);
+        let mut chunk = self.envelope.take().unwrap_or_default();
+        let model = chunk.get("model").and_then(Value::as_str).map(String::from);
+        let billed = match bill {
+            Bill::Inject {
+                stats,
+                allow_implicit,
+                reference,
+            } => Some(splice_cache_fields(&mut usage, stats, model.as_deref(), allow_implicit, reference)),
+            Bill::Scrub => {
+                scrub_provider_cache_fields(&mut usage);
+                None
+            }
+        };
+        chunk.insert("choices".to_string(), serde_json::json!([]));
+        chunk.insert("usage".to_string(), Value::Object(usage));
+        let end = if self.crlf { "\r\n\r\n" } else { "\n\n" };
+        let frame = format!("{}data: {}{end}", self.open_tail, Value::Object(chunk));
+        Some((Bytes::from(frame), billed))
+    }
+}
+
+fn missing_terminator(event: &[u8]) -> &'static str {
+    if event.ends_with(b"\n\n") || event.ends_with(b"\r\n\r\n") {
+        ""
+    } else if event.ends_with(b"\r\n") {
+        "\r\n"
+    } else if event.ends_with(b"\n") {
+        "\n"
+    } else {
+        "\n\n"
     }
 }
 
@@ -343,19 +506,12 @@ fn sse_data_json(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(trimmed).ok().filter(Value::is_object)
 }
 
-pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Inject { stats, allow_implicit }).rewritten
-}
-
-pub fn scrub_sse_body(body: &[u8]) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Scrub).rewritten
-}
-
 pub async fn inject_into_response_nonstreaming(
     response: Response,
     stats: &CacheStats,
     capture: &UpstreamCachedTokens,
     allow_implicit: bool,
+    reference: Option<&Joined>,
 ) -> (Response, bool) {
     let status_ok = response.status().is_success();
 
@@ -389,10 +545,7 @@ pub async fn inject_into_response_nonstreaming(
         }
     };
 
-    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
-        capture.set(v);
-    }
-    match inject_into_usage_json(&body_bytes, stats, allow_implicit) {
+    match inject_into_usage_json(&body_bytes, stats, allow_implicit, reference, capture) {
         Some((rewritten, billed)) => {
             if let Some(capture) = parts.extensions.get::<CacheBilling>() {
                 capture.set(billed);
@@ -450,10 +603,7 @@ pub async fn scrub_response_nonstreaming(response: Response, capture: &UpstreamC
         }
     };
 
-    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
-        capture.set(v);
-    }
-    let rewritten = scrub_usage_json(&body_bytes);
+    let rewritten = scrub_usage_json(&body_bytes, capture);
     if rewritten.is_some() {
         parts.headers.remove(axum::http::header::CONTENT_ENCODING);
     }
@@ -470,39 +620,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upstream_cached_tokens_are_read_before_the_rewrite() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
-                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
-                   data: [DONE]\n\n";
-        let probe = scan_edit_sse(sse.as_bytes(), UsageEdit::Probe);
-        assert!(probe.saw_usage);
-        assert_eq!(probe.upstream_cached_tokens, Some(687));
-        let scrub = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub);
-        assert_eq!(scrub.upstream_cached_tokens, Some(687), "read before zeroing");
-        let out = String::from_utf8(scrub.rewritten.expect("rewritten").to_vec()).unwrap();
-        assert!(out.contains("\"cached_tokens\":0"), "customer-visible value still zeroed: {out}");
-        let no_usage = scan_edit_sse(b"data: {\"choices\":[]}\n\n", UsageEdit::Probe);
-        assert_eq!(no_usage.upstream_cached_tokens, None);
-
-        let body = br#"{"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":4}}}"#;
-        assert_eq!(read_upstream_cached_tokens_json(body), Some(4));
-        assert_eq!(read_upstream_cached_tokens_json(br#"{"usage":{"prompt_tokens":10}}"#), None);
-        assert_eq!(read_upstream_cached_tokens_json(b"nope"), None);
-    }
-
-    #[test]
-    fn upstream_cached_tokens_cell_is_first_write_wins() {
+    fn upstream_cached_tokens_cell_records_the_settled_usage() {
         let cell = UpstreamCachedTokens::default();
-        assert_eq!(cell.get(), None);
-        cell.set(5);
-        cell.set(9);
-        assert_eq!(cell.get(), Some(5));
-        assert_eq!(cell.clone().get(), Some(5), "clones share the cell");
+        assert_eq!((cell.get(), cell.prompt_tokens()), (None, None));
+        cell.record(UsageCounts {
+            prompt: Some(100),
+            engine: Some(9),
+            ..Default::default()
+        });
+        cell.record(UsageCounts::default());
+        assert_eq!(cell.get(), Some(9), "a count the settled usage lacks keeps the cell");
+        assert_eq!(cell.clone().prompt_tokens(), Some(100), "clones share the cell");
     }
 
     fn module_billed(stats: CacheStats) -> BilledCache {
         BilledCache {
             read_source: (stats.read > 0).then_some(CacheReadSource::Module),
+            reference: None,
             stats,
         }
     }
@@ -714,7 +848,7 @@ mod tests {
     #[test]
     fn inject_non_streaming_adds_cache_fields() {
         let body = serde_json::json!({"usage":{"prompt_tokens":2000,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!(billed, module_billed(stats()));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 2000, "total preserved");
@@ -727,7 +861,7 @@ mod tests {
     #[test]
     fn drifted_split_is_capped_to_prompt_in_reported_usage() {
         let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!(billed, module_billed(CacheStats { read: 940, ..stats() }));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 1000, "engine total preserved");
@@ -739,7 +873,7 @@ mod tests {
     #[test]
     fn corrupt_writes_report_no_cache_activity() {
         let body = serde_json::json!({"usage":{"prompt_tokens":50,"completion_tokens":5}}).to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!(billed, BilledCache::default());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
@@ -751,42 +885,7 @@ mod tests {
     #[test]
     fn inject_non_streaming_none_when_no_usage() {
         let body = serde_json::json!({"choices":[]}).to_string();
-        assert!(inject_into_usage_json(body.as_bytes(), &stats(), false).is_none());
-    }
-
-    #[test]
-    fn streaming_billing_metadata_matches_emitted_capped_usage() {
-        for (prompt, expected) in [
-            (2000, module_billed(stats())),
-            (1000, module_billed(CacheStats { read: 940, ..stats() })),
-            (50, BilledCache::default()),
-        ] {
-            let sse = format!("data: {{\"usage\":{{\"prompt_tokens\":{prompt}}}}}\n\ndata: [DONE]\n\n");
-            let scan = scan_edit_sse(
-                sse.as_bytes(),
-                UsageEdit::Inject {
-                    stats: &stats(),
-                    allow_implicit: false,
-                },
-            );
-            assert_eq!(scan.billing_stats, Some(expected));
-            let body = String::from_utf8(scan.rewritten.unwrap().to_vec()).unwrap();
-            let usage = sse_data_json(body.lines().next().unwrap()).unwrap()["usage"].clone();
-            assert_eq!(usage["cache_read_input_tokens"], expected.stats.read);
-            assert_eq!(usage["cache_creation_input_tokens"], expected.stats.creation_total());
-            assert!(scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).billing_stats.is_none());
-        }
-        assert!(
-            scan_edit_sse(
-                b"data: {\"choices\":[]}\n\n",
-                UsageEdit::Inject {
-                    stats: &stats(),
-                    allow_implicit: false
-                }
-            )
-            .billing_stats
-            .is_none()
-        );
+        assert!(inject_into_usage_json(body.as_bytes(), &stats(), false, None, &UpstreamCachedTokens::default()).is_none());
     }
 
     #[test]
@@ -796,7 +895,14 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (out, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            true,
+            None,
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
         assert_eq!(billed.stats.read, 687);
         assert_eq!(billed.stats.creation_total(), 0);
         assert_eq!(billed.read_source, Some(CacheReadSource::Engine));
@@ -817,7 +923,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 800}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (200, Some(CacheReadSource::Module)));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 200, "customer sees the module read");
@@ -831,7 +937,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 200}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (500, Some(CacheReadSource::Module)));
     }
 
@@ -846,7 +952,7 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 900}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!(billed.stats.read, 0, "no engine read on an explicit write leg");
         assert_eq!(billed.stats.creation_1h, 300, "the write bills as normal");
         assert_eq!(billed.read_source, None);
@@ -866,7 +972,14 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 5000}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (_, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            true,
+            None,
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (100, Some(CacheReadSource::Engine)));
 
         let body = serde_json::json!({"usage":{
@@ -874,7 +987,14 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (_, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            true,
+            None,
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
     }
 
@@ -885,7 +1005,14 @@ mod tests {
             "prompt_cache_hit_tokens": 400
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        let (out, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            true,
+            None,
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(v["usage"].get("prompt_cache_hit_tokens").is_none(), "dialect field scrubbed");
@@ -899,7 +1026,14 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 687}
         }})
         .to_string();
-        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), false).unwrap();
+        let (out, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            false,
+            None,
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
@@ -918,82 +1052,119 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 40}
         }})
         .to_string();
-        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false, None, &UpstreamCachedTokens::default()).unwrap();
         assert_eq!(billed.stats.creation_total(), 0, "corrupt module writes zeroed");
         assert_eq!((billed.stats.read, billed.read_source), (0, None));
     }
 
+    fn assured_usage(engine: Option<u64>) -> String {
+        let details = engine.map_or(String::new(), |e| format!(r#","prompt_tokens_details":{{"cached_tokens":{e}}}"#));
+        format!(r#"{{"model":"m","usage":{{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005{details}}}}}"#)
+    }
+
+    fn assured(engine: Option<u64>, allow_implicit: bool, reference: &Joined, stats: &CacheStats) -> (Value, BilledCache) {
+        let (out, billed) = inject_into_usage_json(
+            assured_usage(engine).as_bytes(),
+            stats,
+            allow_implicit,
+            Some(reference),
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
+        (serde_json::from_slice::<Value>(&out).unwrap()["usage"].clone(), billed)
+    }
+
     #[test]
-    fn streaming_engine_passthrough_edits_the_terminal_frame() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
-        let scan = scan_edit_sse(
-            sse.as_bytes(),
-            UsageEdit::Inject {
-                stats: &CacheStats::default(),
-                allow_implicit: true,
-            },
+    fn assured_terms_bill_part_of_the_gap_and_report_it() {
+        let org = uuid::Uuid::new_v4();
+        let terms = Some(crate::reference_cache::CacheAssurance::GapShare(0.4));
+        let (usage, billed) = assured(Some(500), true, &Joined::ready_with(org, terms, 900), &CacheStats::default());
+        assert_eq!((billed.stats.read, billed.read_source), (660, Some(CacheReadSource::Reference)));
+        assert_eq!(billed.reference, Some(900), "the estimate billed against is the one recorded");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 660);
+        assert_eq!(usage["cache_read_input_tokens"], 660);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+
+        let (_, billed) = assured(Some(500), true, &Joined::ready_with(org, terms, 400), &CacheStats::default());
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), Some(400))
         );
-        let billed = scan.billing_stats.unwrap();
-        assert_eq!((billed.stats.read, billed.read_source), (687, Some(CacheReadSource::Engine)));
-        let body = String::from_utf8(scan.rewritten.unwrap().to_vec()).unwrap();
-        assert!(body.contains("\"cache_read_input_tokens\":687"), "got: {body}");
-        assert!(body.contains("\"cached_tokens\":687"), "got: {body}");
-        assert!(body.contains("data: [DONE]"));
-    }
 
-    #[test]
-    fn inject_sse_preserves_crlf_on_edited_frame() {
-        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\r\n\r\ndata: [DONE]\r\n\r\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).unwrap();
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
-        assert!(s.contains("}\r\n\r\n"), "edited frame must keep CRLF framing, got: {s}");
-        assert!(!s.contains("}\n\r"), "must not produce a malformed \\n\\r, got: {s}");
-    }
+        let (_, billed) = assured(None, true, &Joined::ready_with(org, terms, 900), &CacheStats::default());
+        assert_eq!((billed.stats.read, billed.read_source), (360, Some(CacheReadSource::Reference)));
 
-    #[test]
-    fn inject_sse_edits_only_terminal_usage_frame() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).unwrap();
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\"cached_tokens\":1024"));
-        assert!(s.contains("\"cache_read_input_tokens\":1024"));
-        assert_eq!(s.matches("cached_tokens").count(), 1);
-        assert!(s.contains("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"));
-        assert!(s.contains("data: [DONE]"));
-    }
-
-    #[test]
-    fn inject_sse_none_when_no_usage_frame() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(inject_into_sse_body(sse.as_bytes(), &stats(), false).is_none());
-    }
-
-    #[test]
-    fn inject_sse_handles_data_prefix_without_space() {
-        let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).expect("no-space data: frame is injected");
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
-    }
-
-    #[test]
-    fn inject_into_sse_body_edits_the_usage_frame() {
-        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(body, &stats(), false).expect("usage frame present → edited");
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
-        assert!(s.contains("data: [DONE]"), "DONE preserved");
-        assert!(s.contains("\"content\":\"hi\""), "delta preserved");
-    }
-
-    #[test]
-    fn inject_into_sse_body_none_without_usage() {
-        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(
-            inject_into_sse_body(body, &stats(), false).is_none(),
-            "no usage frame → nothing to edit"
+        let (_, billed) = assured(
+            Some(0),
+            true,
+            &Joined::ready_with(org, Some(crate::reference_cache::CacheAssurance::GapShare(1.0)), 5_000),
+            &CacheStats::default(),
         );
+        assert_eq!((billed.stats.read, billed.reference), (1_000, Some(1_000)));
+    }
+
+    #[test]
+    fn a_null_details_object_still_reports_the_billed_read() {
+        let body = r#"{"model":"m","usage":{"prompt_tokens":1000,"completion_tokens":5,"total_tokens":1005,"prompt_tokens_details":null}}"#;
+        let terms = Some(crate::reference_cache::CacheAssurance::GapShare(0.5));
+        let joined = Joined::ready_with(uuid::Uuid::new_v4(), terms, 800);
+        let (out, billed) = inject_into_usage_json(
+            body.as_bytes(),
+            &CacheStats::default(),
+            true,
+            Some(&joined),
+            &UpstreamCachedTokens::default(),
+        )
+        .unwrap();
+        let usage = serde_json::from_slice::<Value>(&out).unwrap()["usage"].clone();
+        assert_eq!(billed.stats.read, 400);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 400, "{usage}");
+    }
+
+    #[test]
+    fn without_an_estimate_assured_terms_fall_back_to_the_engine() {
+        let unavailable = Joined::Unavailable {
+            coverage: Some(crate::reference_cache::Coverage {
+                principal: uuid::Uuid::new_v4(),
+                terms: Some(crate::reference_cache::CacheAssurance::GapShare(0.4)),
+            }),
+            outcome: "deadline_exceeded",
+        };
+        let (usage, billed) = assured(Some(500), true, &unavailable, &CacheStats::default());
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), None)
+        );
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 500);
+    }
+
+    #[test]
+    fn the_estimate_without_terms_is_recorded_not_billed() {
+        let (_, billed) = assured(
+            Some(500),
+            true,
+            &Joined::ready_with(uuid::Uuid::new_v4(), None, 900),
+            &CacheStats::default(),
+        );
+        assert_eq!(
+            (billed.stats.read, billed.read_source, billed.reference),
+            (500, Some(CacheReadSource::Engine), Some(900))
+        );
+    }
+
+    #[test]
+    fn marked_requests_ignore_assured_terms() {
+        let terms = Some(crate::reference_cache::CacheAssurance::GapShare(1.0));
+        let module = CacheStats {
+            read: 200,
+            creation_5m: 300,
+            ..Default::default()
+        };
+        let (usage, billed) = assured(Some(500), false, &Joined::ready_with(uuid::Uuid::new_v4(), terms, 900), &module);
+        assert_eq!((billed.stats.read, billed.read_source), (200, Some(CacheReadSource::Module)));
+        assert_eq!(billed.stats.creation_5m, 300);
+        assert_eq!(billed.reference, Some(900), "still recorded");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 200);
     }
 
     #[tokio::test]
@@ -1004,7 +1175,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"error":{"message":"bad request"}}).to_string()))
             .unwrap();
-        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
+        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false, None).await;
         assert!(!billing_ok, "error body → no commit");
     }
 
@@ -1016,7 +1187,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"usage":{"prompt_tokens":2000}}).to_string()))
             .unwrap();
-        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
+        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false, None).await;
         assert!(billing_ok, "2xx with usage → commit allowed");
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let s = std::str::from_utf8(&collected).unwrap();
@@ -1035,7 +1206,7 @@ mod tests {
             "cache_discount": 0.9
         }})
         .to_string();
-        let out = scrub_usage_json(body.as_bytes()).expect("dirty usage → rewritten");
+        let out = scrub_usage_json(body.as_bytes(), &UpstreamCachedTokens::default()).expect("dirty usage → rewritten");
         let v: Value = serde_json::from_slice(&out).unwrap();
         let usage = v["usage"].as_object().unwrap();
         assert_eq!(usage["prompt_tokens"], 985, "token totals untouched");
@@ -1053,9 +1224,12 @@ mod tests {
             "prompt_tokens_details": {"cached_tokens": 0}
         }})
         .to_string();
-        assert!(scrub_usage_json(body.as_bytes()).is_none());
-        assert!(scrub_usage_json(br#"{"choices":[]}"#).is_none(), "no usage object → no-op");
-        assert!(scrub_usage_json(b"not json").is_none());
+        assert!(scrub_usage_json(body.as_bytes(), &UpstreamCachedTokens::default()).is_none());
+        assert!(
+            scrub_usage_json(br#"{"choices":[]}"#, &UpstreamCachedTokens::default()).is_none(),
+            "no usage object → no-op"
+        );
+        assert!(scrub_usage_json(b"not json", &UpstreamCachedTokens::default()).is_none());
     }
 
     #[test]
@@ -1066,7 +1240,7 @@ mod tests {
             "cache_discount": 0.5
         }})
         .to_string();
-        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats(), false, None, &UpstreamCachedTokens::default()).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let usage = v["usage"].as_object().unwrap();
         assert!(!usage.contains_key("prompt_cache_hit_tokens"));
@@ -1075,32 +1249,10 @@ mod tests {
     }
 
     #[test]
-    fn scrub_sse_zeroes_cached_tokens_in_terminal_frame() {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
-        let out = scrub_sse_body(sse.as_bytes()).expect("dirty usage frame → rewritten");
-        let s = std::str::from_utf8(&out).unwrap();
-        assert!(s.contains("\"cached_tokens\":0"), "got: {s}");
-        assert!(!s.contains("687"), "provider value gone, got: {s}");
-        assert!(
-            s.contains("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"),
-            "delta byte-identical"
-        );
-        assert!(s.contains("data: [DONE]"));
-    }
-
-    #[test]
-    fn scrub_sse_none_when_clean() {
-        let clean = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100}}\n\ndata: [DONE]\n\n";
-        assert!(scrub_sse_body(clean.as_bytes()).is_none());
-        let no_usage = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(scrub_sse_body(no_usage.as_bytes()).is_none());
-    }
-
-    #[test]
     fn scrub_zeroes_non_numeric_cached_tokens() {
         for weird in [serde_json::json!("687"), serde_json::json!(687.5)] {
             let body = serde_json::json!({"usage":{"prompt_tokens_details":{"cached_tokens": weird}}}).to_string();
-            let out = scrub_usage_json(body.as_bytes()).expect("non-zero value → rewritten");
+            let out = scrub_usage_json(body.as_bytes(), &UpstreamCachedTokens::default()).expect("non-zero value → rewritten");
             let v: Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
         }
@@ -1142,5 +1294,332 @@ mod tests {
         let v: Value = serde_json::from_slice(&collected).unwrap();
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
         assert!(!v["usage"].as_object().unwrap().contains_key("cache_read_input_tokens"));
+    }
+
+
+    fn events(body: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while !rest.is_empty() {
+            let lf = rest.find("\n\n").map(|i| i + 2);
+            let crlf = rest.find("\r\n\r\n").map(|i| i + 4);
+            let end = match (lf, crlf) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b).unwrap_or(rest.len()),
+            };
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    fn stream(body: &str, bill: Bill) -> (String, Option<BilledCache>, UsageCounts) {
+        let mut usage = StreamUsage::default();
+        let mut out = String::new();
+        let mut billed = None;
+        let mut counts = UsageCounts::default();
+        let mut settle = |usage: &mut StreamUsage, out: &mut String| {
+            counts = usage.counts();
+            if let Some((frame, b)) = usage.finish(bill) {
+                out.push_str(std::str::from_utf8(&frame).unwrap());
+                billed = b;
+            }
+        };
+        for event in events(body) {
+            let scan = usage.observe(event.as_bytes());
+            if scan.done || scan.saw_error {
+                settle(&mut usage, &mut out);
+            }
+            match scan.rewritten {
+                None => out.push_str(event),
+                Some(rewritten) => out.push_str(std::str::from_utf8(&rewritten).unwrap()),
+            }
+        }
+        settle(&mut usage, &mut out);
+        (out, billed, counts)
+    }
+
+    fn inject(stats: &CacheStats, allow_implicit: bool) -> Bill<'_> {
+        Bill::Inject {
+            stats,
+            allow_implicit,
+            reference: None,
+        }
+    }
+
+    fn usages(out: &str) -> Vec<Value> {
+        out.lines()
+            .filter_map(sse_data_json)
+            .filter_map(|c| c.get("usage").cloned())
+            .collect()
+    }
+
+    #[test]
+    fn upstream_cached_tokens_are_read_before_the_rewrite() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
+                   data: [DONE]\n\n";
+        let (out, billed, counts) = stream(sse, Bill::Scrub);
+        assert_eq!((counts.engine, counts.prompt), (Some(687), Some(985)));
+        assert_eq!(billed, None);
+        assert!(out.contains("\"cached_tokens\":0") && !out.contains("687"), "{out}");
+
+        let body = br#"{"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+        assert_eq!(read_upstream_cached_tokens_json(body), Some(4));
+        assert_eq!(read_upstream_cached_tokens_json(br#"{"usage":{"prompt_tokens":10}}"#), None);
+        assert_eq!(read_upstream_cached_tokens_json(b"nope"), None);
+    }
+
+    #[test]
+    fn streaming_billing_metadata_matches_emitted_capped_usage() {
+        for (prompt, expected) in [
+            (2000, module_billed(stats())),
+            (1000, module_billed(CacheStats { read: 940, ..stats() })),
+            (50, BilledCache::default()),
+        ] {
+            let sse = format!("data: {{\"usage\":{{\"prompt_tokens\":{prompt}}}}}\n\ndata: [DONE]\n\n");
+            let (out, billed, _) = stream(&sse, inject(&stats(), false));
+            assert_eq!(billed, Some(expected));
+            let usage = &usages(&out)[0];
+            assert_eq!(usage["cache_read_input_tokens"], expected.stats.read);
+            assert_eq!(usage["cache_creation_input_tokens"], expected.stats.creation_total());
+            assert_eq!(stream(&sse, Bill::Scrub).1, None);
+        }
+        let none = "data: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+        assert_eq!(stream(none, inject(&stats(), false)).1, None);
+    }
+
+    #[test]
+    fn interim_usage_is_scrubbed_and_one_final_frame_bills() {
+        let sse = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1,\"total_tokens\":1001,\"prompt_tokens_details\":{\"cached_tokens\":100}}}\n\n\
+                   data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":2,\"total_tokens\":1002,\"prompt_tokens_details\":{\"cached_tokens\":300}}}\n\n\
+                   data: [DONE]\n\n";
+        let (out, billed, _) = stream(sse, inject(&CacheStats::default(), true));
+        assert_eq!(billed.unwrap().stats.read, 300);
+        let usages = usages(&out);
+        assert_eq!(usages.len(), 2, "{out}");
+        assert_eq!(usages[0]["prompt_tokens_details"]["cached_tokens"], 0, "interim: scrubbed");
+        assert_eq!(usages[0]["completion_tokens"], 1, "interim: counts kept");
+        assert!(usages[0].get("cache_read_input_tokens").is_none());
+        assert_eq!(usages[1]["cache_read_input_tokens"], 300);
+        assert_eq!(usages[1]["prompt_tokens_details"]["cached_tokens"], 300);
+        assert_eq!(out.matches("\"choices\":[]").count(), 1, "one usage-only frame: {out}");
+        assert!(
+            out.contains("\"id\":\"c\",\"model\":\"m\",\"choices\":[]"),
+            "the envelope is kept: {out}"
+        );
+        assert!(
+            out.ends_with("}}}\n\ndata: [DONE]\n\n"),
+            "the final frame just before [DONE]: {out}"
+        );
+    }
+
+    #[test]
+    fn totals_on_a_content_frame_get_a_final_frame_of_their_own() {
+        let sse = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":2,\"total_tokens\":1002,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
+                   data: [DONE]\n\n";
+        let (out, billed, _) = stream(sse, inject(&CacheStats::default(), true));
+        let billed = billed.unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (687, Some(CacheReadSource::Engine)));
+        assert!(out.contains("\"finish_reason\":\"stop\""));
+        let usages = usages(&out);
+        assert_eq!(usages[0]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usages[1]["prompt_tokens_details"]["cached_tokens"], 687);
+        assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn partial_usage_frames_merge_into_the_final_one() {
+        let run = |frames: &[&str]| {
+            let sse: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+            let (out, billed, _) = stream(&sse, inject(&CacheStats::default(), true));
+            (usages(&out).pop().unwrap(), billed.unwrap().stats.read)
+        };
+        let counts = |u: &Value| {
+            (
+                u["prompt_tokens"].as_u64(),
+                u["completion_tokens"].as_u64(),
+                u["total_tokens"].as_u64(),
+            )
+        };
+        let (u, read) =
+            run(&[r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":700}}}"#]);
+        assert_eq!((counts(&u), read), ((Some(1000), Some(2), Some(1002)), 700));
+        let (u, read) = run(&[
+            r#"{"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":1000,"completion_tokens":2,"total_tokens":1002,"prompt_tokens_details":{"cached_tokens":300}}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":700}}}"#,
+        ]);
+        assert_eq!((counts(&u), read), ((Some(1000), Some(2), Some(1002)), 700));
+        let (u, read) = run(&[
+            r#"{"choices":[{"delta":{"content":"a"}}],"usage":{"prompt_tokens":1000,"completion_tokens":2,"total_tokens":1002,"prompt_tokens_details":{"cached_tokens":900}}}"#,
+            r#"{"choices":[],"usage":{"completion_tokens":3}}"#,
+        ]);
+        assert_eq!((counts(&u), read), ((Some(1000), Some(3), Some(1003)), 900));
+        let (u, _) = run(&[r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":null,"total_tokens":15}}"#]);
+        assert_eq!(counts(&u), (Some(10), Some(5), Some(15)));
+        let (_, read) = run(&[r#"{"choices":[],"usage":{"prompt_tokens":1000}}"#]);
+        assert_eq!(read, 0);
+        let sse = "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\ndata: [DONE]\n\n";
+        let (out, _, _) = stream(sse, inject(&CacheStats::default(), true));
+        assert_eq!(out.matches("\"choices\":[]").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn usage_counts_merge_reports() {
+        let mut c = UsageCounts::default();
+        c.observe(
+            serde_json::json!({"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": null})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!((c.prompt, c.completion, c.total), (Some(10), Some(2), Some(12)));
+        c.observe(serde_json::json!({"total_tokens": 20}).as_object().unwrap());
+        assert_eq!((c.prompt, c.completion, c.total), (Some(10), Some(10), Some(20)));
+        c.observe(
+            serde_json::json!({"completion_tokens": 12, "total_tokens": 30})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(
+            (c.prompt, c.completion, c.total),
+            (Some(18), Some(12), Some(30)),
+            "both given: the prompt follows"
+        );
+        c.observe(serde_json::json!({"prompt_tokens": 5_000_000_000u64}).as_object().unwrap());
+        assert_eq!(c.prompt, Some(18), "beyond u32: not a count");
+        assert_eq!(c.engine, None);
+        c.observe(
+            serde_json::json!({"prompt_tokens_details": {"cached_tokens": 0}})
+                .as_object()
+                .unwrap(),
+        );
+        assert_eq!(c.engine, Some(0), "an explicit zero is a report");
+    }
+
+    #[test]
+    fn a_stream_without_usage_passes_untouched() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        let (out, billed, _) = stream(sse, inject(&stats(), false));
+        assert_eq!((out.as_str(), billed), (sse, None));
+        assert_eq!(stream(sse, Bill::Scrub).0, sse);
+    }
+
+    #[test]
+    fn a_stream_without_done_gets_its_final_frame_at_the_end() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\n";
+        let (out, billed, _) = stream(sse, inject(&stats(), false));
+        assert!(billed.is_some());
+        assert!(
+            out.starts_with("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            "delta byte-identical"
+        );
+        let usages = usages(&out);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0]["cache_read_input_tokens"], 1024);
+        assert!(out.ends_with("}}\n\n"), "the final frame comes last: {out}");
+    }
+
+    #[test]
+    fn the_final_frame_follows_crlf_framing() {
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let (out, _, _) = stream(sse, inject(&stats(), false));
+        assert!(out.contains("\"cache_read_input_tokens\":1024"), "{out}");
+        assert!(out.ends_with("}}\r\n\r\ndata: [DONE]\r\n\r\n"), "{out:?}");
+        assert!(!out.contains("}\n\r") && !out.contains("}\n\n"), "{out:?}");
+    }
+
+    #[test]
+    fn data_frames_without_a_space_are_read() {
+        let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
+        let (out, billed, _) = stream(sse, inject(&stats(), false));
+        assert!(billed.is_some());
+        assert!(
+            out.contains("\"cache_read_input_tokens\":1024") && out.ends_with("data:[DONE]\n\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn scrub_zeroes_the_stream_cache_counts() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687},\"prompt_cache_hit_tokens\":687}}\n\ndata: [DONE]\n\n";
+        let (out, billed, _) = stream(sse, Bill::Scrub);
+        assert_eq!(billed, None);
+        assert!(out.contains("\"cached_tokens\":0") && !out.contains("687"), "{out}");
+        assert!(
+            out.starts_with("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            "delta byte-identical"
+        );
+        assert!(out.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn an_error_frame_with_usage_is_forwarded() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"error\":{\"message\":\"failed\"},\"usage\":{\"prompt_tokens\":2000,\"prompt_tokens_details\":{\"cached_tokens\":900}}}\n\n\
+                   data: [DONE]\n\n";
+        let (out, billed, _) = stream(sse, inject(&stats(), false));
+        assert!(billed.is_some());
+        let frames: Vec<Value> = out.lines().filter_map(sse_data_json).collect();
+        assert_eq!(frames.len(), 3, "{out}");
+        assert!(frames[1].get("error").is_none(), "{out}");
+        assert_eq!(frames[1]["usage"]["prompt_tokens"], 2000);
+        assert_eq!(frames[1]["usage"]["cache_read_input_tokens"], 1024);
+        assert_eq!(frames[2]["error"]["message"], "failed");
+        assert!(frames[2].get("usage").is_none(), "{out}");
+        assert_eq!(usages(&out).len(), 1, "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"));
+
+        let mut usage = StreamUsage::default();
+        let scan = usage.observe(b"data: {\"error\":{\"message\":\"boom\"},\"usage\":{\"prompt_tokens\":5}}\n\n");
+        assert!(scan.saw_error && scan.saw_usage && usage.pending());
+        assert_eq!(
+            scan.rewritten.as_deref(),
+            Some(&b"data: {\"error\":{\"message\":\"boom\"}}\n\n"[..])
+        );
+    }
+
+    #[test]
+    fn usage_after_the_final_frame_is_removed() {
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\n\
+                   data: [DONE]\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}\n\n\
+                   data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":7}}\n\n";
+        let (out, billed, counts) = stream(sse, inject(&stats(), false));
+        assert_eq!(billed.map(|b| b.stats.read), Some(1024));
+        assert_eq!(counts.prompt, Some(2000));
+        let usages = usages(&out);
+        assert_eq!(usages.len(), 1, "{out}");
+        assert_eq!(usages[0]["prompt_tokens"], 2000);
+        assert!(out.ends_with("data: {\"choices\":[{\"delta\":{}}]}\n\n"), "{out}");
+    }
+
+    #[test]
+    fn an_unterminated_tail_is_closed_before_the_final_frame() {
+        for (tail, gap) in [("", "\n\n"), ("\n", "\n"), ("\n\n", "")] {
+            let sse = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"hi\"}}}}],\"usage\":{{\"prompt_tokens\":2000}}}}{tail}");
+            let (out, billed, _) = stream(&sse, inject(&stats(), false));
+            assert!(billed.is_some());
+            assert!(out.contains(&format!("2000}}}}{tail}{gap}data: {{")), "{tail:?}: {out:?}");
+            let frames: Vec<Value> = out.lines().filter_map(sse_data_json).collect();
+            assert_eq!(frames.len(), 2, "{tail:?}: {out:?}");
+            assert_eq!(frames[1]["usage"]["cache_read_input_tokens"], 1024);
+        }
+    }
+
+    #[test]
+    fn the_final_frame_follows_the_usage_framing() {
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\r\n\r\n";
+        let (out, _, _) = stream(sse, inject(&stats(), false));
+        assert!(out.ends_with("}}\n\ndata: [DONE]\r\n\r\n"), "{out:?}");
+    }
+
+    #[test]
+    fn an_error_frame_is_seen() {
+        let mut usage = StreamUsage::default();
+        let scan = usage.observe(b"data: {\"error\":{\"message\":\"boom\"}}\n\n");
+        assert!(scan.saw_error && !scan.saw_usage && scan.rewritten.is_none());
+        let scan = usage.observe(b"data: {\"choices\":[{\"delta\":{\"content\":\"usage error\"}}]}\n\n");
+        assert!(!scan.saw_error && scan.rewritten.is_none(), "words in content are not frames");
+        assert!(!usage.pending());
     }
 }

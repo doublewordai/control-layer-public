@@ -18,6 +18,9 @@ use replay::RecomputeError;
 
 const RENDER_TOLERANCE_BPS: i64 = 100;
 
+const RETAINED_REFERENCE_READ: &str =
+    "cache read retained from serving, not verified: a reference-sourced read depends on reference-cache state no stored body records";
+
 #[tracing::instrument(skip(pool, filter, classifier, tokenizer), fields(limit = filter.limit))]
 pub async fn recompute_corpus(
     pool: &sqlx::PgPool,
@@ -69,7 +72,13 @@ pub async fn recompute_corpus(
 
         let replayed = exchange.to_outlet_pair().and_then(|(req, resp)| {
             recompute_from_stored_response(&req, &resp, flat_tier).map(|mut usage| {
-                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
+                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Reference.as_str()) {
+                    usage.counts.cache_read = row.stored_cache_read.clamp(0, usage.counts.prompt);
+                    usage.counts.cache_creation_5m = 0;
+                    usage.counts.cache_creation_1h = 0;
+                    usage.counts.cache_creation_24h = 0;
+                    usage.cache_tier_inferred = false;
+                } else if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
                     && let Some(engine) = extract_engine_cached_tokens(&resp)
                 {
                     usage.counts.cache_read = engine.clamp(0, usage.counts.prompt);
@@ -99,6 +108,9 @@ pub async fn recompute_corpus(
                 rows_tariff_unresolvable_count(row, &cache_mults);
                 let cost = price(row, &usage, cache_mults);
                 let mut report_row = report::ReportRow::replayed(row, &usage, cost);
+                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Reference.as_str()) {
+                    report_row.note = Some(RETAINED_REFERENCE_READ.to_string());
+                }
 
                 if let (Some(tok), Some(model)) = (tokenizer, row.model.as_deref())
                     && usage.counts.prompt > 0
@@ -119,7 +131,12 @@ pub async fn recompute_corpus(
                     _ => None,
                 };
                 match rescued {
-                    Some(usage) => {
+                    Some(mut usage) => {
+                        let reference_row =
+                            row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Reference.as_str());
+                        if reference_row {
+                            usage.counts.cache_read = row.stored_cache_read.clamp(0, usage.counts.prompt);
+                        }
                         let cache_mults = row
                             .model
                             .as_deref()
@@ -136,6 +153,9 @@ pub async fn recompute_corpus(
                         let cost = price(row, &usage, cache_mults);
                         let mut report_row = report::ReportRow::replayed(row, &usage, cost);
                         report_row.prompt_render_total = Some(usage.counts.prompt);
+                        if reference_row {
+                            report_row.note = Some(RETAINED_REFERENCE_READ.to_string());
+                        }
                         report_row
                     }
                     None => {
@@ -164,7 +184,9 @@ pub async fn recompute_corpus(
             if replay::is_zdr_envelope(Some(body)) {
                 continue;
             }
-            if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str()) {
+            if row.cache_read_source.as_deref().is_some_and(|s| {
+                s == crate::prompt_cache::CacheReadSource::Engine.as_str() || s == crate::prompt_cache::CacheReadSource::Reference.as_str()
+            }) {
                 continue;
             }
 

@@ -13,6 +13,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::db::handlers::ModelProvisioning;
+use crate::db::handlers::account_prices::{DeclaredEntry, DeclaredPrices, api_price_conflicts, refuse_competing_api_prices};
 use crate::db::handlers::model_provisioning::{ACCOUNT_CATALOG_TARIFF_SOURCE, retire_omitted_account_prices};
 use crate::model_provisioning::{CachePrices, Catalog, Tariff, TariffPurpose, validate_cache_tariff, validate_tariffs};
 use crate::org_overlays::OrgCatalog;
@@ -216,6 +217,17 @@ impl AccountLimitsCatalog {
                     .chain(model.classes.values().filter_map(|class| class.toleration_preset.as_deref()))
             })
             .collect()
+    }
+
+    pub(crate) fn declared_prices(&self) -> impl Iterator<Item = DeclaredEntry<'_>> {
+        self.files.iter().flat_map(|file| {
+            file.document.models.iter().map(move |(alias, model)| DeclaredEntry {
+                source: &file.source,
+                account: &file.document.account,
+                alias,
+                prices: declared_prices(model),
+            })
+        })
     }
 
     pub fn validate_against_overlays(&self, overlays: &OrgCatalog) -> Result<()> {
@@ -649,6 +661,9 @@ async fn apply_prices(
         for (alias, model) in &file.document.models {
             let model_id = models[alias];
             declared.push((account, model_id));
+            refuse_competing_api_prices(db, account, model_id, &declared_prices(model), effective_at)
+                .await
+                .with_context(|| context(alias))?;
             let mut provisioning = ModelProvisioning::for_account_catalog(db);
             provisioning
                 .adopt_account_model_tariffs(account, model_id, effective_at)
@@ -709,6 +724,66 @@ async fn apply_prices(
         }
     }
     retire_omitted_account_prices(db, ACCOUNT_CATALOG_TARIFF_SOURCE, &declared, effective_at).await
+}
+
+pub async fn check_api_prices(
+    database_url: &str,
+    accounts: Option<&AccountLimitsCatalog>,
+    overlays: Option<&OrgCatalog>,
+) -> Result<Vec<String>> {
+    let mut db = <PgConnection as sqlx::Connection>::connect(database_url)
+        .await
+        .context("connect to the database")?;
+    catalog_api_price_conflicts(&mut db, accounts, overlays).await
+}
+
+#[cfg(test)]
+pub(crate) async fn check_api_prices_on(
+    pool: &PgPool,
+    accounts: Option<&AccountLimitsCatalog>,
+    overlays: Option<&OrgCatalog>,
+) -> Result<Vec<String>> {
+    let mut conn = pool.acquire().await?;
+    catalog_api_price_conflicts(&mut conn, accounts, overlays).await
+}
+
+async fn catalog_api_price_conflicts(
+    db: &mut PgConnection,
+    accounts: Option<&AccountLimitsCatalog>,
+    overlays: Option<&OrgCatalog>,
+) -> Result<Vec<String>> {
+    let mut tx = sqlx::Connection::begin(db).await?;
+    sqlx::query("SET TRANSACTION READ ONLY").execute(&mut *tx).await?;
+    let entries: Vec<DeclaredEntry<'_>> = accounts
+        .into_iter()
+        .flat_map(AccountLimitsCatalog::declared_prices)
+        .chain(overlays.into_iter().flat_map(OrgCatalog::declared_prices))
+        .collect();
+    let conflicts = api_price_conflicts(&mut tx, &entries).await?;
+    tx.rollback().await?;
+    Ok(conflicts)
+}
+
+fn declared_prices(model: &AccountModelPolicy) -> DeclaredPrices<'_> {
+    let classes = || model.classes.iter().map(|(class, policy)| (class.as_str(), policy));
+    DeclaredPrices {
+        tariffs: model
+            .tariffs
+            .iter()
+            .map(|tariff| (None, tariff))
+            .chain(classes().flat_map(|(class, policy)| policy.tariffs.iter().map(move |tariff| (Some(class), tariff))))
+            .collect(),
+        cache_classes: model
+            .cache_tariff
+            .iter()
+            .map(|_| None)
+            .chain(
+                classes()
+                    .filter(|(_, policy)| policy.cache_tariff.is_some())
+                    .map(|(class, _)| Some(class)),
+            )
+            .collect(),
+    }
 }
 
 async fn resolve_accounts(db: &mut PgConnection, catalog: &AccountLimitsCatalog) -> Result<HashMap<String, Uuid>> {
@@ -1212,6 +1287,79 @@ mod tests {
                 .unwrap_err()
         );
         assert!(error.contains("conflicts with a manually managed tariff"), "{error}");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn a_file_neither_overrides_nor_duplicates_a_price_set_through_the_api(pool: PgPool) {
+        let org = insert_account(&pool, "acme", "organization").await;
+        let model = insert_virtual_model(&pool, "org/model").await;
+        for (input, starts) in [("0.000004", "NOW() - INTERVAL '1 hour'"), ("0.000005", "NOW() + INTERVAL '1 hour'")] {
+            sqlx::query(&format!(
+                "INSERT INTO model_tariffs (deployed_model_id, user_id, name, api_key_purpose, input_price_per_token, output_price_per_token, valid_from, valid_until, provisioning_source)
+                 VALUES ($1, $2, 'admin-api', 'realtime', {input}, {input}, {starts}, CASE WHEN {starts} < NOW() THEN NOW() + INTERVAL '1 hour' END, 'admin-api')"
+            ))
+            .bind(model)
+            .bind(org)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let api_rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM model_tariffs WHERE user_id = $1 AND provisioning_source = 'admin-api'")
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "acme.yaml",
+            "account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        realtime_inflight: 40\n",
+        );
+        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(api_rows().await, 2);
+
+        write(
+            directory.path(),
+            "acme.yaml",
+            &format!("account: acme\nmodels:\n  org/model:\n    classes:\n      standard:\n        tariffs: [{REALTIME}]\n"),
+        );
+        let error = format!(
+            "{:#}",
+            apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap())
+                .await
+                .unwrap_err()
+        );
+        assert!(error.contains("the admin API also sets"), "{error}");
+        assert_eq!(api_rows().await, 2);
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let conflicts = catalog_api_price_conflicts(&mut conn, Some(&catalog), None).await.unwrap();
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+        assert!(
+            conflicts[0].contains("acme.yaml") && conflicts[0].contains("org/model"),
+            "{conflicts:?}"
+        );
+        drop(conn);
+
+        write(
+            directory.path(),
+            "acme.yaml",
+            &format!("account: acme\nmodels:\n  org/model:\n    tariffs: [{BATCH}]\n"),
+        );
+        apply(&pool, &AccountLimitsCatalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(api_rows().await, 2);
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            catalog_api_price_conflicts(&mut conn, Some(&catalog), None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a batch price competes with nothing"
+        );
     }
 
     #[dwctl_test_macros::test]

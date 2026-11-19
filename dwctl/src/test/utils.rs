@@ -432,6 +432,7 @@ pub fn create_test_config() -> crate::config::Config {
         openapi: Default::default(),
         discovery: Default::default(),
         integrations: Default::default(),
+        account_prices: Default::default(),
         cache: Default::default(),
         continuation: Default::default(),
         heap_profiling: Default::default(),

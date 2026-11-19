@@ -117,25 +117,6 @@ export function DataTable<TData, TValue>({
   showPageSizeSelector = false,
   pageSizeOptions = [10, 20, 50, 100],
 }: DataTableProps<TData, TValue>) {
-  const searchInputRef = React.useRef<HTMLInputElement>(null);
-
-  const prevDataRef = React.useRef(data);
-  React.useLayoutEffect(() => {
-    const dataChanged = prevDataRef.current !== data;
-    prevDataRef.current = data;
-
-    if (
-      externalSearch &&
-      dataChanged &&
-      externalSearch.value &&
-      searchInputRef.current
-    ) {
-      searchInputRef.current.focus();
-      const len = externalSearch.value.length;
-      searchInputRef.current.setSelectionRange(len, len);
-    }
-  }, [data, externalSearch]);
-
   const [sorting, setSorting] = React.useState<SortingState>([]);
   const [columnFilters, setColumnFilters] = React.useState<ColumnFiltersState>(
     [],
@@ -222,7 +203,6 @@ export function DataTable<TData, TValue>({
           <div className="relative w-full sm:w-auto">
             <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
             <Input
-              ref={searchInputRef}
               placeholder={searchPlaceholder}
               aria-label={searchPlaceholder || "Search table"}
               value={
@@ -245,7 +225,6 @@ export function DataTable<TData, TValue>({
                 }
               }}
               className="pl-8 w-full sm:w-[300px]"
-              disabled={isLoading}
             />
           </div>
           {selectedRows.length > 0 && (

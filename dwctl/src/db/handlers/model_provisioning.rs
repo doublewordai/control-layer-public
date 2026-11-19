@@ -217,11 +217,13 @@ impl<'c> ModelProvisioning<'c> {
                 "SELECT valid_from, serving_class FROM {table}
                  WHERE user_id=$1 AND deployed_model_id=$2 AND valid_from>$3
                    AND (valid_until IS NULL OR valid_until>valid_from)
+                   AND provisioning_source IS DISTINCT FROM $4
                  ORDER BY valid_from, id LIMIT 1"
             ))
             .bind(account)
             .bind(model)
             .bind(effective_at)
+            .bind(crate::db::handlers::account_prices::ADMIN_API_TARIFF_SOURCE)
             .fetch_optional(&mut *self.db)
             .await?;
             if let Some((valid_from, class)) = future {

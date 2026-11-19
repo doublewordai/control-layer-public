@@ -41,7 +41,7 @@ impl ReferenceStore {
         }
     }
 
-    async fn connection_permit(&self) -> SemaphorePermit<'_> {
+    pub(super) async fn connection_permit(&self) -> SemaphorePermit<'_> {
         self.connections.acquire().await.expect("the semaphore is never closed")
     }
 

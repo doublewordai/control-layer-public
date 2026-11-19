@@ -639,6 +639,71 @@ mod tests {
     }
 
     #[test]
+    fn a_marker_inside_a_tool_result_marks_the_tool_message() {
+        let turn = |marker: Value| {
+            translate(json!({
+                "model": "m", "max_tokens": 1,
+                "messages": [
+                    { "role": "user", "content": "go" },
+                    { "role": "assistant", "content": [ { "type": "tool_use", "id": "t1", "name": "f", "input": {} } ] },
+                    { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t1", "content": [
+                        { "type": "text", "text": "tool output", "cache_control": marker }
+                    ]}]}
+                ]
+            }))
+        };
+        let out = turn(json!({ "type": "ephemeral" }));
+        let tool = &out["messages"][2];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["content"][0]["text"], "tool output");
+        assert_eq!(tool["content"][0]["cache_control"]["type"], "ephemeral", "the request stays marked");
+        assert_eq!(turn(Value::Null)["messages"][2]["content"], "tool output");
+    }
+
+    #[test]
+    fn a_marker_on_empty_assistant_text_is_refused() {
+        let refused = |body: serde_json::Value| {
+            let (parts, ()) = axum::http::Request::post("/v1/messages").body(()).unwrap().into_parts();
+            let err = AnthropicMessages::new(true)
+                .translate_request(&parts, Bytes::from(serde_json::to_vec(&body).unwrap()))
+                .err()
+                .expect("refused");
+            assert!(err.to_string().contains("empty text block"), "{err}");
+        };
+        refused(json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "", "cache_control": { "type": "ephemeral" } },
+                    { "type": "tool_use", "id": "t1", "name": "f", "input": {} }
+                ]},
+                { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t1", "content": "ok" } ] }
+            ]
+        }));
+        refused(json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": [ { "type": "text", "text": "", "cache_control": { "type": "ephemeral" } } ] },
+                { "role": "user", "content": "again" }
+            ]
+        }));
+        let out = translate(json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [
+                { "role": "user", "content": "go" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "" },
+                    { "type": "tool_use", "id": "t1", "name": "f", "input": {} }
+                ]},
+                { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "t1", "content": "ok" } ] }
+            ]
+        }));
+        assert_eq!(out["messages"][1]["content"], Value::Null);
+    }
+
+    #[test]
     fn unknown_fields_and_block_types_are_ignored() {
         let out = translate(json!({
             "model": "m", "max_tokens": 1,
