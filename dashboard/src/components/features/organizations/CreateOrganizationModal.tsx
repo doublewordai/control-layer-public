@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Combobox } from "@/components/ui/combobox";
 import { useDebounce } from "@/hooks/useDebounce";
 import { toast } from "sonner";
@@ -31,6 +32,7 @@ export function CreateOrganizationModal({
   const [displayName, setDisplayName] = useState("");
   const [ownerId, setOwnerId] = useState("");
   const [ownerSearch, setOwnerSearch] = useState("");
+  const [membersCanCreateKeys, setMembersCanCreateKeys] = useState(true);
   const debouncedOwnerSearch = useDebounce(ownerSearch, 300);
   const createOrg = useCreateOrganization();
 
@@ -67,6 +69,7 @@ export function CreateOrganizationModal({
         email,
         display_name: displayName || undefined,
         owner_id: isPlatformManager && ownerId ? ownerId : undefined,
+        members_can_create_keys: membersCanCreateKeys ? undefined : false,
       });
       toast.success("Organization created successfully");
       handleClose();
@@ -83,6 +86,7 @@ export function CreateOrganizationModal({
     setDisplayName("");
     setOwnerId("");
     setOwnerSearch("");
+    setMembersCanCreateKeys(true);
     onClose();
   };
 
@@ -147,6 +151,23 @@ export function CreateOrganizationModal({
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+              />
+            </div>
+            <div className="flex items-center justify-between gap-4">
+              <div className="grid gap-1">
+                <Label htmlFor="create-members-can-create-keys">
+                  Members can create API keys
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  New members can create and manage their own keys. They never
+                  see other members' keys. Turn off to issue keys yourself.
+                </p>
+              </div>
+              <Switch
+                id="create-members-can-create-keys"
+                checked={membersCanCreateKeys}
+                onCheckedChange={setMembersCanCreateKeys}
+                aria-label="Members can create API keys"
               />
             </div>
           </div>

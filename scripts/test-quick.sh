@@ -82,6 +82,8 @@ map_path() {
         *.md|*/LICENSE|*/Dockerfile|onwards/docs/*) ;;
         dwctl/test-macros/*)
             dwctl_all=true; parts+="package(dwctl-test-macros)"$'\n' ;;
+        dwctl/src/model_provisioning.rs|model-provisioning.schema.json|examples/model-provisioning/*)
+            dwctl_parts+="binary(model_provisioning_validator)"$'\n'; dwctl_test model_provisioning ;;
         dwctl/src/*) map_dwctl_src "${path#dwctl/src/}" ;;
         dwctl/migrations/*|dwctl/underway-migrations/*)
             dwctl_parts+="kind(test)"$'\n'; dwctl_test migrations ;;

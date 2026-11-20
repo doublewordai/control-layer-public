@@ -107,7 +107,7 @@ describe("MemberManagement", () => {
     expect(within(dialog).getByRole("radio", { name: "Member" })).toBeChecked();
     expect(
       within(dialog).getByRole("switch", { name: "Can generate API keys" }),
-    ).not.toBeChecked();
+    ).toBeChecked();
     expect(
       within(dialog).getByRole("button", { name: /send invite/i }),
     ).toBeInTheDocument();

@@ -18,6 +18,8 @@ pub struct OrganizationCreate {
     pub display_name: Option<String>,
     #[schema(value_type = Option<String>, format = "uuid")]
     pub owner_id: Option<UserId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members_can_create_keys: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -30,6 +32,8 @@ pub struct OrganizationUpdate {
     pub zero_data_retention: Option<bool>,
     pub self_hosted_only: Option<bool>,
     pub auto_join_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members_can_create_keys: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
@@ -48,6 +52,7 @@ impl OrganizationUpdate {
                 low_balance_threshold: None,
                 self_hosted_only: None,
                 auto_join_enabled: None,
+                members_can_create_keys: None,
                 disabled_modalities: None,
                 toleration_preset: None,
             }
@@ -66,6 +71,8 @@ pub struct OrganizationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_join_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub members_can_create_keys: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub toleration_preset: Option<String>,
@@ -78,6 +85,7 @@ impl OrganizationResponse {
             member_count: None,
             pending_email_change: None,
             auto_join_enabled: None,
+            members_can_create_keys: None,
             disabled_modalities: None,
             toleration_preset: None,
         }
@@ -95,6 +103,11 @@ impl OrganizationResponse {
 
     pub fn with_auto_join_enabled(mut self, enabled: bool) -> Self {
         self.auto_join_enabled = Some(enabled);
+        self
+    }
+
+    pub fn with_members_can_create_keys(mut self, enabled: bool) -> Self {
+        self.members_can_create_keys = Some(enabled);
         self
     }
 

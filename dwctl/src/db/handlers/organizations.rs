@@ -249,6 +249,38 @@ impl<'c> Organizations<'c> {
         Ok(result.rows_affected() > 0)
     }
 
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn members_can_create_keys(&mut self, org_id: UserId) -> Result<bool> {
+        let enabled = sqlx::query_scalar!(
+            r#"
+            SELECT members_can_create_keys
+            FROM users
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(enabled.unwrap_or(false))
+    }
+
+    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]
+    pub async fn set_members_can_create_keys(&mut self, org_id: UserId, enabled: bool) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE users SET members_can_create_keys = $2, updated_at = NOW()
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+            enabled,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     #[instrument(level = "debug", skip(self, request, default_roles), fields(name = %request.name), err)]
     pub async fn create(&mut self, request: &OrganizationCreateDBRequest, default_roles: &[Role]) -> Result<UserDBResponse> {
         let org_id = Uuid::new_v4();
@@ -494,6 +526,26 @@ impl<'c> Organizations<'c> {
             .await?;
         }
         Ok(())
+    }
+
+    #[instrument(level = "debug", skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    pub async fn grant_default_member_roles(&mut self, membership_id: Uuid) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO organization_member_roles (user_organization_id, role)
+            SELECT uo.id, 'manage_keys'
+            FROM user_organizations uo
+            JOIN users o ON o.id = uo.organization_id
+            WHERE uo.id = $1
+              AND uo.role = 'member'
+              AND o.members_can_create_keys
+            ON CONFLICT DO NOTHING
+            "#,
+            membership_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     #[instrument(level = "debug", skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]

@@ -1,5 +1,25 @@
 # Changelog
 
+## [17.6.0](https://github.com/doublewordai/control-layer/compare/v17.5.0...v17.6.0) (2026-11-19)
+
+
+### Features
+
+* **organizations:** let new members create their own API keys by default ([#2229](https://github.com/doublewordai/control-layer/issues/2229)) ([807d6fe](https://github.com/doublewordai/control-layer/commit/807d6fea719fb2714aca4b2046bed8ac09cfe236))
+* **responses:** return cache token split and priced rates on responses list and detail ([#2223](https://github.com/doublewordai/control-layer/issues/2223)) ([a28f994](https://github.com/doublewordai/control-layer/commit/a28f994c8678df34451acd06a3aff1ca0b217682))
+* **users:** let a platform manager mark an account verified ([#2226](https://github.com/doublewordai/control-layer/issues/2226)) ([d10187c](https://github.com/doublewordai/control-layer/commit/d10187c3f7b36a72d3f2589bd1aab8bc73c506ec))
+
+
+### Continuous Integration
+
+* **lint:** check SQLx metadata in one build; validate model provisioning in the dwctl tests (DW-1326) ([#2225](https://github.com/doublewordai/control-layer/issues/2225)) ([563f9e1](https://github.com/doublewordai/control-layer/commit/563f9e1185a6f1b94221de64033adbd5097a410d))
+
+
+### Miscellaneous
+
+* **cubic:** add the Cubic review config and the reviewer files (DW-1036) ([#2221](https://github.com/doublewordai/control-layer/issues/2221)) ([b9c1399](https://github.com/doublewordai/control-layer/commit/b9c1399b66ad0b1dd0c222d13294d7bc37db3001))
+* **dev:** warn on a large target directory; document how to keep builds and tests fast (DW-1033) ([#2218](https://github.com/doublewordai/control-layer/issues/2218)) ([1d7b609](https://github.com/doublewordai/control-layer/commit/1d7b609052810919abf29d466a874b2980c11ddb))
+
 ## [17.5.0](https://github.com/doublewordai/control-layer/compare/v17.4.0...v17.5.0) (2026-11-19)
 
 

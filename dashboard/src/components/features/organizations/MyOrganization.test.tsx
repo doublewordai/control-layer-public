@@ -382,7 +382,7 @@ describe("MyOrganization", () => {
       ).toBeChecked();
       expect(
         within(dialog).getByRole("switch", { name: "Can generate API keys" }),
-      ).not.toBeChecked();
+      ).toBeChecked();
       expect(
         within(dialog).queryByRole("radio", { name: "Owner" }),
       ).not.toBeInTheDocument();
@@ -395,7 +395,7 @@ describe("MyOrganization", () => {
         expect(inviteBody).toEqual({
           email: "newmember@acme.com",
           role: "member",
-          can_manage_keys: false,
+          can_manage_keys: true,
         });
       });
     });

@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -25,6 +26,13 @@ class RunnerTests(unittest.TestCase):
                 "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "with open(os.environ['RUNNER_TEST_LOG'] + '.env', 'a') as log:\n"
                 "    log.write(json.dumps(os.environ.get('SQLX_OFFLINE')) + '\\n')\n"
+                "with open(os.environ['RUNNER_TEST_LOG'] + '.wrapper', 'a') as log:\n"
+                "    log.write(json.dumps([os.environ.get(name) for name in\n"
+                "                          ('RUSTC_WRAPPER', 'SQLX_PREPARE_RUSTC_WRAPPER')]) + '\\n')\n"
+                "if sys.argv[1:2] == ['metadata']:\n"
+                "    if os.environ.get('RUNNER_TEST_METADATA_FAIL'):\n"
+                "        sys.exit(101)\n"
+                "    print(os.environ.get('RUNNER_TEST_METADATA', '{}'))\n"
                 "if os.environ.get('RUNNER_TEST_FAIL') and sys.argv[1:3] == ['nextest', 'run']:\n"
                 "    sys.exit(int(os.environ['RUNNER_TEST_FAIL']))\n"
                 "if sys.argv[1:3] == ['sqlx', 'prepare']:\n"
@@ -51,6 +59,7 @@ class RunnerTests(unittest.TestCase):
                        RUNNER_TEST_FLOCK_LOG=str(flock_log), DW_BUILD_LOCK_FILE=str(directory / "build.lock"))
             for name in ("CI", "DW_NO_BUILD_LOCK", "DW_BUILD_LOCK_HELD", "SQLX_OFFLINE"):
                 env.pop(name, None)
+            env["DW_NO_TARGET_DIR_CHECK"] = "1"
             env.update(extra_env or {})
             if fail:
                 env["RUNNER_TEST_FAIL"] = "42" if fail is True else str(fail)
@@ -60,6 +69,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse(result.stderr, result.stderr)
             self.stderr = result.stderr
             self.sqlx_offline = [json.loads(line) for line in Path(f"{log}.env").read_text().splitlines()]
+            self.rustc_wrappers = [json.loads(line) for line in Path(f"{log}.wrapper").read_text().splitlines()]
             self.lock_file = env["DW_BUILD_LOCK_FILE"]
             self.flock_calls = [json.loads(line) for line in flock_log.read_text().splitlines()]
             return result.returncode, [json.loads(line) for line in log.read_text().splitlines()]
@@ -165,6 +175,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_sqlx_prepare_covers_every_target(self):
         scope = ["--workspace", "--", "--workspace", "--all-targets", "--all-features"]
+        wrapper = str(ROOT / "scripts/sqlx-dependencies-offline.sh")
         status, calls = self.run_runner(script="scripts/sqlx-prepare.sh", expect_stderr=True)
         self.assertEqual(status, 0)
         self.assertEqual(calls, [
@@ -172,20 +183,63 @@ class RunnerTests(unittest.TestCase):
             ["sqlx", "prepare", *scope],
         ])
         self.assertEqual(self.sqlx_offline, ["true", None])
-        status, calls = self.run_runner("--check", script="scripts/sqlx-prepare.sh", expect_stderr=True)
+        self.assertEqual(self.rustc_wrappers, [[wrapper, None], [wrapper, None]])
+        status, calls = self.run_runner("--check", script="scripts/sqlx-prepare.sh")
         self.assertEqual(status, 0)
-        self.assertEqual(calls, [
-            ["check", "--workspace", "--all-targets", "--all-features", "--keep-going"],
-            ["sqlx", "prepare", "--check", *scope],
-        ])
+        self.assertEqual(calls, [["sqlx", "prepare", "--check", *scope]])
+        self.assertEqual(self.sqlx_offline, [None])
+        self.assertEqual(self.rustc_wrappers, [[wrapper, None]])
+        self.run_runner("--check", script="scripts/sqlx-prepare.sh", extra_env={"RUSTC_WRAPPER": "sccache"})
+        self.assertEqual(self.rustc_wrappers, [[wrapper, "sccache"]])
 
-    def test_sqlx_prepare_check_failure_names_the_remedy(self):
-        status, calls = self.run_runner(
-            "--check", script="scripts/sqlx-prepare.sh", expect_stderr=True,
-            extra_env={"RUNNER_TEST_PREPARE_FAILURES": "1"})
-        self.assertEqual(status, 1)
-        self.assertEqual(len(calls), 2)
-        self.assertIn("./scripts/sqlx-prepare.sh", self.stderr)
+    def test_sqlx_prepare_failures(self):
+        for mode, calls_made in (("--check", 1), (None, 2)):
+            with self.subTest(mode=mode):
+                status, calls = self.run_runner(
+                    *filter(None, [mode]), script="scripts/sqlx-prepare.sh", expect_stderr=True,
+                    extra_env={"RUNNER_TEST_PREPARE_FAILURES": "1"})
+                self.assertEqual(status, 1)
+                self.assertEqual(len(calls), calls_made)
+                self.assertIn("./scripts/sqlx-prepare.sh" if mode else "offline dependency build", self.stderr)
+
+    def test_sqlx_wrapper_takes_only_dependencies_offline(self):
+        wrapper = str(ROOT / "scripts/sqlx-dependencies-offline.sh")
+        show = ["sh", "-c", 'echo "${SQLX_OFFLINE-unset}"']
+        with tempfile.TemporaryDirectory() as directory:
+            inner = Path(directory) / "inner"
+            inner.write_text('#!/bin/sh\nprintf "inner "\nexec "$@"\n')
+            inner.chmod(0o755)
+            for extra, expected in (
+                ({}, "true"),
+                ({"SQLX_OFFLINE": "false"}, "true"),
+                ({"CARGO_PRIMARY_PACKAGE": "1"}, "unset"),
+                ({"CARGO_PRIMARY_PACKAGE": "1", "SQLX_OFFLINE": "false"}, "false"),
+                ({"SQLX_PREPARE_RUSTC_WRAPPER": str(inner)}, "inner true"),
+                ({"SQLX_PREPARE_RUSTC_WRAPPER": str(inner), "CARGO_PRIMARY_PACKAGE": "1"}, "inner unset"),
+            ):
+                with self.subTest(extra=extra):
+                    env = {name: value for name, value in os.environ.items()
+                           if name not in ("SQLX_OFFLINE", "CARGO_PRIMARY_PACKAGE", "SQLX_PREPARE_RUSTC_WRAPPER")}
+                    result = subprocess.run([wrapper, *show], env={**env, **extra}, capture_output=True, text=True)
+                    self.assertEqual((result.returncode, result.stdout.strip()), (0, expected), result.stderr)
+
+    @unittest.skipUnless(sys.platform == "darwin", "the directory listing happens on macOS only")
+    def test_warns_when_the_target_directory_holds_too_many_files(self):
+        with tempfile.TemporaryDirectory() as target:
+            deps = Path(target) / "debug" / "deps"
+            deps.mkdir(parents=True)
+            for index in range(4):
+                (deps / f"artifact-{index}").touch()
+            env = {"DW_NO_TARGET_DIR_CHECK": "", "RUNNER_TEST_METADATA": json.dumps({"target_directory": target}, separators=(",", ":"))}
+            self.run_runner(extra_env={**env, "DW_TARGET_DIR_WARN_FILES": "10"})
+            self.run_runner(extra_env={**env, "DW_TARGET_DIR_WARN_FILES": "3"}, expect_stderr=True)
+            self.assertIn("cargo clean", self.stderr)
+            self.assertIn(str(deps), self.stderr)
+            status, _ = self.run_runner(extra_env={**env, "RUNNER_TEST_METADATA_FAIL": "1"})
+            self.assertEqual(status, 0)
+            for flag in (["--release"], ["--cargo-profile", "ci"], ["--target", "aarch64-apple-darwin"]):
+                with self.subTest(flag=flag):
+                    self.run_runner(*flag, extra_env={**env, "DW_TARGET_DIR_WARN_FILES": "3"})
 
     def test_just_without_target_dispatches_empty_default(self):
         justfile = (ROOT / "justfile").read_text()

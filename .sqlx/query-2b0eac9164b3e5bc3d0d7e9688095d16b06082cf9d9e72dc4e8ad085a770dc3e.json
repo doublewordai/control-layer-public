@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO organization_member_roles (user_organization_id, role)\n            SELECT uo.id, 'manage_keys'\n            FROM user_organizations uo\n            JOIN users o ON o.id = uo.organization_id\n            WHERE uo.id = $1\n              AND uo.role = 'member'\n              AND o.members_can_create_keys\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2b0eac9164b3e5bc3d0d7e9688095d16b06082cf9d9e72dc4e8ad085a770dc3e"
+}

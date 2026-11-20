@@ -40,6 +40,9 @@ export function EditOrganizationModal({
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const [tolerationPreset, setTolerationPreset] = useState<string | null>(null);
+  const [membersCanCreateKeys, setMembersCanCreateKeys] = useState<
+    boolean | null
+  >(null);
   const updateOrg = useUpdateOrganization();
   const { data: config } = useConfig();
   const { data: detail } = useOrganization(
@@ -63,6 +66,13 @@ export function EditOrganizationModal({
     }
   }, [detail, isOpen]);
 
+  useEffect(() => {
+    if (isOpen && organization) {
+      const source = detail?.id === organization.id ? detail : organization;
+      setMembersCanCreateKeys(source.members_can_create_keys ?? null);
+    }
+  }, [organization, detail, isOpen]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!organization) return;
@@ -79,6 +89,9 @@ export function EditOrganizationModal({
         data: supportOnly ? { zero_data_retention: true } : {
           display_name: displayName || undefined,
           email: requestedEmail || undefined,
+          ...(membersCanCreateKeys !== null
+            ? { members_can_create_keys: membersCanCreateKeys }
+            : {}),
           ...(canEditZdr
             ? { zero_data_retention: zeroDataRetention }
             : {}),
@@ -163,6 +176,26 @@ export function EditOrganizationModal({
                 ).toLocaleString()}
                 ). Saving a different email restarts the verification.
               </AlertBox>
+            )}
+            {!supportOnly && membersCanCreateKeys !== null && (
+              <div className="flex items-center justify-between gap-4">
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-members-can-create-keys">
+                    Members can create API keys
+                  </Label>
+                  <p className="text-sm text-muted-foreground">
+                    New members can create and manage their own keys; they never
+                    see other members' keys. Applies to people who join from now
+                    on. Change an existing member from the member list.
+                  </p>
+                </div>
+                <Switch
+                  id="edit-members-can-create-keys"
+                  checked={membersCanCreateKeys}
+                  onCheckedChange={setMembersCanCreateKeys}
+                  aria-label="Members can create API keys"
+                />
+              </div>
             )}
             {canEditZdr && (
               <div className="flex items-center justify-between gap-4">

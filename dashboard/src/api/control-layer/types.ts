@@ -1618,6 +1618,7 @@ export interface Organization extends User {
   member_count?: number;
   pending_email_change?: PendingEmailChange;
   disabled_modalities?: Modality[];
+  members_can_create_keys?: boolean;
   toleration_preset?: string | null;
 }
 
@@ -1636,6 +1637,7 @@ export interface OrganizationCreateRequest {
   email: string;
   display_name?: string;
   owner_id?: string;
+  members_can_create_keys?: boolean;
 }
 
 export interface OrganizationUpdateRequest {
@@ -1646,6 +1648,7 @@ export interface OrganizationUpdateRequest {
   zero_data_retention?: boolean;
   self_hosted_only?: boolean;
   disabled_modalities?: Modality[];
+  members_can_create_keys?: boolean;
   toleration_preset?: string | null;
 }
 

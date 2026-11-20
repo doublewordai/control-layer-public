@@ -1,6 +1,8 @@
 
 use sqlx_pool_router::PoolProvider;
 
+use crate::api::handlers::payments::VERIFY_CARD_FIRST;
+
 use crate::{
     AppState,
     api::handlers::validate_toleration_preset,
@@ -392,7 +394,15 @@ pub async fn update_user<P: PoolProvider>(
     let can_update_own_user = permissions::can_update_own_resource(&current_user, Resource::Users, user_id);
 
     let support_zdr = current_user.can_manage_platform() && user_data.is_enable_zdr_only();
-    if !can_update_all_users && !can_update_own_user && !support_zdr {
+    let support_verify = current_user.can_manage_platform() && user_data.is_mark_verified_only();
+    if user_data.verified.is_some() && !support_verify {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "verified status".to_string(),
+        });
+    }
+    if !can_update_all_users && !can_update_own_user && !support_zdr && !support_verify {
         return Err(Error::InsufficientPermissions {
             required: Permission::Any(vec![
                 Permission::Allow(Resource::Users, Operation::UpdateAll),
@@ -447,6 +457,23 @@ pub async fn update_user<P: PoolProvider>(
     let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
 
     let mut repo = Users::new(&mut conn);
+
+    if matches!(user_data.auto_topup_amount, Some(Some(_))) {
+        let target = repo.get_by_id(user_id).await?.ok_or_else(|| Error::NotFound {
+            resource: "User".to_string(),
+            id: user_id.to_string(),
+        })?;
+        if !target.verified {
+            return Err(Error::BadRequest {
+                message: VERIFY_CARD_FIRST.to_string(),
+            });
+        }
+    }
+
+    if support_verify {
+        repo.set_verified(user_id).await?;
+        tracing::info!(actor_id = %current_user.id, target_user_id = %user_id, "account marked verified by a platform manager");
+    }
     let zero_data_retention = user_data.zero_data_retention;
     let db_request = UserUpdateDBRequest::new(user_data);
 
@@ -1782,6 +1809,63 @@ mod tests {
             .json(&update_data)
             .await;
         response.assert_status_forbidden();
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_only_a_platform_manager_can_mark_an_account_verified(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let regular_user = create_test_user(&pool, Role::StandardUser).await;
+        assert!(!regular_user.verified);
+
+        let patch = async |as_user: &UserResponse, body: serde_json::Value| {
+            app.patch(&format!("/admin/api/v1/users/{}", regular_user.id))
+                .add_header(&add_auth_headers(as_user)[0].0, &add_auth_headers(as_user)[0].1)
+                .add_header(&add_auth_headers(as_user)[1].0, &add_auth_headers(as_user)[1].1)
+                .json(&body)
+                .await
+        };
+
+        patch(&regular_user, json!({ "verified": true })).await.assert_status_forbidden();
+        patch(&regular_user, json!({ "display_name": "Renamed", "verified": true }))
+            .await
+            .assert_status_forbidden();
+        patch(&admin_user, json!({ "verified": false })).await.assert_status_forbidden();
+        patch(&admin_user, json!({ "verified": true, "display_name": "Renamed" }))
+            .await
+            .assert_status_forbidden();
+
+        let response = patch(&admin_user, json!({ "verified": true })).await;
+        response.assert_status_ok();
+        let updated: UserResponse = response.json();
+        assert!(updated.verified);
+        assert_ne!(updated.display_name.as_deref(), Some("Renamed"));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_unverified_account_cannot_enable_auto_topup_through_user_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let body = json!({ "auto_topup_amount": 25.0, "auto_topup_threshold": 5.0 });
+
+        let patch = async |body: &serde_json::Value| {
+            app.patch(&format!("/admin/api/v1/users/{}", user.id))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .json(body)
+                .await
+        };
+
+        let response = patch(&body).await;
+        response.assert_status_bad_request();
+        assert!(response.text().contains(VERIFY_CARD_FIRST));
+
+        patch(&json!({ "auto_topup_amount": null })).await.assert_status_ok();
+
+        Users::new(&mut pool.acquire().await.unwrap()).set_verified(user.id).await.unwrap();
+        patch(&body).await.assert_status_ok();
     }
 
     #[dwctl_test_macros::test]

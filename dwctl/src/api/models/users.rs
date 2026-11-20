@@ -53,6 +53,8 @@ pub struct UserUpdate {
     pub self_hosted_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub toleration_preset: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
 }
 
 impl UserUpdate {
@@ -61,6 +63,27 @@ impl UserUpdate {
             self,
             Self {
                 zero_data_retention: Some(true),
+                display_name: None,
+                avatar_url: None,
+                roles: None,
+                batch_notifications_enabled: None,
+                low_balance_threshold: None,
+                auto_topup_amount: None,
+                auto_topup_threshold: None,
+                auto_topup_monthly_limit: None,
+                self_hosted_only: None,
+                toleration_preset: None,
+                verified: None,
+            }
+        )
+    }
+
+    pub fn is_mark_verified_only(&self) -> bool {
+        matches!(
+            self,
+            Self {
+                verified: Some(true),
+                zero_data_retention: None,
                 display_name: None,
                 avatar_url: None,
                 roles: None,

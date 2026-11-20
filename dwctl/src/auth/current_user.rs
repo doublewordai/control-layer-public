@@ -177,8 +177,17 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                             Ok(Some(org)) => {
                                 match org_repo.auto_join_enabled(org.id).await {
                                     Ok(true) => {
-                                        if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
-                                            tracing::warn!("Failed to auto-join user into org for domain {domain}: {e}");
+                                        match org_repo.add_member(org.id, user.id, "member").await {
+                                            Ok(membership) => {
+                                                if let Err(e) = org_repo.grant_default_member_roles(membership.id).await {
+                                                    tracing::warn!(
+                                                        "Failed to apply default member roles after auto-join for domain {domain}: {e}"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Failed to auto-join user into org for domain {domain}: {e}");
+                                            }
                                         }
                                     }
                                     Ok(false) => {

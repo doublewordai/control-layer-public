@@ -427,6 +427,11 @@ Print the generated JSON Schema for editor or generic CI integration:
 cargo run -p dwctl --bin dwctl-model-provisioning -- schema
 ```
 
+The repository commits this output as `model-provisioning.schema.json`. The
+dwctl test `model_provisioning_validator` fails when that file or the catalog
+in `examples/model-provisioning` no longer matches the Rust types; redirect the
+command above into the file to regenerate it.
+
 The Helm chart exposes a separate, opt-in ConfigMap through
 `modelProvisioning.files`. It mounts the files at
 `/app/model-provisioning.d`, enables startup provisioning through environment

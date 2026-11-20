@@ -107,6 +107,11 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 completion_tokens,
                 reasoning_tokens,
                 total_tokens,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+                input_price_per_token::float8 AS input_price_per_token,
+                output_price_per_token::float8 AS output_price_per_token,
+                uncached_cost::float8 AS uncached_cost,
                 api_key_id
             FROM http_analytics
             WHERE fusillade_request_id = ANY($1)
@@ -197,6 +202,11 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 completion_tokens: a.and_then(|a| a.completion_tokens),
                 reasoning_tokens: a.and_then(|a| a.reasoning_tokens),
                 total_tokens: a.and_then(|a| a.total_tokens),
+                cache_read_input_tokens: a.and_then(|a| a.cache_read_input_tokens),
+                cache_creation_input_tokens: a.and_then(|a| a.cache_creation_input_tokens),
+                input_price_per_token: a.and_then(|a| a.input_price_per_token),
+                output_price_per_token: a.and_then(|a| a.output_price_per_token),
+                uncached_cost: a.and_then(|a| a.uncached_cost),
                 total_cost: cost_map.get(&r.id).copied(),
                 created_by_email: email,
                 api_key_id: holder.map(|h| h.root_api_key_id),
@@ -263,6 +273,11 @@ pub async fn get_batch_request<P: PoolProvider>(
             completion_tokens,
             reasoning_tokens,
             total_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            input_price_per_token::float8 AS input_price_per_token,
+            output_price_per_token::float8 AS output_price_per_token,
+            uncached_cost::float8 AS uncached_cost,
             api_key_id
         FROM http_analytics
         WHERE fusillade_request_id = $1
@@ -326,6 +341,11 @@ pub async fn get_batch_request<P: PoolProvider>(
         completion_tokens: analytics.as_ref().and_then(|a| a.completion_tokens),
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
         total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
+        cache_read_input_tokens: analytics.as_ref().and_then(|a| a.cache_read_input_tokens),
+        cache_creation_input_tokens: analytics.as_ref().and_then(|a| a.cache_creation_input_tokens),
+        input_price_per_token: analytics.as_ref().and_then(|a| a.input_price_per_token),
+        output_price_per_token: analytics.as_ref().and_then(|a| a.output_price_per_token),
+        uncached_cost: analytics.as_ref().and_then(|a| a.uncached_cost),
         total_cost: cost,
         body: if is_zdr { String::new() } else { detail.body.unwrap_or_default() },
         response_body: if is_zdr { None } else { detail.response_body },
@@ -410,6 +430,11 @@ struct AnalyticsRow {
     completion_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+    input_price_per_token: Option<f64>,
+    output_price_per_token: Option<f64>,
+    uncached_cost: Option<f64>,
     api_key_id: Option<Uuid>,
 }
 
@@ -788,6 +813,81 @@ mod tests {
         assert!(body["api_key_id"].is_null());
         assert!(body["api_key_name"].is_null());
         assert!(body["api_key_holder_email"].is_null());
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_response_surfaces_cache_tokens_and_prices(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+        crate::test::utils::insert_fusillade_template(
+            &pool,
+            template_id,
+            None,
+            "test-model",
+            "http://test",
+            "/v1/chat/completions",
+            &serde_json::to_string(&body).unwrap(),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
+        )
+        .bind(request_id)
+        .bind(template_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        sqlx::query(
+            r#"INSERT INTO http_analytics
+                   (instance_id, correlation_id, timestamp, method, uri, fusillade_request_id,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    cache_read_input_tokens, cache_creation_input_tokens,
+                    input_price_per_token, output_price_per_token, total_cost, uncached_cost)
+               VALUES ($1, 1, NOW(), 'POST', '/ai/v1/responses', $2,
+                       1000, 100, 1100, 800, 50, 0.000001, 0.000002, 0.00048, 0.0012)"#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .expect("insert analytics");
+
+        let expect_breakdown = |row: &serde_json::Value| {
+            assert_eq!(row["prompt_tokens"], 1000, "prompt_tokens stays the full input count");
+            assert_eq!(row["cache_read_input_tokens"], 800);
+            assert_eq!(row["cache_creation_input_tokens"], 50);
+            assert_eq!(row["input_price_per_token"], 0.000001);
+            assert_eq!(row["output_price_per_token"], 0.000002);
+            assert_eq!(row["uncached_cost"], 0.0012);
+        };
+
+        let list = app
+            .get("/admin/api/v1/batches/requests")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        list.assert_status_ok();
+        let list_body: serde_json::Value = list.json();
+        let rows = list_body["data"].as_array().expect("data array");
+        assert_eq!(rows.len(), 1);
+        expect_breakdown(&rows[0]);
+
+        let detail = app
+            .get(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        detail.assert_status_ok();
+        expect_breakdown(&detail.json::<serde_json::Value>());
     }
 
     #[dwctl_test_macros::test]

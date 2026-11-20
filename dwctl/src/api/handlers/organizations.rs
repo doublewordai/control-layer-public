@@ -281,7 +281,14 @@ pub async fn create_organization<P: PoolProvider>(
 
     let org = repo.create(&db_request, &config.auth.default_user_roles).await?;
 
-    let response = OrganizationResponse::from_user(UserResponse::from(org)).with_member_count(1);
+    if data.members_can_create_keys == Some(false) {
+        repo.set_members_can_create_keys(org.id, false).await?;
+    }
+    let members_can_create_keys = data.members_can_create_keys.unwrap_or(true);
+
+    let response = OrganizationResponse::from_user(UserResponse::from(org))
+        .with_member_count(1)
+        .with_members_can_create_keys(members_can_create_keys);
 
     Ok((StatusCode::CREATED, Json(response)))
 }
@@ -434,6 +441,7 @@ pub async fn get_organization<P: PoolProvider>(
 
     let pending_email_change = org_repo.find_pending_email_change_for_org(id).await?;
     let auto_join_enabled = org_repo.auto_join_enabled(id).await?;
+    let members_can_create_keys = org_repo.members_can_create_keys(id).await?;
     let disabled_modalities = org_repo.disabled_modalities(id).await?;
 
     let can_update_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
@@ -442,6 +450,7 @@ pub async fn get_organization<P: PoolProvider>(
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_member_count(members.len() as i64)
         .with_auto_join_enabled(auto_join_enabled)
+        .with_members_can_create_keys(members_can_create_keys)
         .with_disabled_modalities(disabled_modalities)
         .with_toleration_preset(toleration_preset);
     if let Some(pending) = pending_email_change {
@@ -671,6 +680,10 @@ pub async fn update_organization<P: PoolProvider>(
         repo.set_auto_join_enabled(id, enabled).await?;
     }
     let auto_join_enabled = repo.auto_join_enabled(id).await?;
+    if let Some(enabled) = data.members_can_create_keys {
+        repo.set_members_can_create_keys(id, enabled).await?;
+    }
+    let members_can_create_keys = repo.members_can_create_keys(id).await?;
     if let Some(disabled) = data.disabled_modalities.as_deref() {
         repo.set_disabled_modalities(id, disabled).await?;
     }
@@ -692,6 +705,7 @@ pub async fn update_organization<P: PoolProvider>(
 
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_auto_join_enabled(auto_join_enabled)
+        .with_members_can_create_keys(members_can_create_keys)
         .with_disabled_modalities(disabled_modalities)
         .with_toleration_preset(toleration_preset);
     if let Some(info) = pending_email_change {
@@ -1021,6 +1035,7 @@ pub async fn approve_join_request<P: PoolProvider>(
             id: format!("{request_id} in organization {id}"),
         });
     };
+    repo.grant_default_member_roles(request_id).await?;
 
     let mut users_repo = Users::new(&mut pool_conn);
     let mut load = async |who: &str, user_id: UserId| match users_repo.get_by_id(user_id).await {
@@ -1169,10 +1184,15 @@ pub async fn add_member<P: PoolProvider>(
     let membership = repo.add_member(id, data.user_id, role).await?;
 
     let is_manager_role = matches!(role, "owner" | "admin");
-    let granted = data.can_manage_keys.unwrap_or(false);
-    if !is_manager_role && granted {
-        repo.set_membership_manage_keys(membership.id, true).await?;
-    }
+    let granted = match data.can_manage_keys {
+        _ if is_manager_role => false,
+        Some(true) => {
+            repo.set_membership_manage_keys(membership.id, true).await?;
+            true
+        }
+        Some(false) => false,
+        None => repo.grant_default_member_roles(membership.id).await?,
+    };
 
     let mut users_repo = Users::new(&mut pool_conn);
     let user = users_repo.get_by_id(data.user_id).await?.ok_or_else(|| Error::NotFound {
@@ -1771,7 +1791,8 @@ pub async fn create_user_join_request<P: PoolProvider>(
                 message: format!("Cannot join: you are already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
             });
         }
-        org_repo.add_member(org.id, target_user_id, "member").await?;
+        let membership = org_repo.add_member(org.id, target_user_id, "member").await?;
+        org_repo.grant_default_member_roles(membership.id).await?;
         return Ok(Json(DomainJoinResponse {
             outcome: DomainJoinOutcome::Joined,
             organization_id: org.id,
@@ -1991,8 +2012,14 @@ pub async fn invite_member<P: PoolProvider>(
         .create_invite(id, existing_user_id, &email, role, current_user.id, &token_hash, expires_at)
         .await?;
 
-    if !matches!(role, "owner" | "admin") && data.can_manage_keys.unwrap_or(false) {
-        org_repo.set_membership_manage_keys(invite.id, true).await?;
+    if !matches!(role, "owner" | "admin") {
+        match data.can_manage_keys {
+            Some(true) => org_repo.set_membership_manage_keys(invite.id, true).await?,
+            Some(false) => {}
+            None => {
+                org_repo.grant_default_member_roles(invite.id).await?;
+            }
+        }
     }
 
     let mut users_repo = Users::new(&mut pool_conn);
@@ -5230,7 +5257,7 @@ mod tests {
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "user_id": restricted.id, "role": "member" }))
+            .json(&json!({ "user_id": restricted.id, "role": "member", "can_manage_keys": false }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(false));
@@ -5239,7 +5266,7 @@ mod tests {
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "user_id": defaulted.id, "role": "member", "can_manage_keys": true }))
+            .json(&json!({ "user_id": defaulted.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
@@ -5304,5 +5331,195 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
         assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
+    }
+
+
+    async fn membership_has_manage_keys(pool: &PgPool, org_id: uuid::Uuid, user_id: uuid::Uuid) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM organization_member_roles omr \
+             JOIN user_organizations uo ON uo.id = omr.user_organization_id \
+             WHERE uo.organization_id = $1 AND uo.user_id = $2 AND omr.role = 'manage_keys')",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn set_members_can_create_keys(pool: &PgPool, org_id: uuid::Uuid, enabled: bool) {
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .set_members_can_create_keys(org_id, enabled)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_new_members_can_create_keys_by_default_on_every_join_path(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let requester = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, requester.id).await;
+        let owner_headers = add_auth_headers(&owner);
+        assert!(
+            !membership_has_manage_keys(&pool, org_id, requester.id).await,
+            "nothing is granted before approval"
+        );
+        server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert!(membership_has_manage_keys(&pool, org_id, requester.id).await);
+
+        let invitee = create_test_user(&pool, Role::StandardUser).await;
+        server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/invites"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": invitee.email, "role": "member" }))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+        assert!(membership_has_manage_keys(&pool, org_id, invitee.id).await);
+
+        let domain_owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let domain_org_id = org_claiming_domain(&pool, domain_owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        set_auto_join(&pool, domain_org_id, true).await;
+        let joiner_headers = add_auth_headers(&joiner);
+        server
+            .post("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await
+            .assert_status_ok();
+        assert!(membership_has_manage_keys(&pool, domain_org_id, joiner.id).await);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_default_key_role_is_not_written_for_an_approved_admin(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let requester = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, requester.id).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "role": "admin" }))
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert!(!membership_has_manage_keys(&pool, org_id, requester.id).await);
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_members_can_create_keys_off_applies_to_later_joiners_only(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let earlier = create_test_user(&pool, Role::StandardUser).await;
+        let requester = create_test_user(&pool, Role::StandardUser).await;
+        let added = create_test_user(&pool, Role::StandardUser).await;
+        let opted_in = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, requester.id).await;
+        let owner_headers = add_auth_headers(&owner);
+        let add_member = |body: serde_json::Value| {
+            server
+                .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&body)
+        };
+
+        add_member(json!({ "user_id": earlier.id, "role": "member" }))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+        assert!(membership_has_manage_keys(&pool, org_id, earlier.id).await);
+
+        set_members_can_create_keys(&pool, org_id, false).await;
+        assert!(
+            membership_has_manage_keys(&pool, org_id, earlier.id).await,
+            "the setting is a default for new memberships, not a revocation"
+        );
+
+        server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert!(!membership_has_manage_keys(&pool, org_id, requester.id).await);
+
+        let resp = add_member(json!({ "user_id": added.id, "role": "member" })).await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(false));
+
+        let resp = add_member(json!({ "user_id": opted_in.id, "role": "member", "can_manage_keys": true })).await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_members_can_create_keys_setting_round_trips(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let create = |name: &'static str, extra: serde_json::Value| {
+            let mut body = json!({ "name": name, "email": owner.email });
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            server
+                .post("/admin/api/v1/organizations")
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&body)
+        };
+
+        let resp = create("default-keys-org", json!({})).await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["members_can_create_keys"].as_bool(), Some(true));
+
+        let resp = create("restricted-keys-org", json!({ "members_can_create_keys": false })).await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["members_can_create_keys"].as_bool(), Some(false));
+        let org_id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+
+        crate::test::utils::add_org_member(&pool, org_id, admin.id, "admin").await;
+        crate::test::utils::add_org_member(&pool, org_id, member.id, "member").await;
+        let patch = |who: &crate::api::models::users::UserResponse, enabled: bool| {
+            let headers = add_auth_headers(who);
+            server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({ "members_can_create_keys": enabled }))
+        };
+
+        patch(&member, true).await.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let resp = patch(&admin, true).await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["members_can_create_keys"].as_bool(), Some(true));
+
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["members_can_create_keys"].as_bool(), Some(true));
     }
 }

@@ -149,7 +149,7 @@ async fn abandon_checkout<P: PoolProvider>(state: &AppState<P>, attempt_id: Uuid
     }
 }
 
-const VERIFY_CARD_FIRST: &str = "Please verify your card before enabling auto top-up.";
+pub(crate) const VERIFY_CARD_FIRST: &str = "Please verify your card before enabling auto top-up.";
 
 async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnection) -> Result<BillingTarget, StatusCode> {
     if let Some(org_id) = user.active_organization {

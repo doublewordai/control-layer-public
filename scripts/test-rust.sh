@@ -11,7 +11,11 @@ args=()
 doc_args=()
 default_workspace=true
 default_all_features=true
+default_deps_dir=true
 while (($#)); do
+    case "$1" in
+        --release|--cargo-profile|--cargo-profile=*|--target|--target=*) default_deps_dir=false ;;
+    esac
     case "$1" in
         -p|--package|-p?*|--package=*|--workspace) default_workspace=false ;;
         -F|--features|-F?*|--features=*|--no-default-features|--all-features) default_all_features=false ;;
@@ -44,6 +48,21 @@ if ! cargo nextest --version >/dev/null 2>&1; then
     echo "cargo-nextest is required: cargo install cargo-nextest --locked" >&2
     exit 1
 fi
+
+warn_large_target_dir() {
+    [[ "$(uname -s)" == Darwin && -z "${CI:-}" && -z "${DW_NO_TARGET_DIR_CHECK:-}" ]] || return 0
+    $default_deps_dir || return 0
+    local limit="${DW_TARGET_DIR_WARN_FILES:-50000}" target deps count
+    target="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')" || target=""
+    deps="$target/debug/deps"
+    [[ -n "$target" && -d "$deps" ]] || return 0
+    count="$(find "$deps" -maxdepth 1 -mindepth 1 2>/dev/null | head -n "$((limit + 1))" | wc -l)" || true
+    if ((count > limit)); then
+        echo "test rust: $deps holds more than $limit files, which slows every test that builds an HTTP client." >&2
+        echo "  Run 'cargo clean' (or 'cargo sweep') to restore test speed." >&2
+    fi
+}
+warn_large_target_dir
 
 if $watch; then
     if ! command -v cargo-watch >/dev/null 2>&1; then

@@ -86,6 +86,13 @@ class MappingTests(unittest.TestCase):
         self.assertEqual(self.filterset("dwctl/tests/removed_test.rs"), shared)
         self.assertEqual(self.filterset("dwctl/tests/fixtures/underway_claim.sql"), shared)
 
+    def test_model_provisioning_files_select_their_validator(self):
+        expected = dwctl("binary(model_provisioning_validator)", test("model_provisioning"))
+        for path in ("dwctl/src/model_provisioning.rs", "model-provisioning.schema.json",
+                     "examples/model-provisioning/qwen3-32b.yaml"):
+            with self.subTest(path=path):
+                self.assertEqual(self.filterset(path), expected)
+
     def test_memory_budget_is_left_to_its_own_target(self):
         self.assertEqual(self.filterset("dwctl/tests/memory_budget/main.rs"), "none()")
         self.assertIn("just test memory", self.stderr)
@@ -138,7 +145,7 @@ class RunTests(unittest.TestCase):
                 "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             )
             cargo.chmod(0o755)
-            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log),
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log), DW_NO_TARGET_DIR_CHECK="1",
                        DW_BUILD_LOCK_HELD="1")
             command = ["just", "test", "quick"] if via_just else [str(SCRIPT)]
             result = subprocess.run([*command, "--stdin", *args], input="".join(f"{path}\n" for path in paths),
@@ -237,7 +244,7 @@ class NoDoctestsTests(unittest.TestCase):
             )
             cargo.chmod(0o755)
             (directory / "cargo-watch").symlink_to(cargo)
-            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log),
+            env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}", RUNNER_TEST_LOG=str(log), DW_NO_TARGET_DIR_CHECK="1",
                        DW_BUILD_LOCK_HELD="1")
 
             def runner(*args):

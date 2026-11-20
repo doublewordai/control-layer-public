@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  useOrganization,
   useOrganizationMembers,
   useInviteMember,
   useCancelInvite,
@@ -174,7 +175,14 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<OrgMemberRole>("member");
-  const [inviteCanManageKeys, setInviteCanManageKeys] = useState(false);
+  const [inviteCanManageKeysChoice, setInviteCanManageKeys] = useState<
+    boolean | null
+  >(null);
+  const { data: organization } = useOrganization(organizationId);
+  const inviteCanManageKeys =
+    inviteCanManageKeysChoice ??
+    organization?.members_can_create_keys ??
+    true;
 
   const [roleMember, setRoleMember] = useState<OrganizationMember | null>(null);
   const [roleValue, setRoleValue] = useState<OrgMemberRole>("member");
@@ -190,7 +198,7 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
   const resetInviteForm = () => {
     setInviteEmail("");
     setInviteRole("member");
-    setInviteCanManageKeys(false);
+    setInviteCanManageKeys(null);
   };
 
   const handleInviteMember = async () => {
