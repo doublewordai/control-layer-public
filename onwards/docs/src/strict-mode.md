@@ -126,7 +126,7 @@ Onwards detects the embedded `error` envelope *before* strict deserialization an
 data: {"error":{"message":"Rate limit exceeded","type":"rate_limit_error","param":null,"code":429}}
 ```
 
-The chunk wrapper is stripped so the emitted SSE data line begins with `{"error"` — that prefix is what the [`fusillade`](https://crates.io/crates/fusillade) reassembler matches on to reclassify the response from HTTP 200 to the embedded `code`. End-to-end, an upstream-of-upstream 429 becomes a real HTTP 429 to the client, with retry semantics intact.
+The chunk wrapper is stripped so the emitted SSE data line begins with `{"error"` — that prefix is what the `fusillade` reassembler in this workspace matches on to reclassify the response from HTTP 200 to the embedded `code`. End-to-end, an upstream-of-upstream 429 becomes a real HTTP 429 to the client, with retry semantics intact.
 
 This applies to both bare error chunks and chunks that carry completion fields alongside the error. Untrusted upstreams additionally have the embedded `error.code` masked (per the table above) and the prose replaced with a generic message; trusted targets forward the envelope verbatim.
 

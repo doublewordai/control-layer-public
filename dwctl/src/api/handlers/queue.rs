@@ -111,7 +111,7 @@ fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, 
 pub async fn get_demand<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(params): Query<DemandQuery>,
-    _: RequiresPermission<resource::System, operation::ReadAll>,
+    _: RequiresPermission<resource::Monitoring, operation::ReadAll>,
 ) -> Result<Json<DemandResponse>, Error> {
     let grouped = match params.group_by.as_deref() {
         None => false,
@@ -469,24 +469,6 @@ mod tests {
             parse_service_tiers(Some("batch, flex, PRIORITY")),
             vec![None, Some("flex".to_string()), Some("priority".to_string())]
         );
-    }
-
-    async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE requests
-            SET state = 'processing',
-                daemon_id = gen_random_uuid(),
-                claimed_at = NOW(),
-                started_at = NOW()
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .execute(pool)
-        .await?;
-
-        Ok(())
     }
 
     #[dwctl_test_macros::test]

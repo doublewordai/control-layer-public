@@ -97,20 +97,65 @@ impl RequestSpan {
 }
 
 pub fn record_request_shape(body: &serde_json::Value, span: &tracing::Span) {
+    use crate::request_logging::schema_validity::{self, Budget, Validity};
     use crate::request_logging::{structured_output::response_format_label, tool_calls::tool_choice_mode};
 
-    let format = body
-        .pointer("/response_format/type")
-        .or_else(|| body.pointer("/text/format/type"))
-        .and_then(serde_json::Value::as_str);
-    if let Some(format) = format {
-        span.set_attribute("doubleword.response_format", response_format_label(format));
+    let mut budget = Budget::per_request();
+
+    let format = [
+        ("/response_format/type", "/response_format/json_schema/schema"),
+        ("/text/format/type", "/text/format/schema"),
+        ("/output_config/format/type", "/output_config/format/schema"),
+    ]
+    .into_iter()
+    .find_map(|(format, schema)| Some((body.pointer(format)?.as_str()?, body.pointer(schema))));
+    if let Some((format, schema)) = format {
+        let format = response_format_label(format);
+        span.set_attribute("doubleword.response_format", format);
+        if format == "json_schema" {
+            let validity = match schema.filter(|schema| !schema.is_null()) {
+                Some(schema) => schema_validity::check(schema, &mut budget),
+                None => Validity::Invalid("missing"),
+            };
+            match validity {
+                Validity::Valid => span.set_attribute("doubleword.response_format.schema_valid", true),
+                Validity::Invalid(reason) => {
+                    span.set_attribute("doubleword.response_format.schema_valid", false);
+                    span.set_attribute("doubleword.response_format.schema_error", reason);
+                }
+                Validity::Unchecked => span.set_attribute("doubleword.response_format.schema_error", "unchecked"),
+            }
+        }
     }
     if let Some(mode) = body.get("tool_choice").and_then(tool_choice_mode) {
         span.set_attribute("doubleword.tool_choice", mode);
     }
     if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
         span.set_attribute("doubleword.tool_count", i64::try_from(tools.len()).unwrap_or(i64::MAX));
+        let parameters = tools.iter().filter_map(|tool| {
+            tool.pointer("/function/parameters")
+                .or_else(|| tool.get("parameters"))
+                .or_else(|| tool.get("input_schema"))
+                .filter(|schema| !schema.is_null())
+        });
+        let (mut invalid, mut unchecked, mut first_error) = (0_i64, 0_i64, None);
+        for schema in parameters {
+            match schema_validity::check(schema, &mut budget) {
+                Validity::Valid => {}
+                Validity::Invalid(reason) => {
+                    invalid += 1;
+                    first_error.get_or_insert(reason);
+                }
+                Validity::Unchecked => unchecked += 1,
+            }
+        }
+        span.set_attribute("doubleword.tool_schemas.invalid_count", invalid);
+        if let Some(reason) = first_error {
+            span.set_attribute("doubleword.tool_schemas.first_error", reason);
+        }
+        if unchecked > 0 {
+            span.set_attribute("doubleword.tool_schemas.unchecked_count", unchecked);
+        }
     }
     let max_tokens = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
@@ -159,6 +204,16 @@ pub fn record_identity_attributes(identity: &RequestIdentity, span: &tracing::Sp
             span.set_attribute(key, value);
         }
     }
+}
+
+pub fn record_service_caller(user: &crate::api::models::users::CurrentUser, span: &tracing::Span) {
+    span.set_attribute("doubleword.account_id", user.id.to_string());
+    if let Some(api_key_id) = user.api_key_id {
+        span.set_attribute("doubleword.api_key_id", api_key_id.to_string());
+    }
+    span.set_attribute("doubleword.key_purpose", "platform");
+    let roles: Vec<String> = user.roles.iter().map(|role| format!("{role:?}")).collect();
+    span.set_attribute("doubleword.service_roles", roles.join(","));
 }
 
 pub fn init_telemetry(enable_otel_export: bool, log_format: LogFormat) -> anyhow::Result<Option<SdkTracerProvider>> {
@@ -507,6 +562,89 @@ mod tests {
         assert_eq!(plain("doubleword.response_format").as_deref(), Some("other"));
         assert_eq!(plain("doubleword.tool_choice"), None);
         assert_eq!(plain("doubleword.tool_count"), None);
+    }
+
+    #[test]
+    fn schema_validity_is_recorded_as_bounded_labels() {
+        let valid = serde_json::json!({"type": "object", "properties": {"private-property": {"type": "string"}}});
+        let recursive = serde_json::json!({
+            "$defs": {"private-node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/private-node"}}}},
+            "$ref": "#/$defs/private-node",
+        });
+        let meta_invalid = serde_json::json!({"type": "object", "required": "private-property"});
+        let unresolved = serde_json::json!({"type": "object", "properties": {"private-property": {"$ref": "#/$defs/private-missing"}}});
+
+        let schema_case = |schema: &serde_json::Value| {
+            shape(serde_json::json!({"response_format": {"type": "json_schema", "json_schema": {"name": "private", "schema": schema}}}))
+        };
+        for (name, schema, error) in [
+            ("valid", &valid, None),
+            ("recursive", &recursive, None),
+            ("meta-schema invalid", &meta_invalid, Some("meta_schema")),
+            ("unresolved $ref", &unresolved, Some("unresolved_ref")),
+        ] {
+            let span = schema_case(schema);
+            let valid = error.is_none().to_string();
+            assert_eq!(
+                span("doubleword.response_format.schema_valid").as_deref(),
+                Some(valid.as_str()),
+                "{name}"
+            );
+            assert_eq!(span("doubleword.response_format.schema_error").as_deref(), error, "{name}");
+        }
+
+        let responses = shape(serde_json::json!({"text": {"format": {"type": "json_schema", "name": "private", "schema": unresolved}}}));
+        assert_eq!(
+            responses("doubleword.response_format.schema_error").as_deref(),
+            Some("unresolved_ref")
+        );
+        let anthropic = shape(serde_json::json!({"output_config": {"format": {"type": "json_schema", "schema": meta_invalid}}}));
+        assert_eq!(anthropic("doubleword.response_format").as_deref(), Some("json_schema"));
+        assert_eq!(anthropic("doubleword.response_format.schema_error").as_deref(), Some("meta_schema"));
+        let missing = shape(serde_json::json!({"response_format": {"type": "json_schema", "json_schema": {"name": "private"}}}));
+        assert_eq!(missing("doubleword.response_format.schema_valid").as_deref(), Some("false"));
+        assert_eq!(missing("doubleword.response_format.schema_error").as_deref(), Some("missing"));
+
+        let tools = shape(serde_json::json!({"tools": [
+            {"type": "function", "function": {"name": "private-a", "parameters": valid}},
+            {"type": "function", "function": {"name": "private-b", "parameters": unresolved}},
+            {"type": "function", "name": "private-c", "parameters": meta_invalid},
+            {"name": "private-d", "input_schema": recursive},
+            {"type": "function", "function": {"name": "private-e"}},
+            {"type": "web_search"},
+        ]}));
+        assert_eq!(tools("doubleword.tool_count").as_deref(), Some("6"));
+        assert_eq!(tools("doubleword.tool_schemas.invalid_count").as_deref(), Some("2"));
+        assert_eq!(tools("doubleword.tool_schemas.first_error").as_deref(), Some("unresolved_ref"));
+        let all_valid = shape(serde_json::json!({"tools": [{"type": "function", "function": {"name": "private", "parameters": valid}}]}));
+        assert_eq!(all_valid("doubleword.tool_schemas.invalid_count").as_deref(), Some("0"));
+        assert_eq!(all_valid("doubleword.tool_schemas.first_error"), None);
+        assert_eq!(all_valid("doubleword.tool_schemas.unchecked_count"), None);
+
+        let costly = serde_json::json!({"type": "string", "description": "a".repeat(1 << 20)});
+        let over_budget = shape(serde_json::json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "private", "schema": costly}},
+            "tools": [{"type": "function", "function": {"name": "private", "parameters": costly}}, {"type": "function", "function": {"name": "private", "parameters": unresolved}}],
+        }));
+        assert_eq!(over_budget("doubleword.response_format.schema_valid"), None);
+        assert_eq!(over_budget("doubleword.response_format.schema_error").as_deref(), Some("unchecked"));
+        assert_eq!(over_budget("doubleword.tool_schemas.unchecked_count").as_deref(), Some("1"));
+        assert_eq!(over_budget("doubleword.tool_schemas.invalid_count").as_deref(), Some("1"));
+        assert_eq!(
+            over_budget("doubleword.tool_schemas.first_error").as_deref(),
+            Some("unresolved_ref")
+        );
+
+        let plain = shape(serde_json::json!({"response_format": {"type": "json_object"}}));
+        for key in [
+            "doubleword.response_format.schema_valid",
+            "doubleword.response_format.schema_error",
+            "doubleword.tool_schemas.invalid_count",
+            "doubleword.tool_schemas.first_error",
+            "doubleword.tool_schemas.unchecked_count",
+        ] {
+            assert_eq!(plain(key), None, "{key}");
+        }
     }
     use opentelemetry_sdk::error::OTelSdkResult;
     use opentelemetry_sdk::trace::SpanData;

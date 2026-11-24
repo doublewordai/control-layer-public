@@ -651,13 +651,6 @@ pub mod test_utils {
                 false
             }
         }
-
-        pub fn complete_all(&self) {
-            let mut triggers = self.triggers.lock().unwrap();
-            while let Some(trigger) = triggers.pop() {
-                let _ = trigger.send(());
-            }
-        }
     }
 
     impl std::fmt::Debug for TriggeredMockHttpClient {
@@ -1054,10 +1047,126 @@ mod tests {
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+        assert_eq!(served_by.compute_pool, None);
         assert_eq!(
             response.extensions().get::<crate::AuthenticatedApiKeyId>(),
             Some(&crate::AuthenticatedApiKeyId(api_key_id))
         );
+    }
+
+    #[tokio::test]
+    async fn test_compute_pool_header_captured_in_served_by_and_preserved_for_chained_hops() {
+        use crate::auth::KeyHash;
+        use std::collections::HashSet;
+        use tower::ServiceExt;
+
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(KeyHash::from(api_key.to_string()));
+        let make_targets = |strict_mode: bool| {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    target::Target::builder()
+                        .url("https://inference.example.com".parse().unwrap())
+                        .keys(keys.clone())
+                        .build(),
+                ),
+            );
+            target::Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                key_ids: Default::default(),
+                accounts: Arc::new(DashMap::new()),
+                strict_mode,
+                http_pool_config: None,
+            }
+        };
+
+        let mut mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"choices": [{"message": {"content": "Hello!"}}]}"#,
+        );
+        mock_client.set_header("X-Dynamo-Compute-Pool", "  gpu-pool-a  ".to_string());
+        mock_client.set_header("x-other-upstream", "preserved".to_string());
+        let router = build_router(AppState::with_client(make_targets(false), mock_client));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-dynamo-compute-pool").unwrap(),
+            "  gpu-pool-a  ",
+            "onwards must preserve x-dynamo-compute-pool across chained internal hops"
+        );
+        assert_eq!(
+            response.headers().get("x-other-upstream").unwrap(),
+            "preserved"
+        );
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("success response must carry ServedBy");
+        assert_eq!(served_by.compute_pool.as_deref(), Some("gpu-pool-a"));
+
+        let sse_chunk = format!(
+            "data: {}\n\n",
+            json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1700000000,
+                "model": "gpt-4",
+                "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": "stop"}]
+            })
+        );
+        let mut stream_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![sse_chunk, "data: [DONE]\n\n".to_string()],
+        );
+        stream_client.set_header("x-dynamo-compute-pool", "spot-pool-1".to_string());
+        let router = build_router(AppState::with_client(make_targets(true), stream_client));
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-dynamo-compute-pool").unwrap(),
+            "spot-pool-1",
+            "onwards must preserve x-dynamo-compute-pool on streaming responses for chained internal hops"
+        );
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("streaming response must carry ServedBy");
+        assert_eq!(served_by.compute_pool.as_deref(), Some("spot-pool-1"));
     }
 
     #[tokio::test]

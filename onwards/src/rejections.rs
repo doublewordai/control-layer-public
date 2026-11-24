@@ -38,10 +38,6 @@ impl RejectionContext {
         Self::for_key(&state.targets, key.as_ref(), dispatched)
     }
 
-    pub fn for_api_key(targets: &Targets, api_key: Option<&str>, dispatched: bool) -> Self {
-        Self::for_key(targets, api_key.map(KeyHash::of).as_ref(), dispatched)
-    }
-
     pub fn for_key(targets: &Targets, key: Option<&KeyHash>, dispatched: bool) -> Self {
         let labels = key.and_then(|key| targets.key_labels.get(key));
         let label = |name: &str| labels.as_ref().and_then(|labels| labels.get(name).cloned());

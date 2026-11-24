@@ -1,5 +1,10 @@
 # Changelog
 
+> This changelog stopped at 17.6.0. Release Please, its configuration and the
+> release workflows were removed; the component crates are no longer published.
+> Only `control-layer-public` is versioned now, by the scheduled public export.
+> The entries below are the history before that change.
+
 ## [17.6.0](https://github.com/doublewordai/control-layer/compare/v17.5.0...v17.6.0) (2026-11-19)
 
 

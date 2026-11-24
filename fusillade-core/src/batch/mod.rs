@@ -165,20 +165,6 @@ pub struct File {
     pub source_external_key: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RequestTemplate {
-    pub id: TemplateId,
-    pub file_id: FileId,
-    pub custom_id: Option<String>,
-    pub endpoint: String,
-    pub method: String,
-    pub path: String,
-    pub body: String,
-    pub model: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct RequestTemplateInput {
     pub custom_id: Option<String>,
@@ -387,10 +373,6 @@ impl BatchStatus {
     pub fn is_finished(&self) -> bool {
         self.completed_requests + self.failed_requests + self.canceled_requests
             == self.total_requests
-    }
-
-    pub fn is_running(&self) -> bool {
-        !self.is_finished()
     }
 
     pub fn openai_status(&self) -> &'static str {

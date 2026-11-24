@@ -526,3 +526,43 @@ async fn a_class_less_cache_price_never_changes_a_class_s_own_write_prices(pool:
     f.put(price(Some("standard")), None).await.assert_status_ok();
     assert_eq!(f.assert_feed_matches_billing().await.cached, dec("0.00000004"));
 }
+
+#[dwctl_test_macros::test]
+async fn the_openrouter_price_manager_prices_only_openrouter_s_account(pool: PgPool) {
+    let f = Fixture::new(&pool, 200, |_| {}).await;
+    let other = create_test_user(&pool, Role::StandardUser).await;
+    let secrets: Vec<String> = (0..2).map(|_| crate::crypto::generate_api_key()).collect();
+    let hex = |s: &str| -> String { crate::crypto::hash_api_key(s).iter().map(|b| format!("{b:02x}")).collect() };
+    let file = json!({"service_accounts": [
+        {"id": Uuid::new_v4(), "name": "Price controller", "role": "OpenRouterPriceManager", "key_hashes": [hex(&secrets[0])]},
+        {"id": Uuid::new_v4(), "name": "Queue scaler", "role": "QueueDemandReader", "key_hashes": [hex(&secrets[1])]},
+    ]});
+    crate::service_accounts::apply(&pool, &crate::service_accounts::parse(&file.to_string()).unwrap())
+        .await
+        .unwrap();
+    let (prices, demand) = (&secrets[0], &secrets[1]);
+    let body = json!({"input_per_million_tokens": "0.40", "output_per_million_tokens": "1.60", "reason": "feed"});
+    let path_for = |account: &str| format!("/admin/api/v1/accounts/{account}/models/{}/prices", MODEL.replace('/', "%2F"));
+
+    let send = |method: &str, path: String, secret: &str| {
+        let request = match method {
+            "GET" => f.server.get(&path),
+            "PUT" => f.server.put(&path).json(&body),
+            _ => f.server.delete(&format!("{path}?reason=feed")),
+        };
+        request.add_header("authorization", format!("Bearer {secret}"))
+    };
+
+    send("PUT", path_for(&f.account.username), prices).await.assert_status_ok();
+    send("GET", path_for(&f.account.username), prices).await.assert_status_ok();
+    send("PUT", path_for(&f.account.id.to_string()), prices).await.assert_status_ok();
+    for method in ["GET", "PUT", "DELETE"] {
+        let status = send(method, path_for(&other.username), prices).await.status_code();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} on another account");
+        let status = send(method, path_for("no-such-account"), prices).await.status_code();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} on a missing account");
+        let status = send(method, path_for(&f.account.username), demand).await.status_code();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} without the role");
+    }
+    send("DELETE", path_for(&f.account.username), prices).await.assert_status_ok();
+}

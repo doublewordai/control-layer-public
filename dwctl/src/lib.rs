@@ -47,6 +47,7 @@ pub mod reference_cache;
 mod request_logging;
 pub mod sample_files;
 pub mod scheduling;
+pub mod service_accounts;
 mod static_assets;
 mod sync;
 pub mod task_retention;
@@ -2064,6 +2065,8 @@ pub async fn build_router(
         onwards_router
     };
 
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::inference::middleware::strip_dynamo_headers_middleware));
+
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         state.api_key_usage.clone(),
         api_key_usage::record_proxy_key_use,
@@ -2946,6 +2949,15 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    if let Some(file) = config.service_accounts.file.clone() {
+        let service_accounts_pool = dyn_pools.clone();
+        let service_accounts_interval = config.service_accounts.reconcile_interval;
+        let service_accounts_shutdown = shutdown_token.clone();
+        background_tasks.spawn("service-accounts-reconcile", async move {
+            service_accounts::run(service_accounts_pool, file, service_accounts_interval, service_accounts_shutdown).await
+        });
+    }
+
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
     let probe_scheduler =
@@ -3413,8 +3425,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state, &config.background_services.task_workers).await?);
     for (name, handle) in task_runner.start(

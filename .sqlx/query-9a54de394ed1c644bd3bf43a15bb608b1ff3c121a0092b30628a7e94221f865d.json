@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO api_keys (name, description, purpose, user_id, created_by, hidden, secret_hash)\n                VALUES ($1, 'Service account key, managed by the service-account loader', 'platform', $2, $2, FALSE, $3)\n                ON CONFLICT (secret_hash) DO UPDATE SET is_deleted = FALSE\n                    WHERE api_keys.user_id = EXCLUDED.user_id AND api_keys.created_by = EXCLUDED.created_by\n                      AND api_keys.purpose = 'platform'\n                RETURNING (xmax = 0) AS \"inserted!\"\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "inserted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9a54de394ed1c644bd3bf43a15bb608b1ff3c121a0092b30628a7e94221f865d"
+}

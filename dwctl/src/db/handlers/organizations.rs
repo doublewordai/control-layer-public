@@ -989,18 +989,6 @@ impl<'c> Organizations<'c> {
     }
 
     #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
-    pub async fn count_members(&mut self, org_id: UserId) -> Result<i64> {
-        let count = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM user_organizations WHERE organization_id = $1 AND status = 'active'",
-            org_id
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(count.unwrap_or(0))
-    }
-
-    #[instrument(level = "debug", skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn find_pending_email_change_for_org(&mut self, org_id: UserId) -> Result<Option<PendingOrgEmailChangeDBResponse>> {
         let row = sqlx::query!(
             r#"

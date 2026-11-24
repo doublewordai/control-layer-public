@@ -307,6 +307,15 @@ pub async fn get_user<P: PoolProvider>(
     Ok(Json(response))
 }
 
+fn refuse_service_roles(roles: &[Role]) -> Result<()> {
+    if roles.iter().any(Role::is_service_role) {
+        return Err(Error::BadRequest {
+            message: "service roles are granted only to service accounts, by their loader".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/users",
@@ -332,6 +341,7 @@ pub async fn create_user<P: PoolProvider>(
     actor: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
+    refuse_service_roles(&user_data.roles)?;
     if !actor.is_system()
         && user_data.roles.iter().any(|role| {
             !matches!(
@@ -413,6 +423,9 @@ pub async fn update_user<P: PoolProvider>(
         });
     }
 
+    if let Some(roles) = &user_data.roles {
+        refuse_service_roles(roles)?;
+    }
     if !can_update_all_users && user_data.roles.is_some() {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateAll),

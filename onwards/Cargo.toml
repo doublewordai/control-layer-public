@@ -7,7 +7,7 @@ description = "A flexible LLM proxy library"
 license = "MIT"
 repository = "https://github.com/doublewordai/control-layer"
 homepage = "https://github.com/doublewordai/control-layer"
-documentation = "https://docs.rs/onwards"
+publish = false
 keywords = ["llm", "proxy", "ai", "openai", "anthropic"]
 categories = ["web-programming", "api-bindings"]
 

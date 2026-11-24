@@ -309,6 +309,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -429,6 +430,7 @@ mod tests {
             let row = HttpAnalyticsRow {
                 served_by: None,
                 resolved_serving_class: None,
+                compute_pool: None,
                 instance_id: Uuid::new_v4(),
                 correlation_id: i as i64,
                 timestamp: chrono::Utc::now(),
@@ -490,6 +492,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 456,
             timestamp: chrono::Utc::now(),
@@ -553,6 +556,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 789,
             timestamp: chrono::Utc::now(),
@@ -627,6 +631,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 999,
             timestamp: chrono::Utc::now(),
@@ -688,6 +693,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 111,
             timestamp: chrono::Utc::now(),
@@ -752,6 +758,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 222,
             timestamp: chrono::Utc::now(),
@@ -813,6 +820,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 333,
             timestamp: chrono::Utc::now(),
@@ -869,6 +877,7 @@ mod tests {
             let row = HttpAnalyticsRow {
                 served_by: None,
                 resolved_serving_class: None,
+                compute_pool: None,
                 instance_id: Uuid::new_v4(),
                 correlation_id: 444,
                 timestamp: chrono::Utc::now(),
@@ -924,6 +933,7 @@ mod tests {
         let row = HttpAnalyticsRow {
             served_by: None,
             resolved_serving_class: None,
+            compute_pool: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 555,
             timestamp: chrono::Utc::now(),

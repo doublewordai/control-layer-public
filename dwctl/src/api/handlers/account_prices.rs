@@ -14,7 +14,8 @@ use uuid::Uuid;
 use crate::{
     AppState,
     api::models::account_prices::{AccountPriceResponse, EndAccountPriceQuery, GetAccountPriceQuery, SetAccountPriceRequest},
-    auth::permissions::{RequiresPermission, operation, resource},
+    api::models::users::CurrentUser,
+    auth::permissions::has_permission,
     db::handlers::{
         AccountPrices,
         account_prices::{ChangeRecord, CompetingRow, STANDARD_CLASS},
@@ -22,6 +23,7 @@ use crate::{
     errors::{Error, Result},
     model_provisioning::{CacheTariff, Tariff, TariffPurpose, parse_decimal, parse_per_million, validate_cache_tariff, validate_tariffs},
     pricing::{BilledPrice, billed_realtime_prices},
+    types::{Operation, Permission, Resource},
 };
 
 const IDEMPOTENCY_KEY: &str = "idempotency-key";
@@ -56,11 +58,12 @@ pub async fn get_account_price<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((account, model)): Path<(String, String)>,
     Query(query): Query<GetAccountPriceQuery>,
-    _user: RequiresPermission<resource::Pricing, operation::ReadAll>,
+    user: CurrentUser,
 ) -> Result<Json<AccountPriceResponse>> {
+    may_price_some_account(&user, Operation::ReadAll)?;
     let class = checked_class(query.serving_class.as_deref())?;
     let mut conn = state.db.write().acquire().await.map_err(db_error)?;
-    let target = resolve(&mut conn, &account, &model).await?;
+    let target = resolve(&mut conn, &user, Operation::ReadAll, &state, &account, &model).await?;
     let now = Utc::now();
     let price = billed(&mut conn, &target, class, now).await?;
     Ok(Json(response(&target, class, now, None, price, None)))
@@ -95,9 +98,10 @@ pub async fn set_account_price<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((account, model)): Path<(String, String)>,
     headers: HeaderMap,
-    user: RequiresPermission<resource::Pricing, operation::UpdateAll>,
+    user: CurrentUser,
     Json(request): Json<SetAccountPriceRequest>,
 ) -> Result<Json<Value>> {
+    may_price_some_account(&user, Operation::UpdateAll)?;
     let request_id = idempotency_key(&headers)?;
     let class = checked_class(request.serving_class.as_deref())?;
     let reason = checked_reason(&request.reason)?;
@@ -107,7 +111,7 @@ pub async fn set_account_price<P: PoolProvider>(
     let valid_from = request.valid_from.unwrap_or(now);
 
     let mut tx = state.db.write().begin().await.map_err(db_error)?;
-    let target = resolve(&mut tx, &account, &model).await?;
+    let target = resolve(&mut tx, &user, Operation::UpdateAll, &state, &account, &model).await?;
     let fingerprint = json!(["PUT", target.account, target.model, request]).to_string();
     let mut prices = AccountPrices::new(&mut tx);
     prices.lock(target.account, target.model).await.map_err(db_error)?;
@@ -196,7 +200,7 @@ pub async fn set_account_price<P: PoolProvider>(
         old: previous,
         new: price,
         reason,
-        changed_by: user.current_user.id,
+        changed_by: user.id,
     };
     let body = record(&mut tx, &change, |id| {
         response(&target, class, valid_from, previous, price, Some(id))
@@ -205,7 +209,7 @@ pub async fn set_account_price<P: PoolProvider>(
     tx.commit().await.map_err(db_error)?;
     tracing::info!(
         account = %target.username, model = %target.alias, serving_class = class, %valid_from,
-        input = %input, output = %output, cache_read = ?cache_read, reason, changed_by = %user.current_user.id,
+        input = %input, output = %output, cache_read = ?cache_read, reason, changed_by = %user.id,
         "account price set through the admin API"
     );
     after_commit(&state, &target, valid_from);
@@ -240,14 +244,15 @@ pub async fn end_account_price<P: PoolProvider>(
     Path((account, model)): Path<(String, String)>,
     Query(query): Query<EndAccountPriceQuery>,
     headers: HeaderMap,
-    user: RequiresPermission<resource::Pricing, operation::UpdateAll>,
+    user: CurrentUser,
 ) -> Result<Json<Value>> {
+    may_price_some_account(&user, Operation::UpdateAll)?;
     let request_id = idempotency_key(&headers)?;
     let class = checked_class(query.serving_class.as_deref())?;
     let reason = checked_reason(&query.reason)?;
 
     let mut tx = state.db.write().begin().await.map_err(db_error)?;
-    let target = resolve(&mut tx, &account, &model).await?;
+    let target = resolve(&mut tx, &user, Operation::UpdateAll, &state, &account, &model).await?;
     let fingerprint = json!(["DELETE", target.account, target.model, query]).to_string();
     let mut prices = AccountPrices::new(&mut tx);
     prices.lock(target.account, target.model).await.map_err(db_error)?;
@@ -279,7 +284,7 @@ pub async fn end_account_price<P: PoolProvider>(
         old: previous,
         new: price,
         reason,
-        changed_by: user.current_user.id,
+        changed_by: user.id,
     };
     let body = record(&mut tx, &change, |id| {
         response(&target, class, now, previous, price, (ended > 0).then_some(id))
@@ -288,7 +293,7 @@ pub async fn end_account_price<P: PoolProvider>(
     tx.commit().await.map_err(db_error)?;
     if ended > 0 {
         tracing::info!(
-            account = %target.username, model = %target.alias, serving_class = class, reason, changed_by = %user.current_user.id,
+            account = %target.username, model = %target.alias, serving_class = class, reason, changed_by = %user.id,
             "account price ended through the admin API"
         );
         after_commit(&state, &target, now);
@@ -338,6 +343,21 @@ async fn billed(conn: &mut PgConnection, target: &Target, class: Option<&str>, a
     Ok(prices.remove(&target.alias))
 }
 
+fn may_price_some_account(user: &CurrentUser, operation: Operation) -> Result<()> {
+    if has_permission(user, Resource::Pricing, operation) || has_permission(user, Resource::OpenRouterPricing, operation) {
+        return Ok(());
+    }
+    Err(pricing_denied(operation))
+}
+
+fn pricing_denied(operation: Operation) -> Error {
+    Error::InsufficientPermissions {
+        required: Permission::Allow(Resource::Pricing, operation),
+        action: operation,
+        resource: "account prices".to_string(),
+    }
+}
+
 fn response(
     target: &Target,
     class: Option<&str>,
@@ -358,16 +378,33 @@ fn response(
     }
 }
 
-async fn resolve(conn: &mut PgConnection, account: &str, model: &str) -> Result<Target> {
+async fn resolve<P: PoolProvider>(
+    conn: &mut PgConnection,
+    user: &CurrentUser,
+    operation: Operation,
+    state: &AppState<P>,
+    account: &str,
+    model: &str,
+) -> Result<Target> {
     let account_row = sqlx::query("SELECT id, username FROM users WHERE (id::text = $1 OR username = $1) AND is_deleted = FALSE LIMIT 1")
         .bind(account)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(db_error)?
-        .ok_or_else(|| Error::NotFound {
-            resource: "Account".to_string(),
-            id: account.to_string(),
-        })?;
+        .map_err(db_error)?;
+    if !has_permission(user, Resource::Pricing, operation) {
+        let openrouter = state.current_config().integrations.openrouter.account.clone();
+        let in_scope = has_permission(user, Resource::OpenRouterPricing, operation)
+            && account_row
+                .as_ref()
+                .is_some_and(|row| openrouter.as_deref() == Some(row.get::<&str, _>("username")));
+        if !in_scope {
+            return Err(pricing_denied(operation));
+        }
+    }
+    let account_row = account_row.ok_or_else(|| Error::NotFound {
+        resource: "Account".to_string(),
+        id: account.to_string(),
+    })?;
     let model_row = sqlx::query("SELECT id, alias FROM deployed_models WHERE (id::text = $1 OR alias = $1) AND deleted = FALSE LIMIT 1")
         .bind(model)
         .fetch_optional(&mut *conn)

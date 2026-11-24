@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_roles WHERE user_id = $1 AND role <> $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "user_role",
+            "kind": {
+              "Enum": [
+                "PLATFORMMANAGER",
+                "REQUESTVIEWER",
+                "STANDARDUSER",
+                "BILLINGMANAGER",
+                "BATCHAPIUSER",
+                "CONNECTIONSUSER",
+                "BACKGROUNDINFERENCEUSER",
+                "QUEUEDEMANDREADER",
+                "CATALOGUEREADER",
+                "CATALOGUEREADERALL",
+                "OPENROUTERPRICEMANAGER"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "54191ee9d8936408311dae19ffd188b608b3228d60e4a6b393ab2b0d452072f7"
+}

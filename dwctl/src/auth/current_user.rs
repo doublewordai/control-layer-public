@@ -321,7 +321,8 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         r#"
         SELECT ak.id AS api_key_id, ak.user_id, ak.created_by, ak.purpose,
                u.username, u.email, u.is_admin, u.display_name, u.avatar_url,
-               u.payment_provider_id, u.last_login
+               u.payment_provider_id, u.last_login,
+               u.is_service_account, account.is_service_account AS account_is_service_account
         FROM api_keys ak
         INNER JOIN users u ON ak.created_by = u.id
         INNER JOIN users account ON ak.user_id = account.id
@@ -354,6 +355,13 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     let purpose_str = &api_key_data.purpose;
     let is_system_key =
         purpose_str == "platform" && api_key_data.api_key_id.is_nil() && api_key_data.created_by.is_nil() && api_key_data.user_id.is_nil();
+
+    let is_service_key = api_key_data.is_service_account || api_key_data.account_is_service_account;
+    if is_service_key && !(purpose_str == "platform" && api_key_data.created_by == api_key_data.user_id) {
+        return Some(Err(Error::Unauthenticated {
+            message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
+        }));
+    }
 
     debug!(path, purpose = purpose_str.as_str(), "API key purpose check");
     let is_valid = if is_system_key || matches!(path, "/admin/openapi.json" | "/admin/docs" | "/ai/openapi.json" | "/ai/docs") {
@@ -411,6 +419,8 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         CurrentUser {
             auth_method: if is_system_key {
                 AuthMethod::SystemApiKey
+            } else if is_service_key {
+                AuthMethod::ServiceApiKey
             } else if purpose_str == "platform"
                 && !api_key_data.api_key_id.is_nil()
                 && !api_key_data.created_by.is_nil()
@@ -545,6 +555,17 @@ fn maybe_update_last_login(user_id: crate::types::UserId, last_login: Option<Dat
     }
 }
 
+async fn refuse_service_account(user_id: crate::types::UserId, db: &PgPool) -> Result<()> {
+    let is_service_account = sqlx::query_scalar!("SELECT is_service_account FROM users WHERE id = $1", user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| Error::from(DbError::from(e)))?;
+    if is_service_account == Some(true) {
+        return Err(Error::Unauthenticated { message: None });
+    }
+    Ok(())
+}
+
 impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<crate::AppState<P>> for CurrentUser {
     type Rejection = Error;
 
@@ -558,6 +579,9 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
             Some(Ok((mut user, last_login))) => {
                 let method = user.auth_method;
                 user = user.with_auth_method(method);
+                if method == AuthMethod::ServiceApiKey {
+                    crate::telemetry::record_service_caller(&user, &crate::telemetry::RequestSpan::of(Some(&parts.extensions)));
+                }
                 if let Some(api_key_id) = user.api_key_id {
                     state.api_key_usage.record(api_key_id);
                 }
@@ -577,6 +601,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         if config.auth.native.enabled {
             match try_jwt_session_auth(parts, &config, &state.db.write()).await {
                 Some(Ok((mut user, last_login))) => {
+                    refuse_service_account(user.id, &state.db.write()).await?;
                     user = user.with_auth_method(AuthMethod::NativeSession);
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
@@ -598,6 +623,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         if config.auth.proxy_header.enabled {
             match try_proxy_header_auth(parts, state).await {
                 Some(Ok((mut user, last_login))) => {
+                    refuse_service_account(user.id, &state.db.write()).await?;
                     user = user.with_auth_method(AuthMethod::TrustedSso);
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);

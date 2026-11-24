@@ -50,6 +50,7 @@ pub struct Config {
     pub secret_key: Option<String>,
     pub model_sources: Vec<ModelSource>,
     pub model_provisioning: ModelProvisioningConfig,
+    pub service_accounts: ServiceAccountsConfig,
     pub migrations: MigrationsConfig,
     pub metadata: Metadata,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2245,6 +2246,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             model_provisioning: ModelProvisioningConfig::default(),
+            service_accounts: ServiceAccountsConfig::default(),
             migrations: MigrationsConfig::default(),
             metadata: Metadata::default(),
             payment: None,
@@ -2315,6 +2317,23 @@ pub struct ModelProvisioningConfig {
     pub directory: PathBuf,
     pub org_overlays_directory: PathBuf,
     pub account_limits_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceAccountsConfig {
+    pub file: Option<PathBuf>,
+    #[serde(with = "humantime_serde")]
+    pub reconcile_interval: Duration,
+}
+
+impl Default for ServiceAccountsConfig {
+    fn default() -> Self {
+        Self {
+            file: None,
+            reconcile_interval: Duration::from_secs(5 * 60),
+        }
+    }
 }
 
 impl Default for ModelProvisioningConfig {
@@ -2528,6 +2547,11 @@ impl Config {
                 .map_err(|operation| Error::Internal {
                     operation: format!("Config validation: {operation}"),
                 })?;
+        }
+        if self.service_accounts.file.is_some() && self.service_accounts.reconcile_interval.is_zero() {
+            return Err(Error::Internal {
+                operation: "Config validation: service_accounts.reconcile_interval must be greater than zero".to_string(),
+            });
         }
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
@@ -5002,6 +5026,27 @@ background_services:
                     assert!(Config::load(&args).is_err(), "accepted {setting}");
                 }
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_service_accounts_reconcile_interval_must_be_positive() {
+        Jail::expect_with(|jail| {
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let settings = |interval: &str| {
+                format!(
+                    "secret_key: test-secret-key\nservice_accounts:\n  file: /etc/dwctl/service-accounts.json\n  reconcile_interval: {interval}\n"
+                )
+            };
+            jail.create_file("test.yaml", &settings("0s"))?;
+            assert!(Config::load(&args).is_err(), "accepted a zero interval");
+            jail.create_file("test.yaml", &settings("30s"))?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.service_accounts.reconcile_interval, Duration::from_secs(30));
             Ok(())
         });
     }

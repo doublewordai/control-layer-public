@@ -13,6 +13,7 @@ pub mod openrouter_models;
 pub mod rejections;
 pub mod request_log_credentials;
 pub mod responses;
+pub mod service_accounts;
 pub mod serving_classes;
 pub mod sigterm_drain;
 pub mod sla;
@@ -699,6 +700,121 @@ async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     assert!(
         inference_response.text().starts_with("data:"),
         "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
+#[dwctl_test_macros::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_strips_compute_pool_header_and_records_analytics(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+
+    let unary_body = serde_json::json!({
+        "id": "chatcmpl-unary-1",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "gpt-3.5-turbo",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "Hello!"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+    });
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": false })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("X-Dynamo-Compute-Pool", "  gpu-pool-a  ")
+                .insert_header("x-other-upstream", "preserved-unary")
+                .set_body_json(unary_body),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let sse_response = concat!(
+        "data: {\"id\":\"chatcmpl-sse-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+        "data: {\"id\":\"chatcmpl-sse-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-3.5-turbo\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":12,\"total_tokens\":21}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-dynamo-compute-pool", "spot-pool-1")
+                .insert_header("x-other-upstream", "preserved-sse")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    let unary_resp = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        }))
+        .await;
+    assert_eq!(unary_resp.status_code().as_u16(), 200);
+    assert!(
+        unary_resp.headers().get("x-dynamo-compute-pool").is_none(),
+        "x-dynamo-compute-pool must be stripped at the dwctl edge on unary responses"
+    );
+    assert_eq!(
+        unary_resp.headers().get("x-other-upstream").and_then(|v| v.to_str().ok()),
+        Some("preserved-unary")
+    );
+
+    let sse_resp = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }))
+        .await;
+    assert_eq!(sse_resp.status_code().as_u16(), 200);
+    assert!(
+        sse_resp.headers().get("x-dynamo-compute-pool").is_none(),
+        "x-dynamo-compute-pool must be stripped at the dwctl edge on SSE responses"
+    );
+    assert_eq!(
+        sse_resp.headers().get("x-other-upstream").and_then(|v| v.to_str().ok()),
+        Some("preserved-sse")
+    );
+    assert!(sse_resp.text().ends_with("data: [DONE]\n\n"));
+
+    let mut rows: Vec<(Option<i64>, Option<String>)> = Vec::new();
+    for _ in 0..100 {
+        rows = sqlx::query_as::<_, (Option<i64>, Option<String>)>(
+            "SELECT total_tokens, compute_pool FROM http_analytics WHERE model = 'test-model' ORDER BY total_tokens ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query http_analytics.compute_pool");
+        if rows.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        rows,
+        vec![
+            (Some(12), Some("gpu-pool-a".to_string())),
+            (Some(21), Some("spot-pool-1".to_string())),
+        ],
+        "outlet must record compute_pool on both unary and SSE requests even though dwctl strips the response header"
     );
 
     cleanup_fixture(fixture).await;
@@ -1418,8 +1534,6 @@ async fn test_request_logging_disabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
@@ -2039,8 +2153,6 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
@@ -2100,8 +2212,6 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(

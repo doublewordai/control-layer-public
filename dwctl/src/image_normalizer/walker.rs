@@ -5,7 +5,6 @@ use super::token::ImageToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    HttpOnly,
     All,
     TokensOnly,
     AllAndTokens,
@@ -14,7 +13,6 @@ pub enum Mode {
 impl Mode {
     fn applies_to(self, input: &str) -> bool {
         match self {
-            Mode::HttpOnly => is_http_url(input),
             Mode::All => is_http_url(input) || crate::image_normalizer::data_uri::looks_like_data_uri(input),
             Mode::TokensOnly => ImageToken::looks_like_token(input),
             Mode::AllAndTokens => Mode::All.applies_to(input) || ImageToken::looks_like_token(input),
@@ -214,35 +212,10 @@ mod tests {
         assert!(!has_inputs(&text_only, Mode::All));
         assert!(!has_inputs(&token_only, Mode::All));
         assert!(has_inputs(&token_only, Mode::AllAndTokens));
-        assert!(!has_inputs(&responses, Mode::HttpOnly));
     }
 
     async fn prefix_with(prefix: &'static str, url: String) -> Result<String, Infallible> {
         Ok(format!("{prefix}:{url}"))
-    }
-
-    #[tokio::test]
-    async fn http_only_substitutes_http_in_chat_completions_shape() {
-        let mut body = json!({
-            "model": "vision",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": "describe" },
-                        { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
-                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
-                    ]
-                }
-            ]
-        });
-
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("X", u)).await.unwrap();
-
-        assert_eq!(count, 1);
-        let content = &body["messages"][0]["content"];
-        assert_eq!(content[1]["image_url"]["url"], "X:https://example.com/a.png");
-        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[tokio::test]
@@ -280,7 +253,7 @@ mod tests {
             ]
         });
 
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("R", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("R", u)).await.unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(body["input"][0]["content"][1]["image_url"], "R:https://example.com/b.png");
@@ -307,7 +280,7 @@ mod tests {
         let mut body = json!({
             "messages": [{ "role": "user", "content": "hello world" }]
         });
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("Z", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("Z", u)).await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -365,7 +338,7 @@ mod tests {
                 ]
             }]
         });
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("X", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("X", u)).await.unwrap();
         assert_eq!(count, 1);
     }
 }

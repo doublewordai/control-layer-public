@@ -56,6 +56,8 @@ pub struct RawAnalyticsRecord {
     #[serde(default)]
     pub served_model: Option<String>,
     #[serde(default)]
+    pub compute_pool: Option<String>,
+    #[serde(default)]
     pub requested_serving_class: Option<String>,
     #[serde(default)]
     pub resolved_serving_class: Option<String>,
@@ -709,6 +711,7 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut compute_pool_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut requested_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut resolved_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
@@ -770,6 +773,7 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
+            compute_pool_vec.push(record.raw.compute_pool.clone());
             requested_class_vec.push(record.raw.requested_serving_class.clone());
             resolved_class_vec.push(record.raw.resolved_serving_class.clone());
             finish_reason_vec.push(record.raw.finish_reason.clone());
@@ -801,7 +805,7 @@ where
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
                 cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id,
-                x_request_id, reference_cached_tokens
+                x_request_id, reference_cached_tokens, compute_pool
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -814,7 +818,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[], $51::bigint[]
+                $46::text[], $47::text[], $48::text[], $49::text[], $50::uuid[], $51::bigint[], $52::text[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -870,6 +874,7 @@ where
             &gateway_span_ids as &[Option<String>],
             &x_request_ids as &[Option<Uuid>],
             &reference_cached_vec as &[Option<i64>],
+            &compute_pool_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -911,6 +916,7 @@ where
         let mut served_bys: Vec<String> = Vec::new();
         let mut served_models: Vec<String> = Vec::new();
         let mut serving_classes: Vec<String> = Vec::new();
+        let mut compute_pools: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         let mut service_tiers: Vec<String> = Vec::new();
         let mut fusillade_request_ids_credit: Vec<Option<Uuid>> = Vec::new();
@@ -971,6 +977,7 @@ where
                     .clone()
                     .unwrap_or_else(|| crate::inference::serving_name::STANDARD_CLASS.to_owned()),
             );
+            compute_pools.push(record.raw.compute_pool.clone().unwrap_or_default());
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -984,22 +991,32 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        type CreditMetricRecord = (usize, Uuid, Decimal, String, String, String, String);
+        struct CreditMetricRecord {
+            idx: usize,
+            user_id: Uuid,
+            amount: Decimal,
+            model: String,
+            served_by: String,
+            served_model: String,
+            serving_class: String,
+            compute_pool: String,
+        }
         let source_id_to_record: HashMap<String, CreditMetricRecord> = source_ids
             .iter()
             .enumerate()
             .map(|(i, sid)| {
                 (
                     sid.clone(),
-                    (
-                        i,
-                        user_ids[i],
-                        amounts[i],
-                        models[i].clone(),
-                        served_bys[i].clone(),
-                        served_models[i].clone(),
-                        serving_classes[i].clone(),
-                    ),
+                    CreditMetricRecord {
+                        idx: i,
+                        user_id: user_ids[i],
+                        amount: amounts[i],
+                        model: models[i].clone(),
+                        served_by: served_bys[i].clone(),
+                        served_model: served_models[i].clone(),
+                        serving_class: serving_classes[i].clone(),
+                        compute_pool: compute_pools[i].clone(),
+                    },
                 )
             })
             .collect();
@@ -1120,8 +1137,8 @@ where
 
         let mut scope_folds: HashMap<Uuid, Decimal> = HashMap::new();
         for row in &inserted_rows {
-            if let Some(&(idx, ..)) = source_id_to_record.get(&row.source_id)
-                && let Some(scope_root) = cap_scope_roots[idx]
+            if let Some(record) = source_id_to_record.get(&row.source_id)
+                && let Some(scope_root) = cap_scope_roots[record.idx]
             {
                 *scope_folds.entry(scope_root).or_insert(Decimal::ZERO) += row.amount;
             }
@@ -1397,15 +1414,16 @@ where
         }
 
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model, served_by, served_model, serving_class)) = source_id_to_record.get(&row.source_id) {
-                let nanocredits = (amount.to_f64().unwrap_or(0.0) * 1_000_000_000.0).round() as u64;
+            if let Some(record) = source_id_to_record.get(&row.source_id) {
+                let nanocredits = (record.amount.to_f64().unwrap_or(0.0) * 1_000_000_000.0).round() as u64;
                 counter!(
                     "dwctl_credits_deducted_nanocredits_total",
-                    "user_id" => user_id.to_string(),
-                    "model" => model.clone(),
-                    "serving_class" => serving_class.clone(),
-                    "served_by" => served_by.clone(),
-                    "served_model" => served_model.clone()
+                    "user_id" => record.user_id.to_string(),
+                    "model" => record.model.clone(),
+                    "serving_class" => record.serving_class.clone(),
+                    "served_by" => record.served_by.clone(),
+                    "served_model" => record.served_model.clone(),
+                    "compute_pool" => record.compute_pool.clone()
                 )
                 .increment(nanocredits);
             }
@@ -1451,6 +1469,7 @@ where
             batch_request_source: record.raw.batch_request_source.clone(),
             served_by: record.raw.served_by.clone(),
             resolved_serving_class: record.raw.resolved_serving_class.clone(),
+            compute_pool: record.raw.compute_pool.clone(),
         }
     }
 }
@@ -1494,6 +1513,7 @@ mod tests {
         let record = RawAnalyticsRecord {
             served_by: None,
             served_model: None,
+            compute_pool: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -1559,6 +1579,14 @@ mod tests {
     }
 
     #[test]
+    fn outbox_payload_without_compute_pool_deserializes() {
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("compute_pool");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.compute_pool, None);
+    }
+
+    #[test]
     fn test_parse_api_key_purpose() {
         assert_eq!(parse_api_key_purpose("platform"), ApiKeyPurpose::Platform);
         assert_eq!(parse_api_key_purpose("batch"), ApiKeyPurpose::Batch);
@@ -1571,6 +1599,7 @@ mod tests {
         RawAnalyticsRecord {
             served_by: None,
             served_model: None,
+            compute_pool: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -1848,6 +1877,7 @@ mod integration_tests {
         RawAnalyticsRecord {
             served_by: None,
             served_model: None,
+            compute_pool: None,
             requested_serving_class: None,
             resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
@@ -2269,7 +2299,46 @@ mod integration_tests {
         assert!(line.contains(r#"serving_class="standard""#), "{line}");
         assert!(line.contains(r#"served_by="inference.internal""#), "{line}");
         assert!(line.contains(r#"served_model="component-model""#), "{line}");
+        assert!(line.contains(r#"compute_pool="""#), "{line}");
         assert!(line.ends_with(" 25000000"), "{line}");
+    }
+
+    #[dwctl_test_macros::test]
+    async fn credit_metric_labels_compute_pool(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "pooled-model").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("10.00").unwrap()).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut pooled = create_raw_record("pooled-model", Some(api_key), 1000, 500);
+        pooled.served_by = Some("http://inference.internal:3000/v1".to_string());
+        pooled.compute_pool = Some("gpu-pool-a".to_string());
+
+        let unpooled = create_raw_record("pooled-model", Some(api_key), 200, 100);
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        run_batcher_with_records(&pool, vec![pooled, unpooled]).await;
+
+        let rendered = handle.render();
+        let pooled_line = rendered
+            .lines()
+            .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{") && l.contains(r#"compute_pool="gpu-pool-a""#))
+            .expect("pooled deduction is counted with compute_pool label");
+        assert!(pooled_line.ends_with(" 25000000"), "{pooled_line}");
+
+        let unpooled_line = rendered
+            .lines()
+            .find(|l| l.starts_with("dwctl_credits_deducted_nanocredits_total{") && l.contains(r#"compute_pool="""#))
+            .expect("unpooled deduction falls back to empty compute_pool label");
+        assert!(unpooled_line.ends_with(" 5000000"), "{unpooled_line}");
     }
 
     #[dwctl_test_macros::test]
@@ -3119,6 +3188,33 @@ mod integration_tests {
                 .expect("query should succeed");
         assert_eq!(rows.len(), 1, "the duplicate receipt must not create another row");
         assert_eq!(rows[0].as_deref(), Some("engine"), "the first complete receipt remains canonical");
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn batcher_persists_the_compute_pool_to_http_analytics(pool: sqlx::PgPool) {
+        create_test_model(&pool, "compute-pool-test").await;
+
+        let mut pooled = create_raw_record("compute-pool-test", None, 10, 5);
+        pooled.correlation_id = 1;
+        pooled.compute_pool = Some("gpu-pool-a".to_string());
+
+        let mut unpooled = create_raw_record("compute-pool-test", None, 10, 5);
+        unpooled.correlation_id = 2;
+
+        run_batcher_with_records(&pool, vec![pooled, unpooled]).await;
+
+        let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT correlation_id, compute_pool FROM http_analytics WHERE model = 'compute-pool-test' ORDER BY correlation_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("analytics rows should exist");
+        assert_eq!(
+            rows,
+            vec![(1, Some("gpu-pool-a".to_string())), (2, None)],
+            "compute_pool should persist when reported and stay NULL otherwise"
+        );
     }
 
     #[dwctl_test_macros::test]

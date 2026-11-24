@@ -8,40 +8,20 @@ Run the test suite:
 cargo test
 ```
 
-## Release process
+## Releases
 
-This project uses automated releases through [release-plz](https://release-plz.dev/).
+Onwards is not published to crates.io. It stays a crate in this workspace and
+is consumed as a path dependency, so there is no crate version or release PR to
+prepare for it.
 
-### How releases work
+Every push to `main` builds the standalone image as
+`ghcr.io/doublewordai/onwards:sha-<commit>`. The `main` and `latest` tags move
+to the commit that is `main`'s head. A pull request from this repository that
+runs backend CI builds the same image from its head commit and tags it with
+that commit's SHA.
 
-1. **Make changes** using [conventional commits](https://www.conventionalcommits.org/):
-   - `feat:` for new features (minor version bump)
-   - `fix:` for bug fixes (patch version bump)
-   - `feat!:` or `fix!:` for breaking changes (major version bump)
-
-2. **Create a pull request** with your changes
-
-3. **Merge the PR** -- this triggers the release-plz workflow
-
-4. **Release PR appears** -- release-plz automatically creates a PR with:
-   - Updated version in `Cargo.toml`
-   - Generated changelog
-   - All changes since last release
-
-5. **Review and merge** the release PR
-
-6. **Automated publishing** -- when the release PR is merged:
-   - release-plz publishes the crate to crates.io
-   - Creates a GitHub release with changelog
-
-### Conventional commit examples
-
-```
-feat: add new proxy authentication method
-fix: resolve connection timeout issues
-docs: update API documentation
-chore: update dependencies
-feat!: change configuration file format (BREAKING CHANGE)
-```
-
-The release workflow automatically handles version bumping and publishing based on your commit messages.
+The public repository gets one versioned export for the whole workspace on a
+weekday schedule. Its version comes from the conventional commit messages since
+the previous export: a `feat` bumps the minor; a `!` title marker or a
+`BREAKING CHANGE:` footer bumps the major, and every other commit bumps the
+patch. `release:` commits are ignored.

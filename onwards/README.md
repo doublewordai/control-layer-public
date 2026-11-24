@@ -1,12 +1,10 @@
 # Onwards
 
-[![Crates.io](https://img.shields.io/crates/v/onwards)](https://crates.io/crates/onwards)
-[![Documentation](https://docs.rs/onwards/badge.svg)](https://docs.rs/onwards)
 [![GitHub](https://img.shields.io/badge/GitHub-doublewordai%2Fcontrol--layer-blue)](https://github.com/doublewordai/control-layer/tree/main/onwards)
 
 A Rust-based AI Gateway that provides a unified interface for routing requests to OpenAI-compatible targets. The goal is to be as "transparent" as possible.
 
-Onwards is developed in the control-layer workspace, embedded in the `dwctl` application, and independently published as a crate and container image.
+Onwards is a crate in the control-layer workspace. It is embedded in the `dwctl` application and also built as a standalone container image; it is not published to crates.io.
 
 ## Quickstart
 
@@ -24,12 +22,15 @@ Create a `config.json`:
 }
 ```
 
-Start the gateway:
-
-Install the published binary with `cargo install onwards`, then start the gateway:
+Build and run it from this workspace, or use the standalone image:
 
 ```bash
-onwards -f config.json
+cargo run -p onwards -- -f config.json
+```
+
+```bash
+docker run --rm -p 3000:3000 -v "$PWD/config.json:/config.json" \
+  ghcr.io/doublewordai/onwards:latest -f /config.json
 ```
 
 Send a request:

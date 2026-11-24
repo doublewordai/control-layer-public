@@ -5,9 +5,9 @@ version = "6.0.0"
 description = "Core domain types and storage traits for Fusillade"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/doublewordai/control-layer"
+publish = false
 include = [
     "/src/**",
-    "/CHANGELOG.md",
 ]
 
 [lib]

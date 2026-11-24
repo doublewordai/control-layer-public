@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -15,22 +15,6 @@ pub struct HttpResponse {
     pub status: u16,
     pub body: String,
     pub x_request_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[cfg_attr(feature = "sqlx-postgres", derive(sqlx::Type))]
-#[cfg_attr(
-    feature = "sqlx-postgres",
-    sqlx(type_name = "text", rename_all = "lowercase")
-)]
-pub enum RequestStateFilter {
-    Pending,
-    Claimed,
-    Processing,
-    Completed,
-    Failed,
-    Canceled,
 }
 
 pub trait RequestState: Send + Sync {}
@@ -399,20 +383,6 @@ impl AnyRequest {
             self,
             AnyRequest::Completed(_) | AnyRequest::Failed(_) | AnyRequest::Canceled(_)
         )
-    }
-
-    pub fn as_pending(&self) -> Option<&Request<Pending>> {
-        match self {
-            AnyRequest::Pending(r) => Some(r),
-            _ => None,
-        }
-    }
-
-    pub fn into_pending(self) -> Option<Request<Pending>> {
-        match self {
-            AnyRequest::Pending(r) => Some(r),
-            _ => None,
-        }
     }
 }
 

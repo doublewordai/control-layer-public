@@ -66,6 +66,7 @@ pub struct HttpAnalyticsRow {
     pub batch_request_source: String,
     pub served_by: Option<String>,
     pub resolved_serving_class: Option<String>,
+    pub compute_pool: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +95,7 @@ pub struct UsageMetrics {
     pub server_port: u16,
     pub served_by: Option<String>,
     pub served_model: Option<String>,
+    pub compute_pool: Option<String>,
     pub engine_cached_tokens: Option<i64>,
     pub cache_read_source: Option<String>,
     pub reference_cached_tokens: Option<i64>,
@@ -463,6 +465,10 @@ impl UsageMetrics {
                 .extensions
                 .get::<onwards::ServedBy>()
                 .and_then(|s| s.onwards_model.clone()),
+            compute_pool: response_data
+                .extensions
+                .get::<onwards::ServedBy>()
+                .and_then(|s| s.compute_pool.clone()),
             engine_cached_tokens,
             cache_read_source: extract_cache_read_source(response_data),
             reference_cached_tokens: extract_reference_cached_tokens(response_data),
@@ -1465,6 +1471,7 @@ mod tests {
         extensions.insert(onwards::ServedBy {
             url: "https://router.requesty.ai/v1".to_string(),
             onwards_model: Some("policy/glm-5.2".to_string()),
+            compute_pool: Some("gpu-pool-a".to_string()),
         });
         let response_data = ResponseData {
             extensions,
@@ -1487,6 +1494,7 @@ mod tests {
         );
         assert_eq!(metrics.served_by.as_deref(), Some("https://router.requesty.ai/v1"));
         assert_eq!(metrics.served_model.as_deref(), Some("policy/glm-5.2"));
+        assert_eq!(metrics.compute_pool.as_deref(), Some("gpu-pool-a"));
 
         let response_data_no_ext = ResponseData {
             extensions: Default::default(),
@@ -1508,6 +1516,7 @@ mod tests {
         );
         assert_eq!(metrics.served_by, None);
         assert_eq!(metrics.served_model, None);
+        assert_eq!(metrics.compute_pool, None);
     }
 
     #[test]

@@ -50,10 +50,6 @@ pub fn hash_string_with_params(input: &str, params: Option<Argon2Params>) -> Res
     Ok(hash.to_string())
 }
 
-pub fn hash_string(input: &str) -> Result<String, Error> {
-    hash_string_with_params(input, None)
-}
-
 pub fn verify_string(input: &str, hash: &str) -> Result<bool, Error> {
     let parsed_hash = PasswordHash::new(hash).map_err(|e| Error::Internal {
         operation: format!("parse hash: {e}"),
@@ -77,7 +73,7 @@ mod tests {
     #[test]
     fn test_string_hashing() {
         let input = "test_password_123";
-        let hash = hash_string(input).unwrap();
+        let hash = hash_string_with_params(input, None).unwrap();
 
         assert!(!hash.is_empty());
 
@@ -91,8 +87,8 @@ mod tests {
         let input1 = "password1";
         let input2 = "password2";
 
-        let hash1 = hash_string(input1).unwrap();
-        let hash2 = hash_string(input2).unwrap();
+        let hash1 = hash_string_with_params(input1, None).unwrap();
+        let hash2 = hash_string_with_params(input2, None).unwrap();
 
         assert_ne!(hash1, hash2);
     }
@@ -101,8 +97,8 @@ mod tests {
     fn test_same_input_different_hashes() {
         let input = "same_password";
 
-        let hash1 = hash_string(input).unwrap();
-        let hash2 = hash_string(input).unwrap();
+        let hash1 = hash_string_with_params(input, None).unwrap();
+        let hash2 = hash_string_with_params(input, None).unwrap();
 
         assert_ne!(hash1, hash2);
 

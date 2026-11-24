@@ -17,7 +17,11 @@
                 "BILLINGMANAGER",
                 "BATCHAPIUSER",
                 "CONNECTIONSUSER",
-                "BACKGROUNDINFERENCEUSER"
+                "BACKGROUNDINFERENCEUSER",
+                "QUEUEDEMANDREADER",
+                "CATALOGUEREADER",
+                "CATALOGUEREADERALL",
+                "OPENROUTERPRICEMANAGER"
               ]
             }
           }

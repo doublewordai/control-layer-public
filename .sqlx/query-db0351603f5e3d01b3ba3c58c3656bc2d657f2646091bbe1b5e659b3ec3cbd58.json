@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, auth_source, user_type, is_service_account)\n            VALUES ($1, $2, $3, $4, 'service', 'individual', TRUE)\n            ON CONFLICT (id) DO UPDATE\n                SET display_name = EXCLUDED.display_name, is_deleted = FALSE, updated_at = NOW()\n                WHERE users.is_service_account\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "db0351603f5e3d01b3ba3c58c3656bc2d657f2646091bbe1b5e659b3ec3cbd58"
+}

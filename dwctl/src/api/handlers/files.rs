@@ -3175,9 +3175,8 @@ mod tests {
 
         assert!(body["nvext"]["router"].get("ttft_target").is_none());
         assert!(body["nvext"]["router"].get("itl_target").is_none());
-        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert!(body["nvext"].get("agent_hints").is_none());
         assert_eq!(body["nvext"]["router"]["keep"], true);
-        assert_eq!(body["nvext"]["agent_hints"]["keep"], true);
         assert_eq!(body["nvext"]["keep"], true);
 
         assert_eq!(

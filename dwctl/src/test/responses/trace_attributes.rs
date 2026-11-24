@@ -240,7 +240,12 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
         "stream": true,
         "max_tokens": 200,
         "response_format": {"type": "json_schema", "json_schema": {"name": "private-schema", "schema": {"type": "object"}}},
-        "tools": [{"type": "function", "function": {"name": "private-tool", "parameters": {"type": "object"}}}],
+        "tools": [
+            {"type": "function", "function": {"name": "private-tool", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "private-tool-2", "parameters": {
+                "type": "object", "properties": {"private-property": {"$ref": "#/$defs/private-missing"}},
+            }}},
+        ],
         "tool_choice": {"type": "function", "function": {"name": "private-tool"}},
     });
     let rejected = server.post(path_chat).add_header("Authorization", &auth).json(&structured).await;
@@ -249,7 +254,13 @@ async fn customer_attributes_on_request_spans(pool: sqlx::PgPool) {
     let request = root(&spans, path_chat);
     assert_eq!(attr(request, "doubleword.response_format").as_deref(), Some("json_schema"));
     assert_eq!(attr(request, "doubleword.tool_choice").as_deref(), Some("function"));
-    assert_eq!(attr(request, "doubleword.tool_count").as_deref(), Some("1"));
+    assert_eq!(attr(request, "doubleword.tool_count").as_deref(), Some("2"));
+    assert_eq!(attr(request, "doubleword.response_format.schema_valid").as_deref(), Some("true"));
+    assert_eq!(attr(request, "doubleword.tool_schemas.invalid_count").as_deref(), Some("1"));
+    assert_eq!(
+        attr(request, "doubleword.tool_schemas.first_error").as_deref(),
+        Some("unresolved_ref")
+    );
     assert_eq!(attr(request, "gen_ai.request.max_tokens").as_deref(), Some("200"));
     assert_eq!(attr(request, "doubleword.stream").as_deref(), Some("true"));
     let recorded = format!("{:?}", request.attributes);

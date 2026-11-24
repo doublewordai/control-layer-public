@@ -77,17 +77,17 @@ class PreviewWorkflowTest < Minitest::Test
     end
   end
 
-  # The deployment side pulls releases from the registry and reads each
-  # image's source commit from its OCI labels, so a release labels its images
-  # and dispatches nothing to the deployment target.
-  def test_release_labels_its_images_and_dispatches_nothing
-    release_workflow = File.read(File.join(ROOT, ".github", "workflows", "release.yml"))
+  # The deployment side pulls main images from the registry and reads each
+  # image's source commit from its OCI labels, so publication labels its
+  # images and dispatches nothing to the deployment target.
+  def test_main_publication_labels_its_images_and_dispatches_nothing
+    publish_workflow = File.read(File.join(ROOT, ".github", "workflows", "publish-main.yml"))
 
-    assert_includes release_workflow, "labels: ${{ steps.meta.outputs.labels }}"
-    refute_includes release_workflow, "createDispatchEvent"
-    refute_includes release_workflow, "DEPLOY_TARGET_OWNER"
-    refute_includes release_workflow, "DEPLOY_TARGET_REPO"
-    refute_includes release_workflow, "PREVIEW_DISPATCH_TOKEN"
+    assert_includes publish_workflow, "labels: ${{ steps.meta.outputs.labels }}"
+    refute_includes publish_workflow, "createDispatchEvent"
+    refute_includes publish_workflow, "DEPLOY_TARGET_OWNER"
+    refute_includes publish_workflow, "DEPLOY_TARGET_REPO"
+    refute_includes publish_workflow, "PREVIEW_DISPATCH_TOKEN"
   end
 
   def test_comment_driven_staging_build_is_removed

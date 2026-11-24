@@ -62,6 +62,10 @@ pub enum Resource {
     System,
     Organizations,
     Connections,
+    Monitoring,
+    ApiSpec,
+    ModelCatalogue,
+    OpenRouterPricing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

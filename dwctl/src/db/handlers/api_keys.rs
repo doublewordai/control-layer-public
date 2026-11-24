@@ -2361,6 +2361,7 @@ mod tests {
                 default_models: None,
             }],
             model_provisioning: Default::default(),
+            service_accounts: Default::default(),
             migrations: Default::default(),
             metadata: crate::config::Metadata {
                 region: Some("Test Region".to_string()),

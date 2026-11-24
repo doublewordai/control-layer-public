@@ -6,7 +6,7 @@ use either::Either;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
-use sqlx::postgres::{PgListener, PgPool};
+use sqlx::postgres::PgPool;
 use sqlx::{
     Database, Describe, Error as SqlxError, Execute, Executor, Postgres, Transaction, pool,
 };
@@ -175,13 +175,6 @@ pub(crate) async fn begin_transaction_in_schema(
         .await?;
     }
     Ok(transaction)
-}
-
-pub(crate) async fn connect_listener(
-    pool: &PgPool,
-    retry_config: &DbRetryConfig,
-) -> Result<PgListener, SqlxError> {
-    retry_sqlx_pool_acquire(retry_config, || PgListener::connect_with(pool)).await
 }
 
 async fn retry_sqlx_pool_acquire<T, Op, Fut>(

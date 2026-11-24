@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
-use sqlx::postgres::{PgListener, PgPool};
+use sqlx::postgres::PgPool;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -466,14 +466,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
-    pub fn with_template_generation_writes(self, _enabled: bool) -> Self {
-        self
-    }
-
-    pub fn template_generation_writes_enabled(&self) -> bool {
-        true
-    }
-
     pub fn with_partition_maintenance_pool(mut self, pool: sqlx::PgPool) -> Result<Self> {
         if pool.options().get_max_connections() != 1 || pool.options().get_min_connections() != 0 {
             return Err(FusilladeError::ValidationError(
@@ -603,10 +595,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
         self.db_retry_config = config;
         self
-    }
-
-    pub fn set_db_retry_config(&mut self, config: crate::DbRetryConfig) {
-        self.db_retry_config = config;
     }
 
     pub fn db_retry_config(&self) -> &crate::DbRetryConfig {
@@ -987,10 +975,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
-    pub fn set_download_buffer_size(&mut self, buffer_size: usize) {
-        self.download_buffer_size = buffer_size;
-    }
-
     pub fn with_file_expiry(mut self, file_expiry: FileExpiry) -> Self {
         assert!(
             file_expiry.default > chrono::Duration::zero()
@@ -1062,19 +1046,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
-    pub fn set_batch_insert_strategy(&mut self, strategy: BatchInsertStrategy) {
-        match strategy {
-            BatchInsertStrategy::Batched { batch_size } => {
-                assert!(
-                    batch_size > 0,
-                    "batch_size must be greater than 0, got {}",
-                    batch_size
-                );
-            }
-        }
-        self.batch_insert_strategy = strategy;
-    }
-
     pub async fn mark_batch_failed(&self, batch_id: BatchId, error_message: &str) -> Result<()> {
         sqlx::query!(
             r#"
@@ -1099,12 +1070,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     pub fn pools(&self) -> &P {
         &self.pools
-    }
-
-    pub async fn create_listener(&self) -> Result<PgListener> {
-        crate::db::connect_listener(&self.pools.write(), &self.db_retry_config)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
     }
 }
 

@@ -18,6 +18,19 @@ pub enum Role {
     BatchAPIUser,
     BackgroundInferenceUser,
     ConnectionsUser,
+    QueueDemandReader,
+    CatalogueReader,
+    CatalogueReaderAll,
+    OpenRouterPriceManager,
+}
+
+impl Role {
+    pub fn is_service_role(&self) -> bool {
+        matches!(
+            self,
+            Role::QueueDemandReader | Role::CatalogueReader | Role::CatalogueReaderAll | Role::OpenRouterPriceManager
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -162,6 +175,7 @@ pub enum AuthMethod {
     ApiKey,
     PlatformApiKey,
     SystemApiKey,
+    ServiceApiKey,
     TrustedSso,
 }
 
@@ -197,16 +211,22 @@ pub struct UserOrganizationContext {
 impl CurrentUser {
     pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
         self.auth_method = method;
-        if method != AuthMethod::TrustedSso && !self.is_system() {
+        if self.is_system() {
+            return self;
+        }
+        if method == AuthMethod::ServiceApiKey {
+            self.is_admin = false;
+            self.roles.retain(Role::is_service_role);
+            return self;
+        }
+        self.roles.retain(|role| !role.is_service_role());
+        if method != AuthMethod::TrustedSso {
             self.is_admin = false;
             self.roles.retain(|role| match role {
                 Role::PlatformManager => method == AuthMethod::PlatformApiKey,
                 Role::BillingManager | Role::RequestViewer => false,
                 _ => true,
             });
-            if !self.roles.contains(&Role::StandardUser) {
-                self.roles.push(Role::StandardUser);
-            }
         }
         self
     }

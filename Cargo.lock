@@ -1965,6 +1965,7 @@ name = "dwctl"
 version = "17.6.0"
 dependencies = [
  "aes-gcm",
+ "ahash",
  "anyhow",
  "arc-swap",
  "argon2",
@@ -2008,6 +2009,7 @@ dependencies = [
  "hyper-util",
  "jemalloc_pprof",
  "jsonschema",
+ "jsonschema-regex",
  "jsonwebtoken 10.4.0",
  "lettre",
  "log",

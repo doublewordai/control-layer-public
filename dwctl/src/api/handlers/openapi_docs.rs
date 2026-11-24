@@ -35,12 +35,12 @@ fn scalar_html(title: &str) -> String {
 }
 
 #[tracing::instrument(skip_all)]
-pub async fn admin_openapi_json(_: RequiresPermission<resource::System, operation::ReadAll>) -> Json<utoipa::openapi::OpenApi> {
+pub async fn admin_openapi_json(_: RequiresPermission<resource::ApiSpec, operation::ReadAll>) -> Json<utoipa::openapi::OpenApi> {
     Json(AdminApiDoc::openapi())
 }
 
 #[tracing::instrument(skip_all)]
-pub async fn admin_openapi_docs(_: RequiresPermission<resource::System, operation::ReadAll>) -> Response {
+pub async fn admin_openapi_docs(_: RequiresPermission<resource::ApiSpec, operation::ReadAll>) -> Response {
     let scalar = Scalar::with_url("/admin/openapi.json", AdminApiDoc::openapi()).custom_html(scalar_html("Admin API"));
     Html(scalar.to_html()).into_response()
 }

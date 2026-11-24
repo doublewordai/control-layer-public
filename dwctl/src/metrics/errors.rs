@@ -33,6 +33,7 @@ pub mod component {
     pub const REALTIME_INFLIGHT: &str = "realtime_inflight";
     pub const API_KEY_USAGE: &str = "api_key_usage";
     pub const PENDING_SECRETS: &str = "pending_secrets";
+    pub const SERVICE_ACCOUNTS: &str = "service_accounts";
     pub const OPENROUTER_REFRESH: &str = "openrouter_refresh";
 }
 

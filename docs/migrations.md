@@ -215,20 +215,53 @@ never held across the whole table.
 
 ### Rollback floors
 
-A contract step sets the oldest release you can roll back to: any release
-before its expand step fails against the contracted schema.
+A contract step sets the oldest commit you can roll back to: any commit before
+that floor fails against the contracted schema. A floor is a commit hash, never
+a release version. "Older" means an ancestor on `main`, as `git merge-base
+--is-ancestor` decides.
 
-| from release | earliest safe rollback | why |
-|--------------|------------------------|-----|
-| 15.8.0 | 15.6.0 | `api_keys.secret_hash` must be non-NULL; releases before 15.6.0 create keys without it |
-| 16.5.0 | 16.3.0 | Keys created from 16.5.0 store a placeholder in `api_keys.secret`, and fusillade work stores no key: before 16.3.0 a one-off reveal can hand out the placeholder, and before 16.0.0 dispatch sends no credential |
-| 17.0.0 | 16.5.0 | `api_keys.secret` and Fusillade's stored `api_key` columns are dropped; releases before 16.5.0 read and write them |
+An additive migration does not move the floor. If the migration checker sorts
+your change as not additive, declare its floor in a header comment at the top
+of the file:
+
+```sql
+-- rollback-floor: 0123456789abcdef0123456789abcdef01234567
+-- rollback-floor-reason: contract drops api_keys.secret; earlier code reads it
+```
+
+If the migration also needs `-- no-transaction`, that marker must remain the
+file's first bytes, before the floor headers:
+
+```sql
+-- no-transaction
+-- rollback-floor: 0123456789abcdef0123456789abcdef01234567
+-- rollback-floor-reason: contract drops the old index
+```
+
+The commit must be an ancestor of the pull request's base. The check fails when
+the header is missing, the value is not a 40-character commit hash, the reason
+is missing, or the commit is not an ancestor of the base. The workflow prints
+the declared floor (or "unchanged" for additive migrations) in its job summary.
+The checker sorts forward migrations; `.down.sql` files are explicit rollback
+scripts and are not sorted.
+
+The historical floors, each stated as the commit that landed the contract step
+and the oldest commit that still works:
+
+| contract commit | earliest safe rollback | why |
+|-----------------|------------------------|-----|
+| `8329f2cf186729b482267ee029a5dbf8beed52fd` | `bbffbe53c064d15c0ce79cbbc525a46fe33f1e59` | `api_keys.secret` and Fusillade's stored `api_key` columns are dropped; code before `bbffbe53` reads and writes them |
+| `bbffbe53c064d15c0ce79cbbc525a46fe33f1e59` | `23cf6d9be675f4bb84443beeed5fe5b37a0bfa41` | Keys created from `bbffbe53` store a placeholder in `api_keys.secret`, and fusillade work stores no key: before `23cf6d9b` a one-off reveal can hand out the placeholder, and before `d6cfcc80` dispatch sends no credential |
+| `023df5c3d32ea5760cebde2dc521b679fb2181a1` | `45e838698f964d0ac269d401565e9ddb07050530` | `api_keys.secret_hash` must be non-NULL; code before `45e83869` creates keys without it |
 
 ## Checklist before opening a PR
 
 * `cargo test -p dwctl --lib migrations::` passes.
 * New `CONCURRENTLY` index → build, reindex and validate files with
   numbering room between them.
+* A not-additive migration has a `-- rollback-floor` and
+  `-- rollback-floor-reason` header whose commit is an ancestor of `main`;
+  the migration check workflow checks both.
 * The previous release can serve against the migrated schema (additive, or
   the expand half of an expand/contract).
 * `.github/scripts/test-fusillade-migration-checksums.py` (run by `just lint

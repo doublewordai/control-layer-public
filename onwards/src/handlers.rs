@@ -224,6 +224,7 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 pub struct ServedBy {
     pub url: String,
     pub onwards_model: Option<String>,
+    pub compute_pool: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +247,14 @@ fn resolve_trace_propagation(target: &Target, pool_trusted: bool) -> bool {
 fn withhold_trace_context(headers: &mut HeaderMap) {
     headers.remove("traceparent");
     headers.remove("tracestate");
+}
+
+const COMPUTE_POOL_HEADER: HeaderName = HeaderName::from_static("x-dynamo-compute-pool");
+
+fn read_compute_pool(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(COMPUTE_POOL_HEADER)?;
+    let trimmed = value.to_str().ok()?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
@@ -1197,6 +1206,8 @@ pub async fn target_message_handler<T: HttpClient>(
             Ok(response) => response,
         };
 
+        let compute_pool = read_compute_pool(response.headers());
+
         let status = response.status().as_u16();
         last_upstream_status = Some(status);
         attempt_upstream_status = Some(status);
@@ -1672,6 +1683,7 @@ pub async fn target_message_handler<T: HttpClient>(
         response.extensions_mut().insert(ServedBy {
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
+            compute_pool,
         });
         response.extensions_mut().insert(UpstreamFailureLabels {
             model: metric_model.clone(),
@@ -2798,6 +2810,43 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
         withhold_trace_context(&mut headers);
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn read_compute_pool_extracts_trimmed_value_and_preserves_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_bytes(b"X-Dynamo-Compute-Pool").unwrap(),
+            "  gpu-pool-a  ".parse().unwrap(),
+        );
+        headers.append(
+            HeaderName::from_static("x-dynamo-compute-pool"),
+            "second-value".parse().unwrap(),
+        );
+        headers.insert("x-request-id", "req-1".parse().unwrap());
+
+        assert_eq!(read_compute_pool(&headers).as_deref(), Some("gpu-pool-a"));
+        assert_eq!(
+            headers.get("x-dynamo-compute-pool").unwrap(),
+            "  gpu-pool-a  "
+        );
+        assert_eq!(headers.get_all("x-dynamo-compute-pool").iter().count(), 2);
+        assert_eq!(headers.get("x-request-id").unwrap(), "req-1");
+
+        headers.insert("x-dynamo-compute-pool", "   ".parse().unwrap());
+        assert_eq!(read_compute_pool(&headers), None);
+        assert!(headers.contains_key("x-dynamo-compute-pool"));
+
+        headers.insert(
+            "x-dynamo-compute-pool",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(read_compute_pool(&headers), None);
+        assert!(headers.contains_key("x-dynamo-compute-pool"));
+
+        headers.remove("x-dynamo-compute-pool");
+        assert_eq!(read_compute_pool(&headers), None);
         assert_eq!(headers.len(), 1);
     }
 }

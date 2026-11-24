@@ -5,12 +5,12 @@ version = "4.1.0"
 description = "PostgreSQL storage implementation for the Fusillade scheduling daemon"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/doublewordai/control-layer"
+publish = false
 include = [
     "/src/**",
     "/tests/**",
     "/migrations/**",
     "/.sqlx/**",
-    "/CHANGELOG.md",
 ]
 
 [lib]
@@ -18,7 +18,7 @@ name = "fusillade_arsenal"
 path = "src/lib.rs"
 
 [dependencies]
-fusillade-core = { version = "6.0.0", path = "../fusillade-core", features = ["sqlx-postgres"] }
+fusillade-core = { path = "../fusillade-core", features = ["sqlx-postgres"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"

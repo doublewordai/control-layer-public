@@ -1,7 +1,5 @@
 # Onwards
 
-[![Crates.io](https://img.shields.io/crates/v/onwards)](https://crates.io/crates/onwards)
-[![Documentation](https://docs.rs/onwards/badge.svg)](https://docs.rs/onwards)
 [![GitHub](https://img.shields.io/badge/GitHub-doublewordai%2Fcontrol--layer-blue)](https://github.com/doublewordai/control-layer/tree/main/onwards)
 
 A Rust-based AI Gateway that provides a unified interface for routing requests to OpenAI-compatible targets. The goal is to be as "transparent" as possible.

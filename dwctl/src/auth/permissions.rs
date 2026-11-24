@@ -157,6 +157,24 @@ pub mod resource {
             Resource::Connections
         }
     }
+
+    #[derive(Default)]
+    pub struct Monitoring;
+
+    impl From<Monitoring> for Resource {
+        fn from(_: Monitoring) -> Resource {
+            Resource::Monitoring
+        }
+    }
+
+    #[derive(Default)]
+    pub struct ApiSpec;
+
+    impl From<ApiSpec> for Resource {
+        fn from(_: ApiSpec) -> Resource {
+            Resource::ApiSpec
+        }
+    }
 }
 
 pub mod operation {
@@ -304,22 +322,32 @@ pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operati
         return false;
     }
     if user.auth_method != AuthMethod::TrustedSso {
-        return role_has_permission(&Role::StandardUser, resource, operation)
-            || user
-                .roles
-                .iter()
-                .filter(|role| match role {
-                    Role::PlatformManager => user.auth_method == AuthMethod::PlatformApiKey,
-                    Role::BillingManager | Role::RequestViewer => false,
-                    _ => true,
-                })
-                .any(|role| role_has_permission(role, resource, operation));
+        return user
+            .roles
+            .iter()
+            .filter(|role| role_counts_under(role, user.auth_method))
+            .any(|role| role_has_permission(role, resource, operation));
     }
     if user.is_admin {
         return true;
     }
 
-    user.roles.iter().any(|role| role_has_permission(role, resource, operation))
+    user.roles
+        .iter()
+        .filter(|role| role_counts_under(role, user.auth_method))
+        .any(|role| role_has_permission(role, resource, operation))
+}
+
+fn role_counts_under(role: &Role, method: AuthMethod) -> bool {
+    if role.is_service_role() || method == AuthMethod::ServiceApiKey {
+        return role.is_service_role() && method == AuthMethod::ServiceApiKey;
+    }
+    match (role, method) {
+        (_, AuthMethod::TrustedSso) => true,
+        (Role::PlatformManager, _) => method == AuthMethod::PlatformApiKey,
+        (Role::BillingManager | Role::RequestViewer, _) => false,
+        _ => true,
+    }
 }
 
 pub fn can_run_background_inference(user: &CurrentUser) -> bool {
@@ -387,6 +415,24 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
             )
         }
         Role::BackgroundInferenceUser => false,
+        Role::QueueDemandReader => matches!((resource, operation), (Resource::Monitoring, Operation::ReadAll)),
+        Role::CatalogueReader => matches!(
+            (resource, operation),
+            (Resource::Models, Operation::ReadOwn)
+                | (Resource::CompositeModels, Operation::ReadOwn)
+                | (Resource::ApiSpec, Operation::ReadAll)
+        ),
+        Role::CatalogueReaderAll => matches!(
+            (resource, operation),
+            (Resource::Models, Operation::ReadOwn)
+                | (Resource::CompositeModels, Operation::ReadOwn)
+                | (Resource::ApiSpec, Operation::ReadAll)
+                | (Resource::ModelCatalogue, Operation::ReadAll)
+        ),
+        Role::OpenRouterPriceManager => matches!(
+            (resource, operation),
+            (Resource::OpenRouterPricing, Operation::ReadAll) | (Resource::OpenRouterPricing, Operation::UpdateAll)
+        ),
         Role::ConnectionsUser => {
             matches!(
                 (resource, operation),
@@ -960,5 +1006,148 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         assert!(!can_manage_org_resource(&bob, org.id, &mut conn).await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod service_role_tests {
+    use super::*;
+    use crate::api::models::users::{AuthMethod, CurrentUser, Role};
+    use uuid::Uuid;
+
+    fn caller(roles: Vec<Role>, method: AuthMethod) -> CurrentUser {
+        CurrentUser {
+            auth_method: AuthMethod::TrustedSso,
+            id: Uuid::new_v4(),
+            username: "caller".to_string(),
+            email: "caller@example.com".to_string(),
+            is_admin: false,
+            roles,
+            display_name: None,
+            avatar_url: None,
+            payment_provider_id: None,
+            organizations: vec![],
+            active_organization: None,
+            api_key_id: Some(Uuid::new_v4()),
+        }
+        .with_auth_method(method)
+    }
+
+    const ALL_METHODS: [AuthMethod; 5] = [
+        AuthMethod::NativeSession,
+        AuthMethod::ApiKey,
+        AuthMethod::PlatformApiKey,
+        AuthMethod::ServiceApiKey,
+        AuthMethod::TrustedSso,
+    ];
+
+    #[test]
+    fn stored_roles_are_the_whole_grant_under_every_key() {
+        for method in [AuthMethod::NativeSession, AuthMethod::ApiKey, AuthMethod::PlatformApiKey] {
+            let user = caller(vec![Role::BatchAPIUser], method);
+            assert!(!user.roles.contains(&Role::StandardUser), "{method:?}");
+            assert!(!has_permission(&user, Resource::ApiKeys, Operation::CreateOwn), "{method:?}");
+            assert!(has_permission(&user, Resource::Batches, Operation::CreateOwn), "{method:?}");
+        }
+        let standard = caller(vec![Role::StandardUser], AuthMethod::ApiKey);
+        assert!(has_permission(&standard, Resource::ApiKeys, Operation::CreateOwn));
+    }
+
+    #[test]
+    fn service_roles_act_only_under_a_service_key() {
+        for role in [
+            Role::QueueDemandReader,
+            Role::CatalogueReader,
+            Role::CatalogueReaderAll,
+            Role::OpenRouterPriceManager,
+        ] {
+            for method in ALL_METHODS {
+                let user = caller(vec![role.clone()], method);
+                let kept = user.roles.contains(&role);
+                assert_eq!(kept, method == AuthMethod::ServiceApiKey, "{role:?} under {method:?}");
+            }
+        }
+        let demand = |method| {
+            has_permission(
+                &caller(vec![Role::QueueDemandReader], method),
+                Resource::Monitoring,
+                Operation::ReadAll,
+            )
+        };
+        assert!(demand(AuthMethod::ServiceApiKey));
+        for method in [
+            AuthMethod::NativeSession,
+            AuthMethod::ApiKey,
+            AuthMethod::PlatformApiKey,
+            AuthMethod::TrustedSso,
+        ] {
+            assert!(!demand(method), "{method:?}");
+        }
+    }
+
+    #[test]
+    fn a_service_key_carries_nothing_but_service_roles() {
+        let user = caller(
+            vec![
+                Role::QueueDemandReader,
+                Role::PlatformManager,
+                Role::StandardUser,
+                Role::BatchAPIUser,
+            ],
+            AuthMethod::ServiceApiKey,
+        );
+        assert_eq!(user.roles, vec![Role::QueueDemandReader]);
+        assert!(has_permission(&user, Resource::Monitoring, Operation::ReadAll));
+        for (resource, operation) in [
+            (Resource::System, Operation::ReadAll),
+            (Resource::Users, Operation::ReadAll),
+            (Resource::ApiKeys, Operation::CreateOwn),
+            (Resource::Models, Operation::ReadOwn),
+            (Resource::Pricing, Operation::ReadAll),
+            (Resource::Batches, Operation::CreateOwn),
+            (Resource::Organizations, Operation::CreateOwn),
+        ] {
+            assert!(!has_permission(&user, resource, operation), "{resource:?} {operation:?}");
+        }
+    }
+
+    #[test]
+    fn each_service_role_grants_only_its_capability() {
+        let svc = |role| caller(vec![role], AuthMethod::ServiceApiKey);
+
+        let reader = svc(Role::CatalogueReader);
+        assert!(has_permission(&reader, Resource::Models, Operation::ReadOwn));
+        assert!(has_permission(&reader, Resource::CompositeModels, Operation::ReadOwn));
+        assert!(has_permission(&reader, Resource::ApiSpec, Operation::ReadAll));
+        assert!(!has_permission(&reader, Resource::ModelCatalogue, Operation::ReadAll));
+        assert!(!has_permission(&reader, Resource::Models, Operation::ReadAll));
+
+        let all = svc(Role::CatalogueReaderAll);
+        assert!(has_permission(&all, Resource::ModelCatalogue, Operation::ReadAll));
+        assert!(!has_permission(&all, Resource::Models, Operation::ReadAll));
+        assert!(!has_permission(&all, Resource::Endpoints, Operation::ReadAll));
+
+        let prices = svc(Role::OpenRouterPriceManager);
+        assert!(has_permission(&prices, Resource::OpenRouterPricing, Operation::ReadAll));
+        assert!(has_permission(&prices, Resource::OpenRouterPricing, Operation::UpdateAll));
+        assert!(!has_permission(&prices, Resource::Pricing, Operation::ReadAll));
+        assert!(!has_permission(&prices, Resource::Pricing, Operation::UpdateAll));
+        assert!(!has_permission(&prices, Resource::Models, Operation::ReadOwn));
+    }
+
+    #[test]
+    fn platform_managers_keep_the_moved_endpoints() {
+        let pm = caller(vec![Role::StandardUser, Role::PlatformManager], AuthMethod::PlatformApiKey);
+        for resource in [
+            Resource::Monitoring,
+            Resource::ApiSpec,
+            Resource::ModelCatalogue,
+            Resource::OpenRouterPricing,
+        ] {
+            assert!(has_permission(&pm, resource, Operation::ReadAll), "{resource:?}");
+        }
+        let standard = caller(vec![Role::StandardUser], AuthMethod::PlatformApiKey);
+        assert!(!has_permission(&standard, Resource::Monitoring, Operation::ReadAll));
+        assert!(!has_permission(&standard, Resource::ApiSpec, Operation::ReadAll));
     }
 }

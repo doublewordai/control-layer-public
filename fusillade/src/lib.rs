@@ -16,8 +16,6 @@ pub use fusillade_core::error::{FusilladeError, Result};
 pub use fusillade_core::request::*;
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 #[cfg(feature = "postgres")]
-pub use manager::DaemonExecutor;
-#[cfg(feature = "postgres")]
 pub use manager::PostgresDaemon;
 pub use manager::{
     DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveCutoffs,

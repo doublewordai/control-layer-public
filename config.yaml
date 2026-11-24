@@ -204,6 +204,15 @@ metadata:
   docs_url: "https://doublewordai.github.io/control-layer/"
   docs_jsonl_url: "https://docs.doubleword.ai/batches/jsonl-files"
 
+# Service accounts: no-login accounts, each with one service role (QueueDemandReader,
+# CatalogueReader, CatalogueReaderAll or OpenRouterPriceManager) and the SHA-256 hashes
+# of its platform keys. dwctl applies the JSON file at startup and every
+# reconcile_interval; a missing, invalid or empty file changes nothing. See the
+# `service_accounts` module for the format.
+# service_accounts:
+#   file: /etc/dwctl/service-accounts.json
+#   reconcile_interval: 5m
+
 # Authentication configuration
 auth:
   # Native username/password authentication

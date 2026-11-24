@@ -7,7 +7,7 @@ use axum::{
     Json,
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderName, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -1114,16 +1114,59 @@ pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
         scrubbed |= obj.shift_remove("priority").is_some();
         if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
             scrubbed |= onwards::serving::scrub_router_targets(nvext);
-            if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
-                scrubbed |= hints.shift_remove("priority").is_some();
+            scrubbed |= nvext.shift_remove("agent_hints").is_some();
+            for key in NVEXT_WORKER_PIN_KEYS {
+                scrubbed |= nvext.shift_remove(key).is_some();
             }
             if let Some(routing) = nvext.get_mut("routing_constraints").and_then(|r| r.as_object_mut()) {
-                scrubbed |= routing.shift_remove("tolerations").is_some();
+                for key in ["tolerations", "required_taints", "preferred_taints"] {
+                    scrubbed |= routing.shift_remove(key).is_some();
+                }
             }
             scrubbed |= onwards::serving::scrub_billing(nvext);
         }
     }
     scrubbed
+}
+
+const NVEXT_WORKER_PIN_KEYS: [&str; 5] = [
+    "backend_instance_id",
+    "decode_worker_id",
+    "prefill_worker_id",
+    "dp_rank",
+    "prefill_dp_rank",
+];
+
+const DYNAMO_HEADER_PREFIX: &str = "x-dynamo-";
+
+const DYNAMO_HEADER_ALIASES: [&str; 5] = [
+    "x-worker-instance-id",
+    "x-prefill-instance-id",
+    "x-dp-rank",
+    "x-data-parallel-rank",
+    "x-prefill-dp-rank",
+];
+
+fn is_dynamo_header(name: &HeaderName) -> bool {
+    name.as_str().starts_with(DYNAMO_HEADER_PREFIX) || DYNAMO_HEADER_ALIASES.contains(&name.as_str())
+}
+
+pub(crate) fn strip_dynamo_headers(headers: &mut HeaderMap, keep: &[HeaderName]) {
+    let dynamo_headers: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| is_dynamo_header(name) && !keep.contains(name))
+        .cloned()
+        .collect();
+    for name in dynamo_headers {
+        headers.remove(name);
+    }
+}
+
+pub async fn strip_dynamo_headers_middleware(mut req: Request<Body>, next: Next) -> Response {
+    strip_dynamo_headers(req.headers_mut(), &[]);
+    let mut resp = next.run(req).await;
+    strip_dynamo_headers(resp.headers_mut(), &[]);
+    resp
 }
 
 pub(crate) fn pinned_tolerations(
@@ -1211,6 +1254,147 @@ mod tests {
     }
 
     #[test]
+    fn strip_dynamo_headers_removes_every_dynamo_header() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("X-Dynamo-Request-Priority", "2147483647"),
+            ("x-dynamo-request-strict-priority", "1000"),
+            ("x-dynamo-worker-instance-id", "7"),
+            ("x-dynamo-some-future-header", "1"),
+            ("X-Worker-Instance-Id", "7"),
+            ("x-data-parallel-rank", "0"),
+            ("x-request-id", "keep-me"),
+            ("x-dynamo", "not-the-prefix"),
+        ] {
+            headers.insert(HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+        }
+
+        strip_dynamo_headers(&mut headers, &[]);
+
+        let mut remaining: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+        remaining.sort();
+        assert_eq!(remaining, ["x-dynamo", "x-request-id"]);
+    }
+
+    #[test]
+    fn strip_dynamo_headers_retains_only_the_kept_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-dynamo-worker-instance-id", "7".parse().unwrap());
+        headers.insert("x-dynamo-request-priority", "2147483647".parse().unwrap());
+
+        strip_dynamo_headers(&mut headers, &[HeaderName::from_static("x-dynamo-worker-instance-id")]);
+
+        assert_eq!(headers.get("x-dynamo-worker-instance-id").unwrap(), "7");
+        assert!(headers.get("x-dynamo-request-priority").is_none());
+    }
+
+    #[tokio::test]
+    async fn strip_dynamo_headers_middleware_strips_inbound_and_outbound_headers() {
+        use axum::Router;
+        use axum::middleware;
+        use axum::routing::post;
+        use std::sync::Mutex;
+        use tower::ServiceExt;
+
+        let captured_compute_pools: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_inner = captured_compute_pools.clone();
+
+        let inner_observer = middleware::from_fn(move |req: Request<Body>, next: Next| {
+            let captured = captured_for_inner.clone();
+            async move {
+                let resp = next.run(req).await;
+                let pool = resp.extensions().get::<onwards::ServedBy>().and_then(|s| s.compute_pool.clone());
+                captured.lock().unwrap().push(pool);
+                resp
+            }
+        });
+
+        let app = Router::new()
+            .route(
+                "/unary",
+                post(|req: Request<Body>| async move {
+                    assert!(req.headers().get("x-dynamo-request-priority").is_none());
+                    assert_eq!(req.headers().get("x-request-id").unwrap(), "req-unary");
+                    let mut resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("X-Dynamo-Compute-Pool", "gpu-pool-a")
+                        .header("x-dynamo-internal-debug", "secret")
+                        .header("x-other-upstream", "preserved")
+                        .body(Body::from(r#"{"ok":true}"#))
+                        .unwrap();
+                    resp.extensions_mut().insert(onwards::ServedBy {
+                        url: "http://upstream".to_string(),
+                        onwards_model: None,
+                        compute_pool: Some("gpu-pool-a".to_string()),
+                    });
+                    resp
+                }),
+            )
+            .route(
+                "/stream",
+                post(|req: Request<Body>| async move {
+                    assert!(req.headers().get("x-worker-instance-id").is_none());
+                    let mut resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/event-stream")
+                        .header("x-dynamo-compute-pool", "spot-pool-1")
+                        .header("x-other-upstream", "preserved-sse")
+                        .body(Body::from("data: [DONE]\n\n"))
+                        .unwrap();
+                    resp.extensions_mut().insert(onwards::ServedBy {
+                        url: "http://upstream".to_string(),
+                        onwards_model: None,
+                        compute_pool: Some("spot-pool-1".to_string()),
+                    });
+                    resp
+                }),
+            )
+            .layer(inner_observer)
+            .layer(middleware::from_fn(strip_dynamo_headers_middleware));
+
+        let unary_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/unary")
+                    .header("x-dynamo-request-priority", "999")
+                    .header("x-request-id", "req-unary")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unary_resp.status(), StatusCode::OK);
+        assert!(unary_resp.headers().get("x-dynamo-compute-pool").is_none());
+        assert!(unary_resp.headers().get("x-dynamo-internal-debug").is_none());
+        assert_eq!(unary_resp.headers().get("x-other-upstream").unwrap(), "preserved");
+        assert_eq!(unary_resp.headers().get("content-type").unwrap(), "application/json");
+
+        let sse_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/stream")
+                    .header("x-worker-instance-id", "42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(sse_resp.headers().get("x-dynamo-compute-pool").is_none());
+        assert_eq!(sse_resp.headers().get("x-other-upstream").unwrap(), "preserved-sse");
+        assert_eq!(sse_resp.headers().get("content-type").unwrap(), "text/event-stream");
+
+        assert_eq!(
+            *captured_compute_pools.lock().unwrap(),
+            vec![Some("gpu-pool-a".to_string()), Some("spot-pool-1".to_string())]
+        );
+    }
+
+    #[test]
     fn strip_scheduling_priority_removes_only_the_top_level_field() {
         let mut body = serde_json::json!({
             "model": "m", "priority": 900,
@@ -1227,11 +1411,10 @@ mod tests {
 
         let mut body = serde_json::json!({
             "model": "m",
-            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "osl": 8}}
         });
         assert!(strip_scheduling_priority(&mut body), "the nvext carrier counts too");
-        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
-        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert!(body["nvext"].get("agent_hints").is_none());
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
         let mut clean = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
@@ -1273,6 +1456,28 @@ mod tests {
 
         let mut clean = serde_json::json!({"model": "m", "nvext": {"routing_constraints": {"region": "eu"}}});
         assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_worker_pins_and_taints() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {
+                "backend_instance_id": 7, "decode_worker_id": 7, "prefill_worker_id": 8,
+                "dp_rank": 0, "prefill_dp_rank": 1,
+                "agent_hints": {"strict_priority": 1000, "latency_sensitivity": 1e9, "speculative_prefill": true},
+                "routing_constraints": {"required_taints": ["mirror"], "preferred_taints": {"mirror": 1.0}, "region": "eu"},
+                "cache_control": {"enabled": true}
+            }
+        });
+        assert!(strip_scheduling_priority(&mut body));
+        assert_eq!(
+            body["nvext"],
+            serde_json::json!({
+                "routing_constraints": {"region": "eu"},
+                "cache_control": {"enabled": true}
+            })
+        );
     }
 
     #[test]

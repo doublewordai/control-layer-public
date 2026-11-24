@@ -26,7 +26,7 @@ use crate::{
     },
     errors::{Error, Result},
     reasoning::ReasoningTranslationOverrides,
-    types::{DeploymentId, InferenceEndpointId, Resource},
+    types::{DeploymentId, InferenceEndpointId, Operation, Resource},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -282,6 +282,13 @@ pub async fn list_deployed_models<P: PoolProvider>(
 ) -> Result<Json<ModelListResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
     let can_read_all_models = can_read_all_resources(&current_user, Resource::Models);
+    if !can_read_all_models && !has_permission(&current_user, Resource::Models, Operation::ReadOwn) {
+        return Err(Error::InsufficientPermissions {
+            required: crate::types::Permission::Allow(Resource::Models, Operation::ReadOwn),
+            action: Operation::ReadOwn,
+            resource: "models".to_string(),
+        });
+    }
     let can_read_groups = can_read_all_resources(&current_user, Resource::Groups);
     let can_read_users = can_read_all_resources(&current_user, Resource::Users);
     let can_read_pricing = can_read_all_resources(&current_user, Resource::Pricing);
@@ -350,7 +357,8 @@ pub async fn list_deployed_models<P: PoolProvider>(
         filter = filter.with_statuses(vec![ModelStatus::Active]);
     };
 
-    if !can_read_all_models || query.accessible.unwrap_or(false) {
+    let can_list_every_model = can_read_all_models || has_permission(&current_user, Resource::ModelCatalogue, Operation::ReadAll);
+    if !can_list_every_model || query.accessible.unwrap_or(false) {
         let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
         filter = filter.with_accessible_to(target_user_id);
     }

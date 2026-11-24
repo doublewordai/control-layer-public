@@ -24,16 +24,6 @@ async fn get_batch_api_key_id(pool: &PgPool, user_id: Uuid) -> Uuid {
         .expect("Failed to get batch API key")
 }
 
-async fn get_realtime_api_key(pool: &PgPool, user_id: Uuid) -> String {
-    let mut conn = pool.acquire().await.expect("Failed to acquire connection");
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let id = api_keys_repo
-        .get_or_create_hidden_key(user_id, ApiKeyPurpose::Realtime, user_id)
-        .await
-        .expect("Failed to get realtime API key");
-    crate::test::utils::bearer_for_key(pool, id).await
-}
-
 #[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_route_at_claim_time_escalation(pool: PgPool) {
@@ -44,9 +34,8 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
 
     let batch_key_id = get_batch_api_key_id(&pool, user.id).await;
-    let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
-    tracing::info!("✅ Created batch and realtime API keys for user");
+    tracing::info!("✅ Created batch API key for user");
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -318,7 +307,6 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
 
     let batch_key_id = get_batch_api_key_id(&pool, user.id).await;
-    let _user_realtime_api_key = get_realtime_api_key(&pool, user.id).await;
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))

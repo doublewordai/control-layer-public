@@ -196,6 +196,42 @@ async fn overlay_targets_survive_strict_and_translated_ingress(pool: PgPool) {
 }
 
 #[dwctl_test_macros::test]
+async fn dynamo_routing_overrides_never_reach_the_upstream(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    for (sent, path) in ["chat/completions", "responses", "messages", "completions"].into_iter().enumerate() {
+        let sent = sent + 1;
+        let mut body = match path {
+            "responses" => json!({"model":"policy","input":"hi","max_output_tokens":16}),
+            "completions" => json!({"model":"policy","prompt":"hi","max_tokens":16}),
+            _ => json!({"model":"policy","messages":[{"role":"user","content":"hi"}],"max_tokens":16}),
+        };
+        body["nvext"] = json!({"backend_instance_id": 7, "agent_hints": {"strict_priority": 1000}});
+        f.server
+            .post(&format!("/ai/v1/{path}"))
+            .add_header("Authorization", format!("Bearer {}", f.key))
+            .add_header("x-dynamo-request-priority", "2147483647")
+            .add_header("x-dynamo-request-strict-priority", "1000")
+            .add_header("x-dynamo-worker-instance-id", "7")
+            .add_header("x-worker-instance-id", "7")
+            .json(&body)
+            .await
+            .assert_status_ok();
+        let requests = f.upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), sent, "{path}: one upstream request per call");
+        let forwarded = requests.last().unwrap();
+        let dynamo_headers: Vec<_> = forwarded
+            .headers
+            .keys()
+            .filter(|name| name.as_str().starts_with("x-dynamo-") || name.as_str() == "x-worker-instance-id")
+            .collect();
+        assert!(dynamo_headers.is_empty(), "{path}: forwarded {dynamo_headers:?}");
+        let nvext = &forwarded.body_json::<Value>().unwrap()["nvext"];
+        assert!(nvext.get("backend_instance_id").is_none(), "{path}: forwarded {nvext}");
+        assert!(nvext["agent_hints"].get("strict_priority").is_none(), "{path}: forwarded {nvext}");
+    }
+}
+
+#[dwctl_test_macros::test]
 async fn realtime_class_suffixes_are_not_parsed(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for model in ["policy:interactive", "policy:standard", "policy:throughput:interactive"] {
