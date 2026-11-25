@@ -3348,10 +3348,31 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     let analytics_writer = if config.enable_analytics {
         let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
-        let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
+        let mut batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
+
+        let routing_sink_shutdown = tokio_util::sync::CancellationToken::new();
+        if config.request_routing.enabled {
+            let ch_config = config
+                .clickhouse
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("request_routing.enabled requires a clickhouse section"))?;
+            let client = crate::clickhouse::ClickHouseClient::from_config(ch_config)?;
+            let (sink_handle, sink) = crate::clickhouse::ClickHouseSink::<request_logging::routing::RequestRoutingRow>::new(
+                client,
+                request_logging::routing::sink_options(),
+            )?;
+            let sink_shutdown = routing_sink_shutdown.clone();
+            background_tasks.spawn("request-routing-sink", async move {
+                sink.run(sink_shutdown).await;
+                Ok(())
+            });
+            batcher = batcher.with_routing_sink(sink_handle);
+            info!("Request routing records enabled");
+        }
 
         let batcher_shutdown = shutdown_token.clone();
         background_tasks.spawn("analytics-batcher", async move {
+            let _stop_routing_sink = routing_sink_shutdown.drop_guard();
             batcher.run(batcher_shutdown).await;
             Ok(())
         });

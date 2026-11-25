@@ -768,7 +768,8 @@ cache:
 # completions pool, splicing the result into the client's still-open stream with
 # merged billing. Per-model activation is DATA, not config: a model rescues only
 # when its composite carries a completions pool with an enabled member.
-# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain.
+# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain and
+# request_routing.
 # clickhouse:
 #   endpoint_url: "https://<service>.<region>.aws.clickhouse.cloud:8443"
 #   database: "clay"
@@ -781,6 +782,14 @@ prefix_chain:
   enabled: false
   models: null # null: every model; a non-empty list: exactly those aliases
   hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
+
+# Routing record: per request, the alias sent and the served model, serving class,
+# upstream (served_by) and compute pool dwctl resolved it to, written to ClickHouse
+# (clay.request_routing) by the analytics projector, one row per http_analytics row.
+# Requires the clickhouse section and enable_analytics. Enable only once the table
+# exists and the writer holds INSERT on it, or every batch is dropped.
+request_routing:
+  enabled: false
 
 # Reference cache: for chat requests (Chat Completions, and Messages and Responses
 # after translation), estimates how many prompt tokens an ideal per-principal prefix

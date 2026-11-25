@@ -94,6 +94,8 @@ pub struct Config {
     #[serde(default)]
     pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
     #[serde(default)]
+    pub request_routing: crate::request_logging::routing::RequestRoutingConfig,
+    #[serde(default)]
     pub reference_cache: crate::reference_cache::ReferenceCacheConfig,
     #[serde(default)]
     pub continuation: ContinuationConfig,
@@ -2276,6 +2278,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+            request_routing: crate::request_logging::routing::RequestRoutingConfig::default(),
             reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
             continuation: ContinuationConfig::default(),
             heap_profiling: crate::profiling::HeapProfilingConfig::default(),
@@ -2793,6 +2796,11 @@ impl Config {
         }
 
         if let Err(e) = self.prefix_chain.validate(self.clickhouse.as_ref(), &self.cache.tokenizer_url) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
+        if let Err(e) = self.request_routing.validate(self.clickhouse.as_ref(), self.enable_analytics) {
             return Err(Error::Internal {
                 operation: format!("Config validation: {e}"),
             });

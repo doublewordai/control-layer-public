@@ -1,6 +1,7 @@
 
 use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
+use crate::clickhouse::SinkHandle;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
@@ -8,6 +9,7 @@ use crate::pricing::{
     CacheTariffRow, ModelInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
     parse_api_key_purpose, resolve_cache_multipliers,
 };
+use crate::request_logging::routing::RequestRoutingRow;
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
@@ -192,6 +194,7 @@ where
     batch_size: usize,
     projector_notify: Arc<Notify>,
     usage_refresh_notify: Option<Arc<Notify>>,
+    routing_sink: Option<SinkHandle<RequestRoutingRow>>,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -209,6 +212,7 @@ where
             batch_size,
             projector_notify: projector_notify.clone(),
             usage_refresh_notify: None,
+            routing_sink: None,
         };
 
         let writer = AnalyticsOutboxWriter {
@@ -221,6 +225,12 @@ where
     #[must_use]
     pub fn with_usage_refresh_notify(mut self, notify: Arc<Notify>) -> Self {
         self.usage_refresh_notify = Some(notify);
+        self
+    }
+
+    #[must_use]
+    pub fn with_routing_sink(mut self, sink: SinkHandle<RequestRoutingRow>) -> Self {
+        self.routing_sink = Some(sink);
         self
     }
 
@@ -322,7 +332,7 @@ where
 
         records.extend(self.enrich_batch(&mut tx, &raw_records).await?);
 
-        self.write_batch_in_transaction(&mut tx, &records).await?;
+        let analytics_ids = self.write_batch_in_transaction(&mut tx, &records).await?;
         sqlx::query("DELETE FROM analytics_outbox WHERE id = ANY($1)")
             .bind(&ids)
             .execute(&mut *tx)
@@ -331,6 +341,12 @@ where
 
         if let Some(notify) = &self.usage_refresh_notify {
             notify.notify_one();
+        }
+
+        if let Some(sink) = &self.routing_sink {
+            for row in routing_rows(&records, &analytics_ids) {
+                sink.send(row);
+            }
         }
 
         let now = Utc::now();
@@ -654,7 +670,7 @@ where
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         records: &[EnrichedRecord],
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<HashMap<(Uuid, i64), i64>, sqlx::Error> {
         let (analytics_ids, newly_inserted) = self.batch_insert_analytics(tx, records).await?;
 
         let duplicates = self.batch_insert_credits(tx, records, &analytics_ids, &newly_inserted).await?;
@@ -662,7 +678,7 @@ where
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
         }
-        Ok(())
+        Ok(analytics_ids)
     }
 
     async fn batch_insert_analytics(
@@ -1474,6 +1490,26 @@ where
     }
 }
 
+fn routing_rows(records: &[EnrichedRecord], analytics_ids: &HashMap<(Uuid, i64), i64>) -> Vec<RequestRoutingRow> {
+    records
+        .iter()
+        .filter_map(|record| {
+            let raw = &record.raw;
+            let &analytics_id = analytics_ids.get(&(raw.instance_id, raw.correlation_id))?;
+            Some(RequestRoutingRow {
+                analytics_id,
+                x_request_id: raw.x_request_id,
+                timestamp: raw.timestamp,
+                model: raw.request_model.clone().unwrap_or_default(),
+                served_model: raw.served_model.clone(),
+                resolved_serving_class: raw.resolved_serving_class.clone(),
+                served_by: raw.served_by.clone(),
+                compute_pool: raw.compute_pool.clone(),
+            })
+        })
+        .collect()
+}
+
 fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_batch_id: Option<Uuid>) -> &'static str {
     match (api_key_purpose, fusillade_batch_id) {
         (_, Some(_)) => "fusillade",
@@ -2076,6 +2112,51 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(stored, record.x_request_id);
+    }
+
+    #[dwctl_test_macros::test]
+    async fn projector_emits_one_routing_record_per_inserted_row(pool: sqlx::PgPool) {
+        create_test_model(&pool, "routed-alias").await;
+        let config = crate::test::utils::create_test_config();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let batcher = batcher.with_routing_sink(SinkHandle::for_test(tx, "request_routing"));
+
+        let mut record = create_raw_record("routed-alias", None, 10, 5);
+        record.x_request_id = Some(Uuid::now_v7());
+        record.served_model = Some("component-model".to_string());
+        record.served_by = Some("http://upstream.test/v1".to_string());
+        record.resolved_serving_class = Some("standard".to_string());
+        record.compute_pool = Some("pool-a".to_string());
+        writer.publish(record.clone()).await.unwrap();
+        assert!(rx.try_recv().is_err(), "nothing is emitted before projection");
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+
+        let (id, model): (i64, Option<String>) = sqlx::query_as("SELECT id, model FROM http_analytics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            RequestRoutingRow {
+                analytics_id: id,
+                x_request_id: record.x_request_id,
+                timestamp: record.timestamp,
+                model: model.unwrap(),
+                served_model: Some("component-model".to_string()),
+                resolved_serving_class: Some("standard".to_string()),
+                served_by: Some("http://upstream.test/v1".to_string()),
+                compute_pool: Some("pool-a".to_string()),
+            }
+        );
+
+        let fresh = create_raw_record("routed-alias", None, 1, 1);
+        writer.publish(record).await.unwrap();
+        writer.publish(fresh.clone()).await.unwrap();
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 2);
+        let emitted = rx.try_recv().unwrap();
+        assert_eq!((emitted.timestamp, emitted.served_model), (fresh.timestamp, None));
+        assert!(rx.try_recv().is_err(), "the duplicate receipt emits no record");
     }
 
     #[dwctl_test_macros::test]

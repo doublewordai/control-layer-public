@@ -268,6 +268,7 @@ pub fn create_test_config() -> crate::config::Config {
         database_pooled_url: None,
         clickhouse: None,
         prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+        request_routing: crate::request_logging::routing::RequestRoutingConfig::default(),
         reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
         scheduling: Default::default(),
         database_url: None,

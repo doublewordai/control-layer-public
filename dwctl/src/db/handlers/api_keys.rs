@@ -2393,6 +2393,7 @@ mod tests {
             cache: Default::default(),
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
+            request_routing: crate::request_logging::routing::RequestRoutingConfig::default(),
             reference_cache: crate::reference_cache::ReferenceCacheConfig::default(),
             continuation: Default::default(),
             heap_profiling: Default::default(),
