@@ -9,7 +9,9 @@ use crate::{
     api::models::users::{AuthMethod, CurrentUser, Role},
     crypto::{generate_api_key, hash_api_key},
     service_accounts::{apply, parse},
-    test::utils::{add_deployment_to_group, create_test_admin_user, create_test_app, create_test_config, create_test_deployment},
+    test::utils::{
+        add_deployment_to_group, create_test_admin_user, create_test_app, create_test_config, create_test_deployment, create_test_user,
+    },
 };
 
 async fn service_accounts(pool: &PgPool, roles: &[&str]) -> Vec<(Uuid, String)> {
@@ -160,12 +162,36 @@ async fn only_a_service_account_s_own_platform_key_authenticates_it(pool: PgPool
 async fn service_roles_cannot_be_assigned_through_the_users_api(pool: PgPool) {
     let (server, _bg) = create_test_app(pool.clone(), false).await;
     let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
-    let mut request = server.post("/admin/api/v1/users").json(&json!({
-        "username": "someone", "email": "someone@example.com", "roles": ["StandardUser", "QueueDemandReader"],
-    }));
-    for (name, value) in crate::test::utils::add_auth_headers(&admin) {
-        request = request.add_header(name, value);
+    let target = create_test_user(&pool, Role::StandardUser).await;
+
+    for service_role in [
+        "QueueDemandReader",
+        "CatalogueReader",
+        "CatalogueReaderAll",
+        "OpenRouterPriceManager",
+    ] {
+        let mut request = server.post("/admin/api/v1/users").json(&json!({
+            "username": format!("someone-{service_role}"),
+            "email": format!("{service_role}@example.com"),
+            "roles": ["StandardUser", service_role],
+        }));
+        for (name, value) in crate::test::utils::add_auth_headers(&admin) {
+            request = request.add_header(name, value);
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::BAD_REQUEST);
+        assert!(
+            response.text().contains("service roles are granted only to service accounts"),
+            "POST /users with {service_role} should say why it is refused: {}",
+            response.text()
+        );
+
+        let mut request = server
+            .patch(&format!("/admin/api/v1/users/{}", target.id))
+            .json(&json!({ "roles": [service_role] }));
+        for (name, value) in crate::test::utils::add_auth_headers(&target) {
+            request = request.add_header(name, value);
+        }
+        request.await.assert_status(StatusCode::BAD_REQUEST);
     }
-    let status = request.await.status_code();
-    assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN, "{status}");
 }

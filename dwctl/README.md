@@ -269,6 +269,31 @@ migrations, concurrent indexes and destructive changes.
 - Management API requests are served under `/admin/api/v1/*`
 - Provider display configs (operator-set logos / display names for inference providers) live under `/admin/api/v1/provider-display-configs`, with `GET .../{provider_key}/icon` serving as a same-origin proxy for operator-set icon URLs so the dashboard can keep a tight `img-src` CSP regardless of which CDN an admin pastes
 
+### Committed public API descriptions
+
+`dwctl/openapi/admin.json` and `dwctl/openapi/ai.json` are generated from the
+same `utoipa` types the server serves. Run `just openapi` after changing a
+route, handler or schema, and commit the result. The `openapi_freshness` test
+fails when the committed files are stale.
+
+These files are not published to the public repository. `.github/export/copy.bara.sky`
+excludes `dwctl/openapi/**` and `dwctl/tests/openapi_freshness.rs` because the
+generated JSON keeps doc comments as description text and `strip_comments.py`
+only removes comments from source files.
+
+On a pull request that changes `dwctl/src/` or `dwctl/openapi/`, the
+`api / compatibility` job compares the committed documents with the merge base
+using oasdiff. A breaking change fails the job unless the pull request title
+marks it with `!` in the conventional-commit type (for example
+`feat(api)!: ...`).
+
+Set the repository Actions variable `API_COMPAT_DISABLED` to `true` to turn the
+check off while it is being repaired. The job still runs and reports success,
+but skips the oasdiff install, the rule tests and the comparison, and writes
+that it is turned off to the log and job summary. Any other value, or leaving
+the variable unset, keeps the check active. A repository admin sets it under
+Settings > Secrets and variables > Actions > Variables.
+
 ## First-token metrics
 
 The embedded onwards proxy records `onwards_first_token_seconds` and

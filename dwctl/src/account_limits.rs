@@ -49,6 +49,8 @@ pub struct AccountDocument {
     #[serde(default)]
     pub priority: Option<i32>,
     #[serde(default)]
+    pub capacity_refusal_status: Option<u16>,
+    #[serde(default)]
     pub realtime_inflight: BTreeMap<String, i32>,
     #[serde(default)]
     pub models: BTreeMap<String, AccountModelPolicy>,
@@ -266,9 +268,18 @@ impl AccountLimitsCatalog {
                 bail!("{source}: account {account:?} is also declared in {previous}");
             }
             ensure!(
-                document.priority.is_some() || !document.realtime_inflight.is_empty() || !document.models.is_empty(),
-                "{source}: account {account:?} declares nothing; set `priority`, `models` or `realtime_inflight`"
+                document.priority.is_some()
+                    || document.capacity_refusal_status.is_some()
+                    || !document.realtime_inflight.is_empty()
+                    || !document.models.is_empty(),
+                "{source}: account {account:?} declares nothing; set `priority`, `capacity_refusal_status`, `models` or `realtime_inflight`"
             );
+            if let Some(status) = document.capacity_refusal_status {
+                ensure!(
+                    status == 429 || status == 529,
+                    "{source}: account {account:?} capacity_refusal_status must be 429 or 529, got {status}"
+                );
+            }
             validate_priority(document.priority, &format!("{source}: account {account:?}"))?;
             for (alias, limit) in &document.realtime_inflight {
                 ensure!(*limit > 0, "{source}: realtime_inflight limit on {alias:?} must be positive");
@@ -805,6 +816,23 @@ async fn resolve_accounts(db: &mut PgConnection, catalog: &AccountLimitsCatalog)
     Ok(resolved)
 }
 
+pub async fn capacity_refusal_statuses(pool: &PgPool, catalog: &AccountLimitsCatalog) -> Result<HashMap<Uuid, u16>> {
+    let declared: Vec<(&str, u16)> = catalog
+        .files
+        .iter()
+        .filter_map(|file| {
+            let status = file.document.capacity_refusal_status.filter(|status| *status != 529)?;
+            Some((file.document.account.as_str(), status))
+        })
+        .collect();
+    if declared.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut db = pool.acquire().await.context("acquire connection for capacity refusal statuses")?;
+    let accounts = resolve_accounts(&mut db, catalog).await?;
+    Ok(declared.into_iter().map(|(account, status)| (accounts[account], status)).collect())
+}
+
 async fn resolve_models(db: &mut PgConnection, catalog: &AccountLimitsCatalog) -> Result<HashMap<String, Uuid>> {
     let aliases: Vec<String> = catalog
         .files
@@ -919,6 +947,10 @@ mod tests {
             (vec![("a.yaml", "account: acme\nrealtime:\n  org/model: 10\n")], "unknown field"),
             (vec![("a.yaml", "account: acme\n")], "declares nothing"),
             (
+                vec![("a.yaml", "account: acme\ncapacity_refusal_status: 503\n")],
+                "must be 429 or 529",
+            ),
+            (
                 vec![("a.yaml", "account: acme\nrealtime_inflight:\n  org/model: 10\n  org/model: 20\n")],
                 "duplicate entry",
             ),
@@ -937,6 +969,29 @@ mod tests {
             let error = format!("{:#}", AccountLimitsCatalog::load(directory.path()).unwrap_err());
             assert!(error.contains(diagnostic), "{error}");
         }
+    }
+
+    #[test]
+    fn a_capacity_refusal_status_alone_is_a_declaration() {
+        let directory = tempdir().unwrap();
+        write(directory.path(), "a.yaml", "account: acme\ncapacity_refusal_status: 429\n");
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+        assert_eq!(catalog.files[0].document.capacity_refusal_status, Some(429));
+    }
+
+    #[dwctl_test_macros::test]
+    async fn capacity_refusal_statuses_are_keyed_by_account_id_and_omit_the_default(pool: PgPool) {
+        let acme = insert_account(&pool, "acme", "organization").await;
+        insert_account(&pool, "bob", "individual").await;
+        insert_account(&pool, "carol", "individual").await;
+        let directory = tempdir().unwrap();
+        write(directory.path(), "acme.yaml", "account: acme\ncapacity_refusal_status: 429\n");
+        write(directory.path(), "bob.yaml", "account: bob\ncapacity_refusal_status: 529\n");
+        write(directory.path(), "carol.yaml", "account: carol\npriority: 10\n");
+        let catalog = AccountLimitsCatalog::load(directory.path()).unwrap();
+
+        let statuses = capacity_refusal_statuses(&pool, &catalog).await.unwrap();
+        assert_eq!(statuses, HashMap::from([(acme, 429)]));
     }
 
     #[dwctl_test_macros::test]

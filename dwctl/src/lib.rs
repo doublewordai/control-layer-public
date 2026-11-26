@@ -30,7 +30,7 @@ pub mod migrations;
 pub mod modalities;
 pub mod model_provisioning;
 mod notifications;
-mod openapi;
+pub mod openapi;
 pub mod openrouter;
 pub mod org_overlays;
 mod payment_providers;
@@ -1945,6 +1945,25 @@ pub async fn build_router(
         sqlx_pool_router::DynPools::new(state.db.clone()),
         error_enrichment::error_enrichment_middleware,
     ));
+
+    let onwards_router = {
+        let provisioning = &state.current_config().model_provisioning;
+        let statuses = if provisioning.enabled {
+            let catalog = account_limits::AccountLimitsCatalog::load(&provisioning.account_limits_directory)?;
+            account_limits::capacity_refusal_statuses(&state.db.write(), &catalog).await?
+        } else {
+            std::collections::HashMap::new()
+        };
+        let statuses = crate::inference::capacity_refusal::CapacityRefusalStatuses::new(statuses);
+        if statuses.is_empty() {
+            onwards_router
+        } else {
+            onwards_router.layer(middleware::from_fn_with_state(
+                statuses,
+                crate::inference::capacity_refusal::capacity_refusal_status_middleware,
+            ))
+        }
+    };
 
     let onwards_router = {
         let cfg = state.current_config();

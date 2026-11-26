@@ -495,6 +495,7 @@ organisation owns. One file per account, mounted at
 ```yaml
 account: acme
 priority: 100                     # optional; default for every model
+capacity_refusal_status: 429      # optional; 529 by default
 models:
   example/chat-model:
     priority: 300                 # optional; overrides the account default
@@ -556,6 +557,15 @@ Rules:
   requests, and to batch lines by each line's model. A preset id the
   deployment does not configure is logged at startup and fails closed to the
   empty (most restrictive) list.
+- `capacity_refusal_status` (account-wide, `429` or `529`, default `529`) is the
+  status the account's realtime requests receive when the platform refuses them
+  for capacity. The gateway answers such refusals with 529 (`overloaded` or
+  `no_capacity`, with `Retry-After`). Some routing aggregators count every 5xx
+  as provider downtime but read a 429 as "at capacity, send the overflow
+  elsewhere"; set `429` for an account that routes that way. Only the status
+  line changes: the body, its `code` and `Retry-After` stay the same. Batch
+  dispatch always keeps 529, which the batch daemon backs off on. A file may
+  set this alone.
 - If a model appears in both shapes, the two limits must be equal.
 - An account/model pair may be configured in its account file or in an
   [organisation overlay](#organisation-catalog-validation-and-ownership), not

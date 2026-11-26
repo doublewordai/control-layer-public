@@ -317,6 +317,11 @@ down *args="":
     docker compose down {{args}}
 
 
+# Regenerate dwctl/openapi/*.json from the code, then commit the result
+openapi:
+    SQLX_OFFLINE=true cargo run -p dwctl --bin openapi-dump
+
+
 # Run tests: 'just test' or 'just test [docker|rust|quick|ts|memory]'
 #
 # Test targets available:

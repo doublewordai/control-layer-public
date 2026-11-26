@@ -1,5 +1,6 @@
 
 pub mod body_limit;
+pub mod capacity_refusal;
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;

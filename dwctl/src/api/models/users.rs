@@ -33,6 +33,17 @@ impl Role {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+pub enum AssignableRole {
+    PlatformManager,
+    RequestViewer,
+    StandardUser,
+    BillingManager,
+    BatchAPIUser,
+    BackgroundInferenceUser,
+    ConnectionsUser,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserCreate {
     #[schema(example = "jsmith")]
@@ -43,6 +54,7 @@ pub struct UserCreate {
     pub display_name: Option<String>,
     #[schema(example = "https://example.com/avatars/jsmith.png")]
     pub avatar_url: Option<String>,
+    #[schema(value_type = Vec<AssignableRole>)]
     pub roles: Vec<Role>,
 }
 
@@ -52,6 +64,7 @@ pub struct UserUpdate {
     pub display_name: Option<String>,
     #[schema(example = "https://example.com/avatars/jsmith-new.png")]
     pub avatar_url: Option<String>,
+    #[schema(value_type = Option<Vec<AssignableRole>>)]
     pub roles: Option<Vec<Role>>,
     pub batch_notifications_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
