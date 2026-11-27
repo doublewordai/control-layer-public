@@ -58,7 +58,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
     let created_by_filter: Option<String> = if let Some(member_id) = query.member_id {
         if !can_read_all {
             return Err(Error::BadRequest {
-                message: "member_id filter requires platform manager permissions".to_string(),
+                message: "member_id filter is not supported for responses".to_string(),
             });
         }
         Some(member_id.to_string())

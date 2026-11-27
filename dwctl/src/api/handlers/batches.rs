@@ -1693,15 +1693,9 @@ pub async fn list_batches<P: PoolProvider>(
                     .await
                     .map_err(Error::Database)?
             }
-            None if can_read_all => {
-                ApiKeys::new(&mut read_conn)
-                    .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
-                    .await
-                    .map_err(Error::Database)?
-            }
             None => {
                 return Err(Error::BadRequest {
-                    message: "member_id filter is only available in organization context or for platform managers".to_string(),
+                    message: "member_id filter is only available in organization context".to_string(),
                 });
             }
         };
@@ -4967,6 +4961,22 @@ mod tests {
             "Expected error about org context, got: {}",
             body
         );
+    }
+
+    #[dwctl_test_macros::test]
+    #[test_log::test]
+    async fn test_list_batches_member_id_rejected_for_platform_manager_outside_org_context(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&pm);
+
+        let resp = app
+            .get(&format!("/ai/v1/batches?member_id={}", pm.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("only available in organization context"));
     }
 
     #[dwctl_test_macros::test]

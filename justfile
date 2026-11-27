@@ -7,6 +7,54 @@ default:
 get-admin-email:
     @grep 'admin_email:' config.yaml | sed 's/.*admin_email:[ ]*"\(.*\)"/\1/'
 
+# Install the tools and start the services needed to build and test
+#
+# Installs the tools pinned in mise.toml when mise is available, refreshes the
+# shell PATH with mise, installs cargo-nextest when missing, runs pnpm install
+# --frozen-lockfile for the dashboard, verifies the remaining prerequisites,
+# then starts and migrates the local PostgreSQL database that `just test` uses.
+#
+# Docker is needed for the local PostgreSQL service. Hurl is only needed by the
+# optional service and Docker test targets.
+#
+# Examples:
+#   just setup
+# Setup: install tools and start the PostgreSQL service the tests use
+setup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if command -v mise >/dev/null 2>&1; then
+        echo "Installing tools from mise.toml..."
+        mise install
+        # Make the installed tools available even when mise is not activated
+        # in the caller's shell.
+        eval "$(mise activate bash)"
+    else
+        echo "ℹ️  mise not found; using the tools already on PATH"
+        echo "   Install mise (https://mise.jdx.dev) to get the versions in mise.toml"
+    fi
+
+    if ! cargo nextest --version >/dev/null 2>&1; then
+        echo "Installing cargo-nextest..."
+        cargo install cargo-nextest --locked
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "❌ Docker is required to start the PostgreSQL service that 'just test' uses" >&2
+        exit 1
+    fi
+
+    just _check-deps
+
+    echo "Installing dashboard dependencies..."
+    (cd dashboard && pnpm install --frozen-lockfile)
+
+    just db-start
+    just db-setup
+
+    echo "✅ Setup complete: tools are available and PostgreSQL is ready."
+
 # Check that you've got all the dependencies for development installed
 #
 # Prerequisites:
@@ -14,22 +62,25 @@ get-admin-email:
 # - Homebrew (recommended for tool installation)
 #
 # First-time setup (cargo comes from rustup, not Homebrew):
-#   brew install hurl postgresql pnpm
+#   brew install postgresql pnpm
 #   brew install --cask docker
 #   cargo install cargo-nextest --locked
 #   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
-#   just check
-check:
+#   just setup
+#
+# For the optional service and Docker test targets, also install Hurl:
+#   brew install hurl
+_check-deps:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "Setting up development environment..."
+    echo "Checking development dependencies..."
 
     # Check for required tools
     echo "Checking for required tools..."
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm" "sqlx")
+    required_tools=("docker" "psql" "createdb" "cargo" "pnpm" "sqlx")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -61,7 +112,47 @@ check:
         echo "⚠️  Optional: flock not found (macOS: brew install flock); the build lock is skipped without it"
     fi
 
-    echo "✅ Development setup complete!"
+    # Optional: only the service-test targets use Hurl.
+    if ! command -v hurl >/dev/null 2>&1; then
+        echo "⚠️  Optional: hurl not found; 'just test services' and 'just test docker' need it"
+    fi
+
+    echo "✅ Development dependencies are available!"
+
+# Run the checks CI runs before merge, locally
+#
+# Runs 'just lint' (Rust and TypeScript), then 'just test' (Rust and
+# TypeScript), then the remaining local checks from .github/workflows/ci.yaml:
+# the memory-budget tests, the dashboard production build, the publishable
+# Onwards package, and the preview workflow contract when Ruby is available.
+#
+# Docker/Hurl E2E, pooled-database E2E, Open Responses compliance and the
+# security scan need services or credentials and stay in CI.
+#
+# Examples:
+#   just check
+# Check: lint, test, then the other CI checks that run locally
+check: lint test
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "Running memory-budget tests..."
+    just test memory
+
+    echo "Building the dashboard..."
+    (cd dashboard && pnpm run build)
+
+    echo "Checking the publishable Onwards package..."
+    cargo package --locked --package onwards --all-features
+
+    if command -v ruby >/dev/null 2>&1; then
+        echo "Validating the preview workflow contract..."
+        ruby scripts/tests/preview_workflow_test.rb
+    else
+        echo "Skipping the preview workflow contract (ruby not installed)"
+    fi
+
+    echo "✅ All local CI checks passed."
 
 
 # Setup PostgreSQL databases for Rust development
@@ -322,16 +413,22 @@ openapi:
     SQLX_OFFLINE=true cargo run -p dwctl --bin openapi-dump
 
 
-# Run tests: 'just test' or 'just test [docker|rust|quick|ts|memory]'
+# Run tests: 'just test' or 'just test [docker|rust|quick|ts|memory|services]'
 #
 # Test targets available:
 #
-# (no target): Run integration tests against already-running services
+# (no target): Run the Rust and TypeScript test suites
+# - Runs 'just test rust' then 'just test ts'
+# - Uses the PostgreSQL that 'just setup' starts; no other outside service
+# - Arguments without a target keep the old service-test behaviour below
+#
+# services: Run integration tests against already-running services
 # - Assumes services are running (via 'just dev' or 'just up')
-# - Runs hurl-based HTTP API tests and Playwright E2E browser tests
+# - Runs hurl-based HTTP API tests
+# - Playwright E2E tests are currently disabled
 # - Generates JWT tokens for authenticated endpoints
 # - Fast - no stack startup/teardown time
-# - Flags: --api-only (hurl only), --e2e-only (Playwright only)
+# - Flags: --api-only (hurl only)
 #
 # docker: Full docker stack test with lifecycle management
 # - Starts clean docker stack ('just up')
@@ -359,18 +456,27 @@ openapi:
 #   CI runs them with the 'ci' nextest profile.
 #
 # Examples:
-#   just test                    # Test against running services
+#   just test                    # Rust and TypeScript tests
+#   just test services           # Test against running services
 #   just test docker             # Full docker integration test
 #   just test rust               # Backend unit tests
 #   just test quick              # Tests for the files you changed
 #   just test ts                 # Frontend tests
 #   just test memory             # Request memory budgets
+# Test: run the Rust and TypeScript test suites
 [positional-arguments]
 test target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
     target="$1"
     shift
+    if [[ -z "$target" ]]; then
+        echo "Running Rust tests..."
+        just test rust
+        echo "Running TypeScript tests..."
+        just test ts
+        exit 0
+    fi
     if [[ "$target" == rust ]]; then
         exec ./scripts/test-rust.sh "$@"
     fi
@@ -382,11 +488,11 @@ test target="" *args="":
 _test-other target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
-    # Check if target is actually a flag (starts with --)
-    if [ -z "{{target}}" ] || [[ "{{target}}" == --* ]]; then
+    # Check if target is a flag (starts with --), empty, or the services target
+    if [ -z "{{target}}" ] || [ "{{target}}" = services ] || [[ "{{target}}" == --* ]]; then
         # Treat target as an argument if it starts with --
         ALL_ARGS="{{target}} {{args}}"
-        if [ "{{target}}" = "" ]; then
+        if [ "{{target}}" = "" ] || [ "{{target}}" = services ]; then
             ALL_ARGS="{{args}}"
         fi
         # Just run tests against running services
@@ -585,7 +691,7 @@ _test-other target="" *args="":
 
             SERVICES_UP_TIME=$(date +%s)
             echo "🧪 [$(date '+%H:%M:%S')] Running tests... (startup took: $((SERVICES_UP_TIME - START_TIME))s)"
-            just test $API_ONLY_FLAG || {
+            just test services $API_ONLY_FLAG || {
                 FAIL_TIME=$(date +%s)
                 echo "❌ [$(date '+%H:%M:%S')] Tests failed after $((FAIL_TIME - SERVICES_UP_TIME))s"
                 echo ""
@@ -631,7 +737,7 @@ _test-other target="" *args="":
                 -E 'binary(memory_budget)' --no-capture {{args}}
             ;;
         *)
-            echo "Usage: just test [docker|rust|quick|ts|memory]"
+            echo "Usage: just test [docker|rust|quick|ts|memory|services]"
             exit 1
             ;;
     esac
@@ -655,14 +761,24 @@ _test-other target="" *args="":
 #
 #
 # Examples:
+#   just lint                    # Check Rust and TypeScript code
 #   just lint ts                 # Check TypeScript code
 #   just lint ts --fix           # Fix TypeScript issues automatically
 #   just lint rust               # Check Rust code
 #   just lint rust -- -D warnings  # Treat Rust warnings as errors
-lint target *args="":
+# Lint: check Rust and TypeScript formatting and lints
+lint target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
     case "{{target}}" in
+        "")
+            if [[ -n "{{args}}" ]]; then
+                echo "Usage: just lint [ts|rust]"
+                exit 1
+            fi
+            just lint rust
+            just lint ts
+            ;;
         ts)
             cd dashboard
             echo "Checking pnpm-lock.yaml sync..."

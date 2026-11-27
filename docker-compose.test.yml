@@ -1,5 +1,5 @@
 # Adds mock LLM server for testing
-# Used by both local tests (just test) and CI (just test docker)
+# Used by local service tests (just test services) and CI (just test docker)
 
 services:
   control-layer:

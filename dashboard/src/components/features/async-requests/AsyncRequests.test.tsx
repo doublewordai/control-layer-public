@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { render, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { AsyncRequests } from "./AsyncRequests";
@@ -16,7 +15,6 @@ vi.mock("../../../api/control-layer/hooks", () => ({
     isPending: false,
   })),
   useModels: vi.fn(),
-  useUsers: vi.fn(),
 }));
 
 vi.mock("../../../utils/authorization", () => ({
@@ -65,11 +63,6 @@ const createWrapper = () => {
   );
 };
 
-const ACCOUNTS = [
-  { id: "user-1", email: "dev@example.com", user_type: "individual" },
-  { id: "org-1", email: "ops@example.com", user_type: "organization" },
-];
-
 describe("AsyncRequests", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -99,11 +92,6 @@ describe("AsyncRequests", () => {
 
     vi.mocked(hooks.useModels).mockReturnValue({
       data: { data: [] },
-      isLoading: false,
-    } as any);
-
-    vi.mocked(hooks.useUsers).mockReturnValue({
-      data: { data: ACCOUNTS },
       isLoading: false,
     } as any);
   });
@@ -237,68 +225,11 @@ describe("AsyncRequests", () => {
       } as any);
     });
 
-    it("offers organizations as well as individuals", async () => {
-      const user = userEvent.setup();
-      const { container } = render(<AsyncRequests />, {
-        wrapper: createWrapper(),
-      });
-
-      await user.click(
-        within(container).getByRole("combobox", { name: /filter by account/i }),
-      );
-
-      expect(screen.getByText("ops@example.com")).toBeInTheDocument();
-      expect(screen.getByText("dev@example.com")).toBeInTheDocument();
-      expect(screen.getByText("Org")).toBeInTheDocument();
-    });
-
-    it("sends the selected account as member_id", async () => {
-      const user = userEvent.setup();
-      const { container } = render(<AsyncRequests />, {
-        wrapper: createWrapper(),
-      });
-
-      await user.click(
-        within(container).getByRole("combobox", { name: /filter by account/i }),
-      );
-      await user.click(screen.getByText("ops@example.com"));
-
-      const lastCall = vi.mocked(hooks.useAsyncRequests).mock.calls.at(-1)?.[0];
-      expect(lastCall?.member_id).toBe("org-1");
-    });
-
-    it("hides the filter, and sends no member_id, below PlatformManager", () => {
-      vi.mocked(authorization.useAuthorization).mockReturnValue({
-        userRoles: ["StandardUser"],
-        isLoading: false,
-        hasPermission: () => true,
-        canAccessRoute: () => true,
-        getFirstAccessibleRoute: () => "/batches",
-      } as any);
-
-      const { container } = render(<AsyncRequests />, {
-        wrapper: createWrapper(),
-      });
-
-      expect(
-        within(container).queryByRole("combobox", { name: /filter by account/i }),
-      ).not.toBeInTheDocument();
-      expect(
-        vi.mocked(hooks.useAsyncRequests).mock.calls.at(-1)?.[0]?.member_id,
-      ).toBeUndefined();
-    });
-
-    it("drops a persisted account id in an org context", () => {
+    it("offers no account filter and sends no member_id to a Platform Manager", () => {
       localStorage.setItem(
         "filters:responses",
-        JSON.stringify({ account: "org-1" }),
+        JSON.stringify({ account: "user-1" }),
       );
-      vi.mocked(orgContext.useOrganizationContext).mockReturnValue({
-        activeOrganizationId: "org-2",
-        activeOrganization: null,
-        isOrgContext: true,
-        setActiveOrganization: vi.fn(),
-      } as any);
 
       const { container } = render(<AsyncRequests />, {
         wrapper: createWrapper(),

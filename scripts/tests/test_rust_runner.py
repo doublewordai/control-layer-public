@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -241,19 +242,107 @@ class RunnerTests(unittest.TestCase):
                 with self.subTest(flag=flag):
                     self.run_runner(*flag, extra_env={**env, "DW_TARGET_DIR_WARN_FILES": "3"})
 
-    def test_just_without_target_dispatches_empty_default(self):
+    def test_just_without_target_dispatches_rust_and_typescript(self):
         justfile = (ROOT / "justfile").read_text()
         start, end = "[positional-arguments]\ntest ", "\n_test-other "
         self.assertEqual(justfile.count(start), 1, f"expected one {start!r} in justfile")
         self.assertEqual(justfile.count(end), 1, f"expected one {end!r} in justfile")
         recipe = justfile.split(start, 1)[1].split(end, 1)[0]
+        real_just = shutil.which("just")
+        self.assertIsNotNone(real_just)
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "justfile"
-            path.write_text('[positional-arguments]\ntest ' + recipe +
-                            '\n_test-other target="" *args="":\n    @echo dispatched target="{{target}}"\n')
-            result = subprocess.run(["just", "--justfile", str(path), "test"], capture_output=True, text=True)
+            directory = Path(directory)
+            path = directory / "justfile"
+            path.write_text('[positional-arguments]\ntest ' + recipe + '\n')
+            log = directory / "calls.txt"
+            fake_just = directory / "just"
+            fake_just.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "with open(os.environ['JUST_DISPATCH_LOG'], 'a') as log:\n"
+                "    log.write(' '.join(sys.argv[1:]) + '\\n')\n"
+            )
+            fake_just.chmod(0o755)
+            result = subprocess.run(
+                [real_just, "--justfile", str(path), "test"],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                         JUST_DISPATCH_LOG=str(log)),
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), "dispatched target=")
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["Running Rust tests...", "Running TypeScript tests..."],
+            )
+            self.assertEqual(log.read_text().splitlines(), ["test rust", "test ts"])
+
+    def test_setup_activates_mise_and_installs_dashboard_dependencies(self):
+        justfile = (ROOT / "justfile").read_text()
+        start, end = "\nsetup:\n", "\n# Check that you've got all"
+        self.assertEqual(justfile.count(start), 1, f"expected one {start!r} in justfile")
+        self.assertEqual(justfile.count(end), 1, f"expected one {end!r} in justfile")
+        recipe = justfile.split(start, 1)[1].split(end, 1)[0]
+        real_just = shutil.which("just")
+        self.assertIsNotNone(real_just)
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            tools = directory / "tools"
+            activated = directory / "activated"
+            tools.mkdir()
+            activated.mkdir()
+            log = directory / "calls.txt"
+
+            def script(path, body):
+                path.write_text("#!/usr/bin/env python3\n" + body)
+                path.chmod(0o755)
+
+            script(tools / "mise", (
+                "import os, sys\n"
+                "with open(os.environ['SETUP_LOG'], 'a') as log:\n"
+                "    log.write('mise ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                "if sys.argv[1:3] == ['activate', 'bash']:\n"
+                "    print('export PATH=\"' + os.environ['SETUP_ACTIVATED_BIN'] + ':$PATH\"')\n"
+                "    print('export SETUP_MISE_ACTIVE=1')\n"
+            ))
+            script(tools / "cargo", (
+                "import sys\n"
+                "if sys.argv[1:2] == ['nextest']:\n"
+                "    sys.exit(0)\n"
+            ))
+            script(tools / "docker", "import sys\nsys.exit(0)\n")
+            script(tools / "just", (
+                "import os, sys\n"
+                "with open(os.environ['SETUP_LOG'], 'a') as log:\n"
+                "    log.write('just ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+            ))
+            script(activated / "pnpm", (
+                "import os, sys\n"
+                "with open(os.environ['SETUP_LOG'], 'a') as log:\n"
+                "    log.write('pnpm ' + ' '.join(sys.argv[1:]) +\n"
+                "              ' active=' + os.environ.get('SETUP_MISE_ACTIVE', '') + '\\n')\n"
+            ))
+
+            path = directory / "justfile"
+            path.write_text("setup:\n" + recipe + "\n")
+            result = subprocess.run(
+                [real_just, "--justfile", str(path), "--working-directory", str(ROOT), "setup"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}",
+                         SETUP_LOG=str(log), SETUP_ACTIVATED_BIN=str(activated)),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Setup complete", result.stdout)
+            self.assertEqual(log.read_text().splitlines(), [
+                "mise install",
+                "mise activate bash",
+                "just _check-deps",
+                "pnpm install --frozen-lockfile active=1",
+                "just db-start",
+                "just db-setup",
+            ])
 
 
 if __name__ == "__main__":

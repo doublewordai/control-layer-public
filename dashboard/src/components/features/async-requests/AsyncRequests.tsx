@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Users, Zap, FastForward, Moon, Trash2, Loader2 } from "lucide-react";
+import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Moon, Trash2, Loader2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 import { Button } from "../../ui/button";
@@ -36,9 +36,8 @@ import {
   CommandList,
 } from "../../ui/command";
 import { cn } from "../../../lib/utils";
-import { useAsyncRequests, useDeleteAsyncRequest, useModels, useUsers } from "../../../api/control-layer/hooks";
+import { useAsyncRequests, useDeleteAsyncRequest, useModels } from "../../../api/control-layer/hooks";
 import { useAuthorization } from "../../../utils/authorization";
-import { useDebounce } from "../../../hooks/useDebounce";
 import type {
   AsyncRequest,
   AsyncRequestStatus,
@@ -308,32 +307,11 @@ export function AsyncRequests() {
   const modelParam = searchParams.get("model");
   const [createModalOpen, setCreateModalOpen] = useState(createParam === "true");
   const [showApiExamples, setShowApiExamples] = useState(false);
-  const { userRoles, hasPermission } = useAuthorization();
+  const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
   const showUserColumn = isPlatformManager || isOrgContext;
 
-  const showAccountFilter =
-    userRoles.includes("PlatformManager") && !isOrgContext;
-
-  const [accountSearch, setAccountSearch] = useState("");
-  const debouncedAccountSearch = useDebounce(accountSearch, 300);
-  const { data: searchedAccounts } = useUsers({
-    search: debouncedAccountSearch,
-    limit: 50,
-    enabled: showAccountFilter,
-  });
-  const [selectedAccountId, setSelectedAccountId] = usePersistedFilter(
-    PERSIST_SCOPE,
-    "account",
-    "",
-  );
-  const [accountPopoverOpen, setAccountPopoverOpen] = useState(false);
-  const accountList = searchedAccounts?.data ?? [];
-  const selectedAccount = accountList.find((a) => a.id === selectedAccountId);
-  const accountIdFilter = showAccountFilter
-    ? selectedAccountId || undefined
-    : undefined;
   const [statusFilter, setStatusFilter] = usePersistedFilter(
     PERSIST_SCOPE,
     "status",
@@ -378,8 +356,6 @@ export function AsyncRequests() {
     setModelFilter(EMPTY_MODEL_FILTER);
     setTierFilter(DEFAULT_TIER_FILTER);
     setDateRange(undefined);
-    setSelectedAccountId("");
-    setAccountSearch("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOrganizationId]);
 
@@ -418,7 +394,6 @@ export function AsyncRequests() {
         ? (statusFilter as AsyncRequestStatus)
         : undefined,
     model: modelFilter.length > 0 ? modelFilter.join(",") : undefined,
-    member_id: accountIdFilter,
     created_after: dateRange?.from.toISOString(),
     created_before: dateRange?.to.toISOString(),
     ...pagination.queryParams,
@@ -485,92 +460,6 @@ export function AsyncRequests() {
                 Active first
               </label>
             </div>
-            {showAccountFilter && (
-              <Popover
-                open={accountPopoverOpen}
-                onOpenChange={setAccountPopoverOpen}
-              >
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    role="combobox"
-                    aria-expanded={accountPopoverOpen}
-                    aria-label="Filter by account"
-                    className="w-[220px] h-9 justify-between font-normal"
-                  >
-                    <div className="flex items-center gap-1.5 truncate">
-                      <Users className="w-3.5 h-3.5 shrink-0 text-gray-500" />
-                      <span className="truncate">
-                        {!selectedAccountId
-                          ? "All accounts"
-                          : (selectedAccount?.email ?? "Selected account")}
-                      </span>
-                    </div>
-                    <ChevronsUpDown className="ml-1 h-3.5 w-3.5 shrink-0 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent className="w-[300px] p-0" align="start">
-                  { }
-                  <Command shouldFilter={false}>
-                    <CommandInput
-                      placeholder="Search users and organizations..."
-                      value={accountSearch}
-                      onValueChange={setAccountSearch}
-                    />
-                    <CommandList>
-                      <CommandEmpty>No accounts found.</CommandEmpty>
-                      <CommandGroup>
-                        <CommandItem
-                          value="all-accounts"
-                          onSelect={() => {
-                            setSelectedAccountId("");
-                            setAccountSearch("");
-                            setAccountPopoverOpen(false);
-                            pagination.handleReset();
-                          }}
-                        >
-                          <Check
-                            className={cn(
-                              "mr-2 h-4 w-4",
-                              !selectedAccountId ? "opacity-100" : "opacity-0",
-                            )}
-                          />
-                          All accounts
-                        </CommandItem>
-                        {accountList.map((account) => (
-                          <CommandItem
-                            key={account.id}
-                            value={account.id}
-                            onSelect={() => {
-                              setSelectedAccountId(account.id);
-                              setAccountSearch("");
-                              setAccountPopoverOpen(false);
-                              pagination.handleReset();
-                            }}
-                          >
-                            <Check
-                              className={cn(
-                                "mr-2 h-4 w-4",
-                                selectedAccountId === account.id
-                                  ? "opacity-100"
-                                  : "opacity-0",
-                              )}
-                            />
-                            <span className="truncate">{account.email}</span>
-                            { }
-                            {account.user_type === "organization" && (
-                              <span className="ml-2 shrink-0 rounded bg-gray-100 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-600">
-                                Org
-                              </span>
-                            )}
-                          </CommandItem>
-                        ))}
-                      </CommandGroup>
-                    </CommandList>
-                  </Command>
-                </PopoverContent>
-              </Popover>
-            )}
             <Select
               value={statusFilter}
               onValueChange={(v) => {

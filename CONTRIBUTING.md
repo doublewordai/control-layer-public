@@ -64,11 +64,12 @@ If you encounter SQLx prepare issues, verify your Rust version with `rustc
 Run
 
 ```bash
-just check
+just setup
 
 ```
 
-to make sure you have all prerequisites installed.
+to install the tools, check you have all prerequisites, install the dashboard
+dependencies, and start the local PostgreSQL database the tests use.
 
 ### 2. Initial Setup
 

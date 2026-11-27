@@ -721,32 +721,6 @@ impl<'c> ApiKeys<'c> {
         Ok(key_ids)
     }
 
-    #[instrument(level = "debug", skip(self), fields(created_by = %abbrev_uuid(&created_by)), err)]
-    pub async fn find_all_hidden_key_ids_by_creator(&mut self, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
-        let purpose_str = match purpose {
-            ApiKeyPurpose::Platform => "platform",
-            ApiKeyPurpose::Realtime => "realtime",
-            ApiKeyPurpose::Batch => "batch",
-            ApiKeyPurpose::Playground => "playground",
-            ApiKeyPurpose::Continuation => "continuation",
-        };
-
-        let key_ids = sqlx::query_scalar!(
-            r#"
-            SELECT id
-            FROM api_keys
-            WHERE purpose = $1 AND created_by = $2
-            AND hidden = true AND is_deleted = false
-            "#,
-            purpose_str,
-            created_by
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
-
-        Ok(key_ids)
-    }
-
     #[instrument(level = "debug", skip(self, key_ids), err)]
     pub async fn get_creators_by_key_ids(&mut self, key_ids: Vec<ApiKeyId>) -> Result<HashMap<ApiKeyId, UserId>> {
         if key_ids.is_empty() {
